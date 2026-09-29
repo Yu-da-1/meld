@@ -1,0 +1,7 @@
+[package]
+name = "meld-controller"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+meld-core = { path = "../meld-core" }
