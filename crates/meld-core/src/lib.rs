@@ -14,9 +14,9 @@ pub use job::{Job, JobSpec, JobSpecValidationError, JobState};
 pub use node::{NodeDescriptor, NodeState};
 pub use protocol::{
     Acknowledgement, CURRENT_PROTOCOL_VERSION, ExecutionAssignment, ExecutionEvent,
-    HeartbeatRequest, PollAssignmentRequest, PollAssignmentResponse, ProtocolVersion,
-    RegisterNodeRequest, RegisterNodeResponse, ReportExecutionEventRequest, RequestMetadata,
-    ResponseMetadata,
+    HeartbeatRequest, PollAssignmentRequest, PollAssignmentResponse, ProtocolError,
+    ProtocolErrorResponse, ProtocolVersion, RegisterNodeRequest, RegisterNodeResponse,
+    ReportExecutionEventRequest, RequestMetadata, ResponseMetadata,
 };
 pub use resource::{ResourceCapacity, ResourceRequirements, ResourceSnapshot};
 pub use transition::InvalidStateTransition;

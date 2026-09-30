@@ -8,12 +8,14 @@ Meld は、自宅や小規模な環境にある複数のコンピューターを
 
 ## 現在の状態
 
-このリポジトリは設計・初期セットアップ段階です。
+Phase 0からPhase 2までが完了し、次はPhase 3のremote execution MVPへ進む段階です。
 
-- Rust のルートパッケージは作成済みです。
-- workspace の構成名は `meld-controller`、`meld-node`、`meld-core` に決定しています。
-- 上記3 crate の実体、ノード間通信、ジョブ実行などはまだ未実装です。
-- 現在の `Cargo.toml` は未作成の workspace member を参照しているため、crate 作成までは `cargo check` が成功しません。
+- `meld-controller`、`meld-node`、`meld-core` の3 crateでvirtual workspaceを構成しています。
+- 共有domain model、job / execution状態遷移、in-memory Node RegistryとJob Manager、first-fit Schedulerを実装済みです。
+- nodeはHTTP/JSONでcontrollerへ登録し、永続化したidentity、capacity、resource snapshot、heartbeatを報告します。
+- controllerはheartbeat timeoutによる`Unreachable`判定と、再接続・同一identityでの再登録を扱います。
+- `GET /v1/nodes`でcontrollerが観測したnode状態、capacity、最新snapshotを取得できます。
+- native processのremote execution、log回収、cancelはPhase 3で実装します。
 
 ## 目指す利用イメージ
 

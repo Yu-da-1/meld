@@ -42,7 +42,7 @@ workspace
 
 ### 現在地
 
-virtual workspaceと3 crateを作成し、build、test、lint、個別起動の完了条件を満たしています。structured loggingは、実際のHTTP processを起動するPhase 2で導入します。
+virtual workspaceと3 crateを作成し、build、test、lint、個別起動の完了条件を満たしています。structured loggingはPhase 2で導入済みです。
 
 ## 3. Phase 1 — Domain Model and Local Vertical Slice
 
@@ -99,6 +99,12 @@ controller内部でin-memoryのNode Manager、Job Manager、単純schedulerを�
 - node停止後、設定時間内に`Unreachable`になる。
 - node再起動後、同じidentityとして復帰できる。
 - protocol version mismatchを明示的に報告できる。
+
+### 現在地
+
+完了しています。HTTP/JSONによるnode登録、永続identity、capacityとresource snapshotを含むheartbeat、timeoutによる`Unreachable`判定、指数backoff付きの再接続・再登録、`GET /v1/nodes`による一覧表示、protocol version mismatchの構造化エラーを実装しました。
+
+2つのnode processを同時登録して各nodeのcapacityと最新usageを取得し、一方の停止による`Unreachable`化、同じidentityでの再起動と`Ready`復帰、version mismatchに対するHTTP 426応答をend-to-endで検証しています。
 
 ## 5. Phase 3 — Remote Execution MVP
 

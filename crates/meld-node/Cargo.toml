@@ -4,4 +4,14 @@ version.workspace = true
 edition.workspace = true
 
 [dependencies]
+directories = "6"
+hostname = "0.4"
 meld-core = { path = "../meld-core" }
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+sysinfo = "0.37"
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "signal", "time"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+[dev-dependencies]
+tempfile = "3"

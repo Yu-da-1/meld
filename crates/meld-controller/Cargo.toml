@@ -4,4 +4,13 @@ version.workspace = true
 edition.workspace = true
 
 [dependencies]
+axum = "0.8"
 meld-core = { path = "../meld-core" }
+serde = { version = "1", features = ["derive"] }
+tokio = { version = "1", features = ["macros", "net", "rt-multi-thread", "time"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+[dev-dependencies]
+serde_json = "1"
+tower = { version = "0.5", features = ["util"] }

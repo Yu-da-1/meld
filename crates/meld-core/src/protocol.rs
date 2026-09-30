@@ -79,6 +79,26 @@ pub struct RegisterNodeResponse {
     pub node_id: NodeId,
 }
 
+/// Describes a protocol-level request failure.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum ProtocolError {
+    ProtocolVersionMismatch {
+        expected: ProtocolVersion,
+        received: ProtocolVersion,
+    },
+    NodeNotRegistered {
+        node_id: NodeId,
+    },
+}
+
+/// Returns a structured protocol failure correlated to one request.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProtocolErrorResponse {
+    pub metadata: ResponseMetadata,
+    pub error: ProtocolError,
+}
+
 /// Reports current resource usage and proves node liveness.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct HeartbeatRequest {
@@ -150,6 +170,24 @@ mod tests {
         };
 
         assert_json_round_trip(&request);
+    }
+
+    #[test]
+    fn protocol_error_round_trips_through_json() {
+        let request = RequestMetadata {
+            message_id: MessageId::generate(),
+            protocol_version: ProtocolVersion::new(2),
+        };
+        let response = ProtocolErrorResponse {
+            metadata: ResponseMetadata::for_request(request),
+            error: ProtocolError::ProtocolVersionMismatch {
+                expected: CURRENT_PROTOCOL_VERSION,
+                received: request.protocol_version,
+            },
+        };
+
+        assert_eq!(response.metadata.in_reply_to, request.message_id);
+        assert_json_round_trip(&response);
     }
 
     #[test]

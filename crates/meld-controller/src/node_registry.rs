@@ -1,6 +1,6 @@
 //! In-memory source of truth for registered nodes.
 
-use std::{collections::BTreeMap, error::Error, fmt};
+use std::{collections::BTreeMap, error::Error, fmt, time::Instant};
 
 use meld_core::{NodeDescriptor, NodeId, NodeState, ResourceSnapshot};
 
@@ -10,6 +10,7 @@ pub struct RegisteredNode {
     descriptor: NodeDescriptor,
     state: NodeState,
     snapshot: Option<ResourceSnapshot>,
+    last_heartbeat_at: Option<Instant>,
 }
 
 impl RegisteredNode {
@@ -23,6 +24,14 @@ impl RegisteredNode {
 
     pub const fn snapshot(&self) -> Option<ResourceSnapshot> {
         self.snapshot
+    }
+
+    pub const fn last_heartbeat_at(&self) -> Option<Instant> {
+        self.last_heartbeat_at
+    }
+
+    pub(crate) fn mark_unreachable(&mut self) {
+        self.state = NodeState::Unreachable;
     }
 }
 
@@ -45,6 +54,7 @@ impl NodeRegistry {
                 descriptor,
                 state: NodeState::Joining,
                 snapshot: None,
+                last_heartbeat_at: None,
             },
         );
     }
@@ -55,6 +65,15 @@ impl NodeRegistry {
         node_id: NodeId,
         snapshot: ResourceSnapshot,
     ) -> Result<(), NodeRegistryError> {
+        self.record_heartbeat_at(node_id, snapshot, Instant::now())
+    }
+
+    pub(crate) fn record_heartbeat_at(
+        &mut self,
+        node_id: NodeId,
+        snapshot: ResourceSnapshot,
+        received_at: Instant,
+    ) -> Result<(), NodeRegistryError> {
         let node = self
             .nodes
             .get_mut(&node_id)
@@ -62,6 +81,7 @@ impl NodeRegistry {
 
         node.state = NodeState::Ready;
         node.snapshot = Some(snapshot);
+        node.last_heartbeat_at = Some(received_at);
         Ok(())
     }
 
@@ -72,6 +92,10 @@ impl NodeRegistry {
     /// Iterates in Node ID order to keep scheduling deterministic.
     pub fn nodes(&self) -> impl Iterator<Item = &RegisteredNode> {
         self.nodes.values()
+    }
+
+    pub(crate) fn nodes_mut(&mut self) -> impl Iterator<Item = &mut RegisteredNode> {
+        self.nodes.values_mut()
     }
 }
 
