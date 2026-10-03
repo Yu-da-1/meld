@@ -1,6 +1,6 @@
 //! Deterministic node placement policy.
 
-use std::{error::Error, fmt};
+use std::{collections::BTreeSet, error::Error, fmt};
 
 use meld_core::{NodeId, NodeState, ResourceRequirements};
 
@@ -19,6 +19,7 @@ impl Scheduler {
         &self,
         requirements: ResourceRequirements,
         registry: &NodeRegistry,
+        unavailable_nodes: &BTreeSet<NodeId>,
     ) -> Result<NodeId, SchedulingFailure> {
         let mut ready_nodes = registry
             .nodes()
@@ -29,10 +30,17 @@ impl Scheduler {
             return Err(SchedulingFailure::NoReadyNodes);
         }
 
-        ready_nodes
-            .find(|node| node.descriptor().capacity.satisfies(requirements))
+        let mut matching_nodes = ready_nodes
+            .filter(|node| node.descriptor().capacity.satisfies(requirements))
+            .peekable();
+        if matching_nodes.peek().is_none() {
+            return Err(SchedulingFailure::InsufficientResources);
+        }
+
+        matching_nodes
+            .find(|node| !unavailable_nodes.contains(&node.descriptor().id))
             .map(|node| node.descriptor().id)
-            .ok_or(SchedulingFailure::InsufficientResources)
+            .ok_or(SchedulingFailure::NoAvailableNodes)
     }
 }
 
@@ -41,6 +49,7 @@ impl Scheduler {
 pub enum SchedulingFailure {
     NoReadyNodes,
     InsufficientResources,
+    NoAvailableNodes,
 }
 
 impl fmt::Display for SchedulingFailure {
@@ -49,6 +58,9 @@ impl fmt::Display for SchedulingFailure {
             Self::NoReadyNodes => formatter.write_str("no nodes are ready"),
             Self::InsufficientResources => {
                 formatter.write_str("ready nodes do not satisfy the resource requirements")
+            }
+            Self::NoAvailableNodes => {
+                formatter.write_str("matching nodes are already running an execution")
             }
         }
     }
@@ -69,7 +81,7 @@ mod tests {
         let registry = ready_registry(descriptor);
 
         let selected = Scheduler::new()
-            .select_node(requirements(4, 8_000), &registry)
+            .select_node(requirements(4, 8_000), &registry, &BTreeSet::new())
             .expect("matching node should be selected");
 
         assert_eq!(selected, expected);
@@ -81,7 +93,7 @@ mod tests {
         registry.register(descriptor(8, 16_000));
 
         let error = Scheduler::new()
-            .select_node(requirements(1, 1_000), &registry)
+            .select_node(requirements(1, 1_000), &registry, &BTreeSet::new())
             .expect_err("joining node must not be selected");
 
         assert_eq!(error, SchedulingFailure::NoReadyNodes);
@@ -92,10 +104,27 @@ mod tests {
         let registry = ready_registry(descriptor(2, 4_000));
 
         let error = Scheduler::new()
-            .select_node(requirements(4, 8_000), &registry)
+            .select_node(requirements(4, 8_000), &registry, &BTreeSet::new())
             .expect_err("undersized node must not be selected");
 
         assert_eq!(error, SchedulingFailure::InsufficientResources);
+    }
+
+    #[test]
+    fn reports_when_all_matching_nodes_are_unavailable() {
+        let descriptor = descriptor(8, 16_000);
+        let node_id = descriptor.id;
+        let registry = ready_registry(descriptor);
+
+        let error = Scheduler::new()
+            .select_node(
+                requirements(1, 1_000),
+                &registry,
+                &BTreeSet::from([node_id]),
+            )
+            .expect_err("busy node must not receive another execution");
+
+        assert_eq!(error, SchedulingFailure::NoAvailableNodes);
     }
 
     #[test]
@@ -125,7 +154,7 @@ mod tests {
         }
 
         let selected = Scheduler::new()
-            .select_node(requirements(1, 1_000), &registry)
+            .select_node(requirements(1, 1_000), &registry, &BTreeSet::new())
             .expect("matching node should be selected");
 
         assert_eq!(selected, lower_id);

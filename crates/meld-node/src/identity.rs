@@ -19,7 +19,7 @@ pub fn load_or_create_node_id() -> io::Result<NodeId> {
     load_or_create_at(&state_directory()?)
 }
 
-fn state_directory() -> io::Result<PathBuf> {
+pub(crate) fn state_directory() -> io::Result<PathBuf> {
     if let Some(configured) = env::var_os(STATE_DIR_ENV) {
         if configured.is_empty() {
             return Err(io::Error::new(

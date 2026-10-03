@@ -1,0 +1,20 @@
+[package]
+name = "meld-cli"
+version.workspace = true
+edition.workspace = true
+
+[[bin]]
+name = "meld"
+path = "src/main.rs"
+
+[dependencies]
+clap = { version = "4", features = ["derive", "env"] }
+meld-core = { path = "../meld-core" }
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+serde = "1"
+tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
+
+[dev-dependencies]
+axum = "0.8"
+meld-controller = { path = "../meld-controller" }
+tokio = { version = "1", features = ["net"] }

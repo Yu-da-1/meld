@@ -1,10 +1,16 @@
 //! In-memory ownership of logical jobs and execution attempts.
 
-use std::{collections::BTreeMap, error::Error, fmt};
+use std::{
+    collections::{BTreeMap, BTreeSet, VecDeque},
+    error::Error,
+    fmt,
+    time::{Duration, Instant},
+};
 
 use meld_core::{
-    Execution, ExecutionCompletionError, ExecutionId, ExecutionResult, ExecutionState,
-    InvalidStateTransition, Job, JobId, JobSpec, JobSpecValidationError, JobState,
+    Execution, ExecutionAssignment, ExecutionCompletionError, ExecutionId, ExecutionOutput,
+    ExecutionResult, ExecutionState, InvalidStateTransition, Job, JobId, JobSpec,
+    JobSpecValidationError, JobState, NodeId,
 };
 
 use crate::{
@@ -17,6 +23,12 @@ use crate::{
 pub struct JobManager {
     jobs: BTreeMap<JobId, Job>,
     executions: BTreeMap<ExecutionId, Execution>,
+    execution_ids_by_job: BTreeMap<JobId, Vec<ExecutionId>>,
+    outputs: BTreeMap<ExecutionId, ExecutionOutput>,
+    cancellation_requests: BTreeSet<ExecutionId>,
+    job_timeout_requests: BTreeSet<ExecutionId>,
+    job_submitted_at: BTreeMap<JobId, Instant>,
+    pending_jobs: VecDeque<JobId>,
 }
 
 impl JobManager {
@@ -26,11 +38,37 @@ impl JobManager {
 
     /// Validates and queues a newly submitted job.
     pub fn submit(&mut self, spec: JobSpec) -> Result<JobId, JobManagerError> {
+        self.submit_at(spec, Instant::now())
+    }
+
+    fn submit_at(
+        &mut self,
+        spec: JobSpec,
+        submitted_at: Instant,
+    ) -> Result<JobId, JobManagerError> {
+        let has_job_timeout = spec.job_timeout_secs.is_some();
         let mut job = Job::new(spec).map_err(JobManagerError::InvalidSpec)?;
         job.queue().map_err(JobManagerError::InvalidJobState)?;
         let job_id = job.id();
         self.jobs.insert(job_id, job);
+        self.pending_jobs.push_back(job_id);
+        if has_job_timeout {
+            self.job_submitted_at.insert(job_id, submitted_at);
+        }
         Ok(job_id)
+    }
+
+    /// Schedules the oldest queued job without allowing later jobs to overtake it.
+    pub fn schedule_next(
+        &mut self,
+        scheduler: &Scheduler,
+        registry: &NodeRegistry,
+    ) -> Result<Option<ExecutionId>, JobManagerError> {
+        let Some(job_id) = self.pending_jobs.front().copied() else {
+            return Ok(None);
+        };
+
+        self.schedule(job_id, scheduler, registry).map(Some)
     }
 
     /// Selects a node and creates one assigned execution attempt.
@@ -52,8 +90,9 @@ impl JobManager {
             });
         }
 
+        let unavailable_nodes = self.unavailable_node_ids();
         let node_id = scheduler
-            .select_node(job.spec().requirements, registry)
+            .select_node(job.spec().requirements, registry, &unavailable_nodes)
             .map_err(JobManagerError::Scheduling)?;
 
         let execution = loop {
@@ -70,6 +109,11 @@ impl JobManager {
             .assign()
             .map_err(JobManagerError::InvalidJobState)?;
         self.executions.insert(execution_id, execution);
+        self.execution_ids_by_job
+            .entry(job_id)
+            .or_default()
+            .push(execution_id);
+        self.remove_pending_job(job_id);
 
         Ok(execution_id)
     }
@@ -80,6 +124,220 @@ impl JobManager {
 
     pub fn execution(&self, execution_id: ExecutionId) -> Option<&Execution> {
         self.executions.get(&execution_id)
+    }
+
+    pub fn latest_execution_for_job(&self, job_id: JobId) -> Option<&Execution> {
+        self.execution_ids_by_job
+            .get(&job_id)
+            .and_then(|execution_ids| execution_ids.last())
+            .and_then(|execution_id| self.executions.get(execution_id))
+    }
+
+    pub fn execution_output(&self, execution_id: ExecutionId) -> Option<&ExecutionOutput> {
+        self.outputs.get(&execution_id)
+    }
+
+    pub fn pending_position(&self, job_id: JobId) -> Option<usize> {
+        self.pending_jobs
+            .iter()
+            .position(|pending| *pending == job_id)
+    }
+
+    pub fn scheduling_failure_for(
+        &self,
+        job_id: JobId,
+        scheduler: &Scheduler,
+        registry: &NodeRegistry,
+    ) -> Result<Option<SchedulingFailure>, JobManagerError> {
+        let job = self
+            .jobs
+            .get(&job_id)
+            .ok_or(JobManagerError::JobNotFound(job_id))?;
+        if job.state() != JobState::Queued {
+            return Err(JobManagerError::JobNotQueued {
+                job_id,
+                state: job.state(),
+            });
+        }
+        let unavailable_nodes = self.unavailable_node_ids();
+        Ok(scheduler
+            .select_node(job.spec().requirements, registry, &unavailable_nodes)
+            .err())
+    }
+
+    pub fn request_job_cancellation(
+        &mut self,
+        job_id: JobId,
+    ) -> Result<Option<ExecutionId>, JobManagerError> {
+        let state = self
+            .jobs
+            .get(&job_id)
+            .ok_or(JobManagerError::JobNotFound(job_id))?
+            .state();
+
+        if matches!(state, JobState::Submitted | JobState::Queued) {
+            self.jobs
+                .get_mut(&job_id)
+                .expect("job was verified above")
+                .request_cancellation()
+                .map_err(JobManagerError::InvalidJobState)?;
+            self.remove_pending_job(job_id);
+            self.job_submitted_at.remove(&job_id);
+            return Ok(None);
+        }
+
+        let execution_id = self
+            .latest_execution_for_job(job_id)
+            .map(Execution::id)
+            .ok_or(JobManagerError::JobHasNoExecution(job_id))?;
+        self.jobs
+            .get_mut(&job_id)
+            .expect("job was verified above")
+            .request_cancellation()
+            .map_err(JobManagerError::InvalidJobState)?;
+        self.cancellation_requests.insert(execution_id);
+        self.job_submitted_at.remove(&job_id);
+        Ok(Some(execution_id))
+    }
+
+    pub fn cancellation_requested(&self, execution_id: ExecutionId, node_id: NodeId) -> bool {
+        self.cancellation_requests.contains(&execution_id)
+            && self
+                .executions
+                .get(&execution_id)
+                .is_some_and(|execution| execution.node_id() == node_id)
+    }
+
+    pub fn job_timeout_requested(&self, execution_id: ExecutionId) -> bool {
+        self.job_timeout_requests.contains(&execution_id)
+    }
+
+    pub fn job_timeout_applies(&self, execution_id: ExecutionId) -> bool {
+        self.job_timeout_requested(execution_id)
+            || self
+                .executions
+                .get(&execution_id)
+                .and_then(|execution| self.jobs.get(&execution.job_id()))
+                .is_some_and(|job| matches!(job.state(), JobState::TimingOut | JobState::TimedOut))
+    }
+
+    pub fn expire_jobs_at(&mut self, now: Instant) -> Result<Vec<JobId>, JobManagerError> {
+        let expired = self
+            .job_submitted_at
+            .iter()
+            .filter_map(|(job_id, submitted_at)| {
+                let timeout_secs = self.jobs.get(job_id)?.spec().job_timeout_secs?;
+                (now.saturating_duration_since(*submitted_at) >= Duration::from_secs(timeout_secs))
+                    .then_some(*job_id)
+            })
+            .collect::<Vec<_>>();
+        let mut timed_out = Vec::with_capacity(expired.len());
+
+        for job_id in expired {
+            let state = self
+                .jobs
+                .get(&job_id)
+                .ok_or(JobManagerError::JobNotFound(job_id))?
+                .state();
+            let timeout_started = match state {
+                JobState::Submitted | JobState::Queued => {
+                    self.jobs
+                        .get_mut(&job_id)
+                        .expect("job was verified above")
+                        .mark_timed_out()
+                        .map_err(JobManagerError::InvalidJobState)?;
+                    self.remove_pending_job(job_id);
+                    true
+                }
+                JobState::Assigned | JobState::Running => {
+                    let execution_id = self
+                        .latest_execution_for_job(job_id)
+                        .map(Execution::id)
+                        .ok_or(JobManagerError::JobHasNoExecution(job_id))?;
+                    let execution_state = self
+                        .executions
+                        .get(&execution_id)
+                        .expect("latest execution should remain stored")
+                        .state();
+                    if execution_state == ExecutionState::Assigned {
+                        self.executions
+                            .get_mut(&execution_id)
+                            .expect("execution was verified above")
+                            .mark_timed_out()
+                            .map_err(JobManagerError::InvalidExecutionState)?;
+                        self.jobs
+                            .get_mut(&job_id)
+                            .expect("job was verified above")
+                            .mark_timed_out()
+                            .map_err(JobManagerError::InvalidJobState)?;
+                    } else {
+                        self.request_execution_job_timeout(execution_id)?;
+                    }
+                    true
+                }
+                JobState::Cancelling
+                | JobState::TimingOut
+                | JobState::Succeeded
+                | JobState::Failed
+                | JobState::Cancelled
+                | JobState::TimedOut
+                | JobState::Lost => false,
+            };
+
+            self.job_submitted_at.remove(&job_id);
+            if timeout_started {
+                timed_out.push(job_id);
+            }
+        }
+
+        Ok(timed_out)
+    }
+
+    fn request_execution_job_timeout(
+        &mut self,
+        execution_id: ExecutionId,
+    ) -> Result<(), JobManagerError> {
+        let job_id = self.preflight_linked_transition(
+            execution_id,
+            ExecutionState::Cancelling,
+            JobState::TimingOut,
+        )?;
+        self.executions
+            .get_mut(&execution_id)
+            .expect("execution was verified above")
+            .request_cancellation()
+            .expect("execution transition was preflighted");
+        self.jobs
+            .get_mut(&job_id)
+            .expect("linked job was verified above")
+            .request_timeout()
+            .expect("job transition was preflighted");
+        self.cancellation_requests.insert(execution_id);
+        self.job_timeout_requests.insert(execution_id);
+        Ok(())
+    }
+
+    /// Returns the assignment that still awaits acknowledgement from one node.
+    pub fn pending_assignment_for(
+        &self,
+        node_id: NodeId,
+    ) -> Result<Option<ExecutionAssignment>, JobManagerError> {
+        let Some(execution) = self.executions.values().find(|execution| {
+            execution.node_id() == node_id && execution.state() == ExecutionState::Assigned
+        }) else {
+            return Ok(None);
+        };
+        let job = self
+            .jobs
+            .get(&execution.job_id())
+            .ok_or(JobManagerError::JobNotFound(execution.job_id()))?;
+
+        Ok(Some(ExecutionAssignment {
+            execution_id: execution.id(),
+            job_id: job.id(),
+            node_id,
+            spec: job.spec().clone(),
+        }))
     }
 
     /// Records that the selected node accepted an assignment.
@@ -93,22 +351,39 @@ impl JobManager {
 
     /// Records process start and moves the logical job to Running.
     pub fn start_execution(&mut self, execution_id: ExecutionId) -> Result<(), JobManagerError> {
-        let job_id = self.preflight_linked_transition(
-            execution_id,
-            ExecutionState::Running,
-            JobState::Running,
-        )?;
+        let execution = self
+            .executions
+            .get(&execution_id)
+            .ok_or(JobManagerError::ExecutionNotFound(execution_id))?;
+        if !execution.state().can_transition_to(ExecutionState::Running) {
+            return Err(JobManagerError::InvalidExecutionState(
+                InvalidStateTransition::new(execution.state(), ExecutionState::Running),
+            ));
+        }
+        let job_id = execution.job_id();
+        let job_state = self
+            .jobs
+            .get(&job_id)
+            .ok_or(JobManagerError::JobNotFound(job_id))?
+            .state();
+        if job_state != JobState::Cancelling && !job_state.can_transition_to(JobState::Running) {
+            return Err(JobManagerError::InvalidJobState(
+                InvalidStateTransition::new(job_state, JobState::Running),
+            ));
+        }
 
         self.executions
             .get_mut(&execution_id)
             .expect("execution was verified above")
             .start()
             .expect("execution transition was preflighted");
-        self.jobs
-            .get_mut(&job_id)
-            .expect("linked job was verified above")
-            .mark_running()
-            .expect("job transition was preflighted");
+        if job_state != JobState::Cancelling {
+            self.jobs
+                .get_mut(&job_id)
+                .expect("linked job was verified above")
+                .mark_running()
+                .expect("job transition was preflighted");
+        }
 
         Ok(())
     }
@@ -131,6 +406,9 @@ impl JobManager {
             .expect("linked job was verified above")
             .queue()
             .expect("job transition was preflighted");
+        if !self.pending_jobs.contains(&job_id) {
+            self.pending_jobs.push_front(job_id);
+        }
 
         Ok(())
     }
@@ -165,6 +443,26 @@ impl JobManager {
         &mut self,
         execution_id: ExecutionId,
     ) -> Result<(), JobManagerError> {
+        self.confirm_execution_cancellation_with_output(execution_id, ExecutionOutput::default())
+    }
+
+    pub fn confirm_execution_cancellation_with_output(
+        &mut self,
+        execution_id: ExecutionId,
+        output: ExecutionOutput,
+    ) -> Result<(), JobManagerError> {
+        let state = self
+            .executions
+            .get(&execution_id)
+            .ok_or(JobManagerError::ExecutionNotFound(execution_id))?
+            .state();
+        if state != ExecutionState::Cancelling {
+            self.executions
+                .get_mut(&execution_id)
+                .expect("execution was verified above")
+                .request_cancellation()
+                .map_err(JobManagerError::InvalidExecutionState)?;
+        }
         let job_id = self.preflight_linked_transition(
             execution_id,
             ExecutionState::Cancelled,
@@ -181,7 +479,65 @@ impl JobManager {
             .expect("linked job was verified above")
             .confirm_cancellation()
             .expect("job transition was preflighted");
+        self.outputs.entry(execution_id).or_insert(output);
+        self.cancellation_requests.remove(&execution_id);
+        self.job_timeout_requests.remove(&execution_id);
+        self.job_submitted_at.remove(&job_id);
 
+        Ok(())
+    }
+
+    pub fn confirm_job_timeout_with_output(
+        &mut self,
+        execution_id: ExecutionId,
+        output: ExecutionOutput,
+    ) -> Result<(), JobManagerError> {
+        let job_id = self.preflight_linked_transition(
+            execution_id,
+            ExecutionState::TimedOut,
+            JobState::TimedOut,
+        )?;
+        self.executions
+            .get_mut(&execution_id)
+            .expect("execution was verified above")
+            .mark_timed_out()
+            .expect("execution transition was preflighted");
+        self.jobs
+            .get_mut(&job_id)
+            .expect("linked job was verified above")
+            .mark_timed_out()
+            .expect("job transition was preflighted");
+        self.outputs.entry(execution_id).or_insert(output);
+        self.cancellation_requests.remove(&execution_id);
+        self.job_timeout_requests.remove(&execution_id);
+        self.job_submitted_at.remove(&job_id);
+        Ok(())
+    }
+
+    pub fn mark_execution_timed_out(
+        &mut self,
+        execution_id: ExecutionId,
+        output: ExecutionOutput,
+    ) -> Result<(), JobManagerError> {
+        let job_id = self.preflight_linked_transition(
+            execution_id,
+            ExecutionState::TimedOut,
+            JobState::Failed,
+        )?;
+        self.executions
+            .get_mut(&execution_id)
+            .expect("execution was verified above")
+            .mark_timed_out()
+            .expect("execution transition was preflighted");
+        self.jobs
+            .get_mut(&job_id)
+            .expect("linked job was verified above")
+            .mark_failed()
+            .expect("job transition was preflighted");
+        self.outputs.entry(execution_id).or_insert(output);
+        self.cancellation_requests.remove(&execution_id);
+        self.job_timeout_requests.remove(&execution_id);
+        self.job_submitted_at.remove(&job_id);
         Ok(())
     }
 
@@ -203,6 +559,7 @@ impl JobManager {
             .expect("linked job was verified above")
             .mark_lost()
             .expect("job transition was preflighted");
+        self.job_submitted_at.remove(&job_id);
 
         Ok(())
     }
@@ -212,6 +569,16 @@ impl JobManager {
         &mut self,
         execution_id: ExecutionId,
         result: ExecutionResult,
+    ) -> Result<(), JobManagerError> {
+        self.finish_execution_with_output(execution_id, result, ExecutionOutput::default())
+    }
+
+    /// Records process completion together with its bounded output.
+    pub fn finish_execution_with_output(
+        &mut self,
+        execution_id: ExecutionId,
+        result: ExecutionResult,
+        output: ExecutionOutput,
     ) -> Result<(), JobManagerError> {
         let execution = self
             .executions
@@ -228,6 +595,12 @@ impl JobManager {
             JobState::Failed
         };
 
+        if execution.state() == ExecutionState::Assigned {
+            return Err(JobManagerError::InvalidExecutionState(
+                InvalidStateTransition::new(execution.state(), execution_state),
+            ));
+        }
+
         if let Some(recorded) = execution.result()
             && recorded != result
         {
@@ -237,6 +610,13 @@ impl JobManager {
                     received: result,
                 },
             ));
+        }
+        if self
+            .outputs
+            .get(&execution_id)
+            .is_some_and(|recorded| recorded != &output)
+        {
+            return Err(JobManagerError::ConflictingExecutionOutput(execution_id));
         }
 
         let job_id = self.preflight_linked_transition(execution_id, execution_state, job_state)?;
@@ -257,6 +637,36 @@ impl JobManager {
         } else {
             job.mark_failed().expect("job transition was preflighted");
         }
+        self.outputs.entry(execution_id).or_insert(output);
+        self.cancellation_requests.remove(&execution_id);
+        self.job_timeout_requests.remove(&execution_id);
+        self.job_submitted_at.remove(&job_id);
+
+        Ok(())
+    }
+
+    /// Records that the assigned process could not be started on the node.
+    pub fn fail_execution_start(
+        &mut self,
+        execution_id: ExecutionId,
+    ) -> Result<(), JobManagerError> {
+        let job_id = self.preflight_linked_transition(
+            execution_id,
+            ExecutionState::Failed,
+            JobState::Failed,
+        )?;
+
+        self.executions
+            .get_mut(&execution_id)
+            .expect("execution was verified above")
+            .finish(ExecutionResult { exit_code: None })
+            .map_err(JobManagerError::ExecutionCompletion)?;
+        self.jobs
+            .get_mut(&job_id)
+            .expect("linked job was verified above")
+            .mark_failed()
+            .expect("job transition was preflighted");
+        self.job_submitted_at.remove(&job_id);
 
         Ok(())
     }
@@ -290,17 +700,45 @@ impl JobManager {
 
         Ok(job_id)
     }
+
+    fn remove_pending_job(&mut self, job_id: JobId) {
+        if let Some(index) = self
+            .pending_jobs
+            .iter()
+            .position(|queued| *queued == job_id)
+        {
+            self.pending_jobs.remove(index);
+        }
+    }
+
+    fn unavailable_node_ids(&self) -> BTreeSet<NodeId> {
+        self.executions
+            .values()
+            .filter(|execution| {
+                matches!(
+                    execution.state(),
+                    ExecutionState::Assigned
+                        | ExecutionState::Accepted
+                        | ExecutionState::Running
+                        | ExecutionState::Cancelling
+                )
+            })
+            .map(Execution::node_id)
+            .collect()
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum JobManagerError {
     InvalidSpec(JobSpecValidationError),
     JobNotFound(JobId),
+    JobHasNoExecution(JobId),
     ExecutionNotFound(ExecutionId),
     JobNotQueued { job_id: JobId, state: JobState },
     InvalidJobState(InvalidStateTransition<JobState>),
     InvalidExecutionState(InvalidStateTransition<ExecutionState>),
     ExecutionCompletion(ExecutionCompletionError),
+    ConflictingExecutionOutput(ExecutionId),
     Scheduling(SchedulingFailure),
 }
 
@@ -309,6 +747,9 @@ impl fmt::Display for JobManagerError {
         match self {
             Self::InvalidSpec(error) => error.fmt(formatter),
             Self::JobNotFound(job_id) => write!(formatter, "job {job_id} was not found"),
+            Self::JobHasNoExecution(job_id) => {
+                write!(formatter, "job {job_id} has no execution")
+            }
             Self::ExecutionNotFound(execution_id) => {
                 write!(formatter, "execution {execution_id} was not found")
             }
@@ -321,6 +762,12 @@ impl fmt::Display for JobManagerError {
             Self::InvalidJobState(error) => error.fmt(formatter),
             Self::InvalidExecutionState(error) => error.fmt(formatter),
             Self::ExecutionCompletion(error) => error.fmt(formatter),
+            Self::ConflictingExecutionOutput(execution_id) => {
+                write!(
+                    formatter,
+                    "execution {execution_id} reported conflicting output"
+                )
+            }
             Self::Scheduling(error) => error.fmt(formatter),
         }
     }
@@ -331,7 +778,8 @@ impl Error for JobManagerError {}
 #[cfg(test)]
 mod tests {
     use meld_core::{
-        NodeDescriptor, NodeId, ResourceCapacity, ResourceRequirements, ResourceSnapshot,
+        CapturedStream, NodeDescriptor, NodeId, ResourceCapacity, ResourceRequirements,
+        ResourceSnapshot,
     };
 
     use super::*;
@@ -367,6 +815,40 @@ mod tests {
     }
 
     #[test]
+    fn assigned_execution_is_exposed_until_acknowledged() {
+        let mut manager = JobManager::new();
+        let expected_spec = spec();
+        let job_id = manager
+            .submit(expected_spec.clone())
+            .expect("valid job should be queued");
+        let (registry, node_id) = ready_registry();
+        let execution_id = manager
+            .schedule_next(&Scheduler::new(), &registry)
+            .expect("queued job should be schedulable")
+            .expect("one job should be queued");
+
+        let assignment = manager
+            .pending_assignment_for(node_id)
+            .expect("linked job should exist")
+            .expect("assigned execution should be pending");
+
+        assert_eq!(assignment.execution_id, execution_id);
+        assert_eq!(assignment.job_id, job_id);
+        assert_eq!(assignment.node_id, node_id);
+        assert_eq!(assignment.spec, expected_spec);
+
+        manager
+            .accept_execution(execution_id)
+            .expect("assignment acknowledgement should be accepted");
+        assert_eq!(
+            manager
+                .pending_assignment_for(node_id)
+                .expect("linked job should still exist"),
+            None
+        );
+    }
+
+    #[test]
     fn scheduling_failure_leaves_job_queued() {
         let mut manager = JobManager::new();
         let job_id = manager.submit(spec()).expect("valid job should be queued");
@@ -380,6 +862,100 @@ mod tests {
             JobManagerError::Scheduling(SchedulingFailure::NoReadyNodes)
         );
         assert_eq!(manager.job(job_id).map(Job::state), Some(JobState::Queued));
+    }
+
+    #[test]
+    fn active_node_does_not_receive_another_execution() {
+        let mut manager = JobManager::new();
+        let first_job_id = manager.submit(spec()).expect("first job should be queued");
+        let (registry, _) = ready_registry();
+        manager
+            .schedule(first_job_id, &Scheduler::new(), &registry)
+            .expect("first job should be assigned");
+        let second_job_id = manager.submit(spec()).expect("second job should be queued");
+
+        let error = manager
+            .schedule_next(&Scheduler::new(), &registry)
+            .expect_err("active node must not receive another execution");
+
+        assert_eq!(
+            error,
+            JobManagerError::Scheduling(SchedulingFailure::NoAvailableNodes)
+        );
+        assert_eq!(
+            manager.job(second_job_id).map(Job::state),
+            Some(JobState::Queued)
+        );
+    }
+
+    #[test]
+    fn schedule_next_selects_jobs_in_submission_order() {
+        let mut manager = JobManager::new();
+        let first_job_id = manager
+            .submit(spec())
+            .expect("first valid job should be queued");
+        let mut second_spec = spec();
+        second_spec.program = "cargo".to_owned();
+        let second_job_id = manager
+            .submit(second_spec)
+            .expect("second valid job should be queued");
+        let (registry, _) = ready_registry();
+
+        let execution_id = manager
+            .schedule_next(&Scheduler::new(), &registry)
+            .expect("oldest queued job should be schedulable")
+            .expect("one job should be queued");
+
+        assert_eq!(
+            manager.execution(execution_id).map(Execution::job_id),
+            Some(first_job_id)
+        );
+        assert_eq!(
+            manager.job(second_job_id).map(Job::state),
+            Some(JobState::Queued)
+        );
+    }
+
+    #[test]
+    fn unschedulable_head_job_is_not_overtaken() {
+        let mut manager = JobManager::new();
+        let mut oversized_spec = spec();
+        oversized_spec.requirements.logical_cpus = 9;
+        let first_job_id = manager
+            .submit(oversized_spec)
+            .expect("oversized job should still be queued");
+        let second_job_id = manager
+            .submit(spec())
+            .expect("second valid job should be queued");
+        let (registry, _) = ready_registry();
+
+        let error = manager
+            .schedule_next(&Scheduler::new(), &registry)
+            .expect_err("insufficient capacity for the head job should stop FIFO scheduling");
+
+        assert_eq!(
+            error,
+            JobManagerError::Scheduling(SchedulingFailure::InsufficientResources)
+        );
+        assert_eq!(
+            manager.job(first_job_id).map(Job::state),
+            Some(JobState::Queued)
+        );
+        assert_eq!(
+            manager.job(second_job_id).map(Job::state),
+            Some(JobState::Queued)
+        );
+    }
+
+    #[test]
+    fn schedule_next_returns_none_when_queue_is_empty() {
+        let mut manager = JobManager::new();
+
+        let execution_id = manager
+            .schedule_next(&Scheduler::new(), &NodeRegistry::new())
+            .expect("an empty queue is not a scheduling failure");
+
+        assert_eq!(execution_id, None);
     }
 
     #[test]
@@ -429,6 +1005,39 @@ mod tests {
     }
 
     #[test]
+    fn finished_execution_stores_output_for_latest_attempt() {
+        let (mut manager, job_id, execution_id) = assigned_job();
+        manager
+            .accept_execution(execution_id)
+            .expect("assignment should be accepted");
+        manager
+            .start_execution(execution_id)
+            .expect("execution should start");
+        let output = ExecutionOutput {
+            stdout: CapturedStream {
+                content: "done\n".to_owned(),
+                truncated: false,
+                lossy: false,
+            },
+            stderr: CapturedStream::default(),
+        };
+
+        manager
+            .finish_execution_with_output(
+                execution_id,
+                ExecutionResult { exit_code: Some(0) },
+                output.clone(),
+            )
+            .expect("execution output should be recorded");
+
+        assert_eq!(
+            manager.latest_execution_for_job(job_id).map(Execution::id),
+            Some(execution_id)
+        );
+        assert_eq!(manager.execution_output(execution_id), Some(&output));
+    }
+
+    #[test]
     fn failed_execution_fails_linked_job() {
         let (mut manager, job_id, execution_id) = assigned_job();
         manager
@@ -450,6 +1059,38 @@ mod tests {
     }
 
     #[test]
+    fn process_start_failure_fails_job_without_requeueing() {
+        let (mut manager, job_id, execution_id) = assigned_job();
+
+        manager
+            .fail_execution_start(execution_id)
+            .expect("process start failure should be recorded");
+
+        assert_eq!(
+            manager.execution(execution_id).map(Execution::state),
+            Some(ExecutionState::Failed)
+        );
+        assert_eq!(manager.job(job_id).map(Job::state), Some(JobState::Failed));
+        assert_eq!(
+            manager
+                .schedule_next(&Scheduler::new(), &NodeRegistry::new())
+                .expect("failed job must not remain queued"),
+            None
+        );
+    }
+
+    #[test]
+    fn ordinary_finished_event_cannot_skip_process_start() {
+        let (mut manager, _, execution_id) = assigned_job();
+
+        let error = manager
+            .finish_execution(execution_id, ExecutionResult { exit_code: Some(1) })
+            .expect_err("ordinary completion must not be accepted before process start");
+
+        assert!(matches!(error, JobManagerError::InvalidExecutionState(_)));
+    }
+
+    #[test]
     fn rejected_execution_returns_job_to_queue() {
         let (mut manager, job_id, execution_id) = assigned_job();
 
@@ -462,6 +1103,121 @@ mod tests {
             Some(ExecutionState::Rejected)
         );
         assert_eq!(manager.job(job_id).map(Job::state), Some(JobState::Queued));
+    }
+
+    #[test]
+    fn queued_job_timeout_removes_job_from_fifo_queue() {
+        let submitted_at = Instant::now();
+        let mut manager = JobManager::new();
+        let mut timed_spec = spec();
+        timed_spec.job_timeout_secs = Some(5);
+        let job_id = manager
+            .submit_at(timed_spec, submitted_at)
+            .expect("valid job should be queued");
+
+        assert!(
+            manager
+                .expire_jobs_at(submitted_at + Duration::from_secs(4))
+                .expect("timeout scan should succeed")
+                .is_empty()
+        );
+        assert_eq!(
+            manager
+                .expire_jobs_at(submitted_at + Duration::from_secs(5))
+                .expect("timeout scan should succeed"),
+            vec![job_id]
+        );
+        assert_eq!(
+            manager.job(job_id).map(Job::state),
+            Some(JobState::TimedOut)
+        );
+        assert_eq!(manager.pending_position(job_id), None);
+    }
+
+    #[test]
+    fn unacknowledged_assignment_times_out_without_remote_confirmation() {
+        let submitted_at = Instant::now();
+        let mut manager = JobManager::new();
+        let mut timed_spec = spec();
+        timed_spec.job_timeout_secs = Some(5);
+        let job_id = manager
+            .submit_at(timed_spec, submitted_at)
+            .expect("valid job should be queued");
+        let (registry, _) = ready_registry();
+        let execution_id = manager
+            .schedule(job_id, &Scheduler::new(), &registry)
+            .expect("job should be assigned");
+
+        manager
+            .expire_jobs_at(submitted_at + Duration::from_secs(5))
+            .expect("timeout scan should succeed");
+
+        assert_eq!(
+            manager.job(job_id).map(Job::state),
+            Some(JobState::TimedOut)
+        );
+        assert_eq!(
+            manager.execution(execution_id).map(Execution::state),
+            Some(ExecutionState::TimedOut)
+        );
+        assert!(!manager.job_timeout_requested(execution_id));
+    }
+
+    #[test]
+    fn running_job_timeout_waits_for_node_and_preserves_partial_output() {
+        let submitted_at = Instant::now();
+        let mut manager = JobManager::new();
+        let mut timed_spec = spec();
+        timed_spec.job_timeout_secs = Some(5);
+        let job_id = manager
+            .submit_at(timed_spec, submitted_at)
+            .expect("valid job should be queued");
+        let (registry, node_id) = ready_registry();
+        let execution_id = manager
+            .schedule(job_id, &Scheduler::new(), &registry)
+            .expect("job should be assigned");
+        manager
+            .accept_execution(execution_id)
+            .expect("assignment should be accepted");
+        manager
+            .start_execution(execution_id)
+            .expect("execution should start");
+
+        manager
+            .expire_jobs_at(submitted_at + Duration::from_secs(5))
+            .expect("timeout scan should succeed");
+        assert_eq!(
+            manager.job(job_id).map(Job::state),
+            Some(JobState::TimingOut)
+        );
+        assert_eq!(
+            manager.execution(execution_id).map(Execution::state),
+            Some(ExecutionState::Cancelling)
+        );
+        assert!(manager.cancellation_requested(execution_id, node_id));
+        assert!(manager.job_timeout_requested(execution_id));
+
+        let output = ExecutionOutput {
+            stdout: CapturedStream {
+                content: "before job timeout\n".to_owned(),
+                truncated: false,
+                lossy: false,
+            },
+            stderr: CapturedStream::default(),
+        };
+        manager
+            .confirm_job_timeout_with_output(execution_id, output.clone())
+            .expect("node confirmation should complete timeout");
+
+        assert_eq!(
+            manager.job(job_id).map(Job::state),
+            Some(JobState::TimedOut)
+        );
+        assert_eq!(
+            manager.execution(execution_id).map(Execution::state),
+            Some(ExecutionState::TimedOut)
+        );
+        assert_eq!(manager.execution_output(execution_id), Some(&output));
     }
 
     #[test]
@@ -534,6 +1290,8 @@ mod tests {
                 logical_cpus: 1,
                 memory_bytes: 256_000_000,
             },
+            job_timeout_secs: None,
+            execution_timeout_secs: None,
         }
     }
 

@@ -72,6 +72,12 @@ impl Execution {
         self.state.transition_to(ExecutionState::Lost)
     }
 
+    pub fn mark_timed_out(&mut self) -> Result<(), InvalidStateTransition<ExecutionState>> {
+        self.state.transition_to(ExecutionState::TimedOut)?;
+        self.result = Some(ExecutionResult { exit_code: None });
+        Ok(())
+    }
+
     /// Records process completion and derives the terminal state from its exit code.
     pub fn finish(&mut self, result: ExecutionResult) -> Result<(), ExecutionCompletionError> {
         if let Some(recorded) = self.result
@@ -109,6 +115,7 @@ pub enum ExecutionState {
     Succeeded,
     Failed,
     Cancelled,
+    TimedOut,
     Rejected,
     /// The controller can no longer determine whether the process is running.
     Lost,
@@ -125,16 +132,21 @@ impl ExecutionState {
                 (self, next),
                 (
                     Self::Assigned,
-                    Self::Accepted | Self::Cancelling | Self::Rejected | Self::Lost
+                    Self::Accepted
+                        | Self::Failed
+                        | Self::Cancelling
+                        | Self::TimedOut
+                        | Self::Rejected
+                        | Self::Lost
                 ) | (
                     Self::Accepted,
-                    Self::Running | Self::Cancelling | Self::Lost
+                    Self::Running | Self::Failed | Self::Cancelling | Self::Lost
                 ) | (
                     Self::Running,
-                    Self::Succeeded | Self::Failed | Self::Cancelling | Self::Lost
+                    Self::Succeeded | Self::Failed | Self::Cancelling | Self::TimedOut | Self::Lost
                 ) | (
                     Self::Cancelling,
-                    Self::Succeeded | Self::Failed | Self::Cancelled | Self::Lost
+                    Self::Succeeded | Self::Failed | Self::Cancelled | Self::TimedOut | Self::Lost
                 )
             )
     }
@@ -155,6 +167,21 @@ impl ExecutionState {
 pub struct ExecutionResult {
     /// Process exit code, or `None` when no code is available.
     pub exit_code: Option<i32>,
+}
+
+/// Text captured from one process output stream.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CapturedStream {
+    pub content: String,
+    pub truncated: bool,
+    pub lossy: bool,
+}
+
+/// Bounded stdout and stderr captured for one execution.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ExecutionOutput {
+    pub stdout: CapturedStream,
+    pub stderr: CapturedStream,
 }
 
 /// Failure to apply a process completion report.

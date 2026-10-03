@@ -142,6 +142,16 @@ controller内部でin-memoryのNode Manager、Job Manager、単純schedulerを�
 
 まず単一jobの意味を明確にします。
 
+### 現在地
+
+完了しています。`meld` CLIからのjob投入、FIFO queue、Readyかつ要求資源を満たすnodeの選択、long pollingによるcommand配信、assignment acknowledgement、node上の分離workspaceとnative process実行を実装しました。
+
+`meld status / logs / cancel`から状態、実行node、stdout、stderr、exit codeを確認でき、実行中jobのcancel、process開始後のexecution timeout、submitから完了までのjob timeoutを扱えます。Queued jobは`no_ready_nodes`、`insufficient_resources`、`no_available_nodes`、`waiting_for_earlier_job`、`awaiting_assignment`の理由を表示します。
+
+assignmentはprocess起動前にNodeがAcceptedを報告し、同じexecutionの再送で二重起動しない順序にしています。正常終了、起動失敗、cancel、execution timeout、queue中と実行中のjob timeout、部分ログ回収をunit/API testと実processのend-to-end testで検証しました。共有protocol contractはversion 5です。
+
+controllerとnodeの再起動をまたぐdeadline復元や完全なreconciliationはPhase 6、認証・暗号化・実行隔離はPhase 7で扱います。それまではlocalhostまたは信頼された開発用LANに限定します。
+
 ## 6. Phase 4 — Scheduling and Resource Accounting
 
 ### 目的

@@ -17,6 +17,12 @@ pub struct JobSpec {
     /// Arguments passed to the executable in their original boundaries.
     pub args: Vec<String>,
     pub requirements: ResourceRequirements,
+    /// Maximum time from controller submission until terminal completion.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub job_timeout_secs: Option<u64>,
+    /// Maximum process runtime after the node starts execution.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub execution_timeout_secs: Option<u64>,
 }
 
 impl JobSpec {
@@ -31,6 +37,12 @@ impl JobSpec {
         if self.requirements.memory_bytes == 0 {
             return Err(JobSpecValidationError::ZeroMemory);
         }
+        if self.job_timeout_secs == Some(0) {
+            return Err(JobSpecValidationError::ZeroJobTimeout);
+        }
+        if self.execution_timeout_secs == Some(0) {
+            return Err(JobSpecValidationError::ZeroExecutionTimeout);
+        }
         Ok(())
     }
 }
@@ -40,6 +52,8 @@ pub enum JobSpecValidationError {
     EmptyProgram,
     ZeroLogicalCpus,
     ZeroMemory,
+    ZeroJobTimeout,
+    ZeroExecutionTimeout,
 }
 
 impl fmt::Display for JobSpecValidationError {
@@ -50,6 +64,10 @@ impl fmt::Display for JobSpecValidationError {
                 formatter.write_str("job must request at least one logical CPU")
             }
             Self::ZeroMemory => formatter.write_str("job must request at least one byte of memory"),
+            Self::ZeroJobTimeout => formatter.write_str("job timeout must be greater than zero"),
+            Self::ZeroExecutionTimeout => {
+                formatter.write_str("execution timeout must be greater than zero")
+            }
         }
     }
 }
@@ -104,7 +122,11 @@ impl Job {
         let next = match self.state {
             JobState::Submitted | JobState::Queued | JobState::Cancelled => JobState::Cancelled,
             JobState::Assigned | JobState::Running | JobState::Cancelling => JobState::Cancelling,
-            JobState::Succeeded | JobState::Failed | JobState::Lost => JobState::Cancelling,
+            JobState::TimingOut
+            | JobState::Succeeded
+            | JobState::Failed
+            | JobState::TimedOut
+            | JobState::Lost => JobState::Cancelling,
         };
 
         self.state.transition_to(next)
@@ -122,6 +144,14 @@ impl Job {
         self.state.transition_to(JobState::Failed)
     }
 
+    pub fn request_timeout(&mut self) -> Result<(), InvalidStateTransition<JobState>> {
+        self.state.transition_to(JobState::TimingOut)
+    }
+
+    pub fn mark_timed_out(&mut self) -> Result<(), InvalidStateTransition<JobState>> {
+        self.state.transition_to(JobState::TimedOut)
+    }
+
     pub fn mark_lost(&mut self) -> Result<(), InvalidStateTransition<JobState>> {
         self.state.transition_to(JobState::Lost)
     }
@@ -136,9 +166,11 @@ pub enum JobState {
     Assigned,
     Running,
     Cancelling,
+    TimingOut,
     Succeeded,
     Failed,
     Cancelled,
+    TimedOut,
     /// The controller can no longer determine whether the process is running.
     Lost,
 }
@@ -156,16 +188,28 @@ impl JobState {
                     | (Self::Queued, Self::Assigned | Self::Cancelled)
                     | (
                         Self::Assigned,
-                        Self::Queued | Self::Running | Self::Cancelling | Self::Lost
+                        Self::Queued
+                            | Self::Running
+                            | Self::Failed
+                            | Self::Cancelling
+                            | Self::TimingOut
+                            | Self::TimedOut
+                            | Self::Lost
                     )
                     | (
                         Self::Running,
-                        Self::Succeeded | Self::Failed | Self::Cancelling | Self::Lost
+                        Self::Succeeded
+                            | Self::Failed
+                            | Self::Cancelling
+                            | Self::TimingOut
+                            | Self::Lost
                     )
                     | (
                         Self::Cancelling,
                         Self::Succeeded | Self::Failed | Self::Cancelled | Self::Lost
                     )
+                    | (Self::Submitted | Self::Queued, Self::TimedOut)
+                    | (Self::TimingOut, Self::TimedOut | Self::Lost)
             )
     }
 
@@ -193,6 +237,8 @@ mod tests {
                 logical_cpus: 1,
                 memory_bytes: 256_000_000,
             },
+            job_timeout_secs: None,
+            execution_timeout_secs: None,
         };
 
         let json = serde_json::to_string(&spec).expect("job spec should serialize");
@@ -259,6 +305,8 @@ mod tests {
                 logical_cpus: 1,
                 memory_bytes: 256_000_000,
             },
+            job_timeout_secs: None,
+            execution_timeout_secs: None,
         };
 
         let job = Job::new(spec.clone()).expect("valid spec should create a job");
@@ -276,6 +324,8 @@ mod tests {
                 logical_cpus: 1,
                 memory_bytes: 256_000_000,
             },
+            job_timeout_secs: None,
+            execution_timeout_secs: None,
         })
         .expect("valid spec should create a job");
         job.queue().expect("job should be queued");
@@ -295,9 +345,45 @@ mod tests {
                 logical_cpus: 1,
                 memory_bytes: 1,
             },
+            job_timeout_secs: None,
+            execution_timeout_secs: None,
         })
         .expect_err("blank program must be rejected");
 
         assert_eq!(error, JobSpecValidationError::EmptyProgram);
+    }
+
+    #[test]
+    fn zero_execution_timeout_is_rejected() {
+        let error = Job::new(JobSpec {
+            program: "rustc".to_owned(),
+            args: Vec::new(),
+            requirements: ResourceRequirements {
+                logical_cpus: 1,
+                memory_bytes: 1,
+            },
+            job_timeout_secs: None,
+            execution_timeout_secs: Some(0),
+        })
+        .expect_err("zero execution timeout must be rejected");
+
+        assert_eq!(error, JobSpecValidationError::ZeroExecutionTimeout);
+    }
+
+    #[test]
+    fn zero_job_timeout_is_rejected() {
+        let error = Job::new(JobSpec {
+            program: "rustc".to_owned(),
+            args: Vec::new(),
+            requirements: ResourceRequirements {
+                logical_cpus: 1,
+                memory_bytes: 1,
+            },
+            job_timeout_secs: Some(0),
+            execution_timeout_secs: None,
+        })
+        .expect_err("zero job timeout must be rejected");
+
+        assert_eq!(error, JobSpecValidationError::ZeroJobTimeout);
     }
 }

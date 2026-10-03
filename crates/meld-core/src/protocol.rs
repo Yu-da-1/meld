@@ -3,12 +3,12 @@
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    ExecutionId, ExecutionResult, JobId, JobSpec, MessageId, NodeDescriptor, NodeId,
-    ResourceSnapshot,
+    ExecutionId, ExecutionOutput, ExecutionResult, JobId, JobSpec, MessageId, NodeDescriptor,
+    NodeId, ResourceSnapshot,
 };
 
 /// Protocol version implemented by this build.
-pub const CURRENT_PROTOCOL_VERSION: ProtocolVersion = ProtocolVersion::new(1);
+pub const CURRENT_PROTOCOL_VERSION: ProtocolVersion = ProtocolVersion::new(5);
 
 /// Version of the controller-node message contract.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -113,18 +113,26 @@ pub struct Acknowledgement {
     pub metadata: ResponseMetadata,
 }
 
-/// Starts a long poll for the next assignment for a node.
+/// Polls for the next control command for a node.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-pub struct PollAssignmentRequest {
+pub struct PollNodeCommandRequest {
     pub metadata: RequestMetadata,
     pub node_id: NodeId,
+    pub active_execution_id: Option<ExecutionId>,
 }
 
-/// Returns an assignment or no value when the long poll expires.
+/// Returns a control command or no value when the poll expires.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct PollAssignmentResponse {
+pub struct PollNodeCommandResponse {
     pub metadata: ResponseMetadata,
-    pub assignment: Option<ExecutionAssignment>,
+    pub command: Option<NodeCommand>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum NodeCommand {
+    Start { assignment: ExecutionAssignment },
+    Cancel { execution_id: ExecutionId },
 }
 
 /// Tells one node to execute one attempt of a logical job.
@@ -151,14 +159,27 @@ pub struct ReportExecutionEventRequest {
 pub enum ExecutionEvent {
     Accepted,
     Running,
-    Finished { result: ExecutionResult },
-    Rejected { reason: String },
-    Cancelled,
+    Finished {
+        result: ExecutionResult,
+        output: ExecutionOutput,
+    },
+    StartFailed {
+        reason: String,
+    },
+    Rejected {
+        reason: String,
+    },
+    Cancelled {
+        output: ExecutionOutput,
+    },
+    TimedOut {
+        output: ExecutionOutput,
+    },
 }
 
 #[cfg(test)]
 mod tests {
-    use crate::{ResourceCapacity, ResourceRequirements};
+    use crate::{CapturedStream, ResourceCapacity, ResourceRequirements};
 
     use super::*;
 
@@ -193,18 +214,22 @@ mod tests {
     #[test]
     fn assignment_round_trips_through_json() {
         let request = RequestMetadata::new();
-        let response = PollAssignmentResponse {
+        let response = PollNodeCommandResponse {
             metadata: ResponseMetadata::for_request(request),
-            assignment: Some(ExecutionAssignment {
-                execution_id: ExecutionId::generate(),
-                job_id: JobId::generate(),
-                node_id: NodeId::generate(),
-                spec: JobSpec {
-                    program: "rustc".to_owned(),
-                    args: vec!["--version".to_owned()],
-                    requirements: ResourceRequirements {
-                        logical_cpus: 1,
-                        memory_bytes: 256_000_000,
+            command: Some(NodeCommand::Start {
+                assignment: ExecutionAssignment {
+                    execution_id: ExecutionId::generate(),
+                    job_id: JobId::generate(),
+                    node_id: NodeId::generate(),
+                    spec: JobSpec {
+                        program: "rustc".to_owned(),
+                        args: vec!["--version".to_owned()],
+                        requirements: ResourceRequirements {
+                            logical_cpus: 1,
+                            memory_bytes: 256_000_000,
+                        },
+                        job_timeout_secs: None,
+                        execution_timeout_secs: None,
                     },
                 },
             }),
@@ -222,6 +247,18 @@ mod tests {
             execution_id: ExecutionId::generate(),
             event: ExecutionEvent::Finished {
                 result: ExecutionResult { exit_code: Some(0) },
+                output: ExecutionOutput {
+                    stdout: CapturedStream {
+                        content: "done\n".to_owned(),
+                        truncated: false,
+                        lossy: false,
+                    },
+                    stderr: CapturedStream {
+                        content: String::new(),
+                        truncated: false,
+                        lossy: false,
+                    },
+                },
             },
         };
 

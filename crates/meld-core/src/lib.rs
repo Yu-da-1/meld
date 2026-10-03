@@ -1,5 +1,6 @@
 //! Shared domain model and protocol contracts for Meld.
 
+mod client;
 mod execution;
 mod id;
 mod job;
@@ -8,13 +9,20 @@ mod protocol;
 mod resource;
 mod transition;
 
-pub use execution::{Execution, ExecutionCompletionError, ExecutionResult, ExecutionState};
+pub use client::{
+    ApiErrorResponse, CancelJobResponse, ExecutionView, JobLogsResponse, JobStatusResponse,
+    ListNodesResponse, NodeView, QueueReason, SubmitJobResponse,
+};
+pub use execution::{
+    CapturedStream, Execution, ExecutionCompletionError, ExecutionOutput, ExecutionResult,
+    ExecutionState,
+};
 pub use id::{ExecutionId, JobId, MessageId, NodeId};
 pub use job::{Job, JobSpec, JobSpecValidationError, JobState};
 pub use node::{NodeDescriptor, NodeState};
 pub use protocol::{
     Acknowledgement, CURRENT_PROTOCOL_VERSION, ExecutionAssignment, ExecutionEvent,
-    HeartbeatRequest, PollAssignmentRequest, PollAssignmentResponse, ProtocolError,
+    HeartbeatRequest, NodeCommand, PollNodeCommandRequest, PollNodeCommandResponse, ProtocolError,
     ProtocolErrorResponse, ProtocolVersion, RegisterNodeRequest, RegisterNodeResponse,
     ReportExecutionEventRequest, RequestMetadata, ResponseMetadata,
 };

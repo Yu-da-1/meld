@@ -1,5 +1,6 @@
 [workspace]
 members = [
+    "crates/meld-cli",
     "crates/meld-controller",
     "crates/meld-node",
     "crates/meld-core",

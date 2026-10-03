@@ -3,16 +3,21 @@
 use std::{error::Error, fmt, time::Duration};
 
 use meld_core::{
-    Acknowledgement, CURRENT_PROTOCOL_VERSION, HeartbeatRequest, NodeDescriptor, NodeId,
+    Acknowledgement, CURRENT_PROTOCOL_VERSION, ExecutionEvent, ExecutionId, HeartbeatRequest,
+    NodeCommand, NodeDescriptor, NodeId, PollNodeCommandRequest, PollNodeCommandResponse,
     ProtocolError, ProtocolErrorResponse, RegisterNodeRequest, RegisterNodeResponse,
-    RequestMetadata, ResourceSnapshot, ResponseMetadata,
+    ReportExecutionEventRequest, RequestMetadata, ResourceSnapshot, ResponseMetadata,
 };
 use reqwest::{Client, Response, StatusCode};
 
 const REGISTER_NODE_PATH: &str = "/v1/nodes/register";
 const HEARTBEAT_PATH: &str = "/v1/nodes/heartbeat";
+const POLL_NODE_COMMAND_PATH: &str = "/v1/nodes/commands/poll";
+const REPORT_EXECUTION_EVENT_PATH: &str = "/v1/nodes/executions/events";
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
+const COMMAND_POLL_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 
+#[derive(Clone)]
 pub struct ControllerClient {
     http: Client,
     controller_url: String,
@@ -72,6 +77,78 @@ impl ControllerClient {
         let response = self
             .http
             .post(format!("{}{HEARTBEAT_PATH}", self.controller_url))
+            .json(&request)
+            .send()
+            .await
+            .map_err(ControllerClientError::Unavailable)?;
+
+        if is_protocol_error(response.status()) {
+            return Err(decode_protocol_error(response).await);
+        }
+        if !response.status().is_success() {
+            return Err(ControllerClientError::Rejected(response.status()));
+        }
+
+        let response = response
+            .json::<Acknowledgement>()
+            .await
+            .map_err(|error| ControllerClientError::InvalidResponse(error.to_string()))?;
+        validate_response_metadata(request.metadata, response.metadata)
+    }
+
+    pub async fn poll_node_command(
+        &self,
+        node_id: NodeId,
+        active_execution_id: Option<ExecutionId>,
+    ) -> Result<Option<NodeCommand>, ControllerClientError> {
+        let request = PollNodeCommandRequest {
+            metadata: RequestMetadata::new(),
+            node_id,
+            active_execution_id,
+        };
+        let response = self
+            .http
+            .post(format!("{}{POLL_NODE_COMMAND_PATH}", self.controller_url))
+            .timeout(COMMAND_POLL_REQUEST_TIMEOUT)
+            .json(&request)
+            .send()
+            .await
+            .map_err(ControllerClientError::Unavailable)?;
+
+        if is_protocol_error(response.status()) {
+            return Err(decode_protocol_error(response).await);
+        }
+        if !response.status().is_success() {
+            return Err(ControllerClientError::Rejected(response.status()));
+        }
+
+        let response = response
+            .json::<PollNodeCommandResponse>()
+            .await
+            .map_err(|error| ControllerClientError::InvalidResponse(error.to_string()))?;
+        validate_response_metadata(request.metadata, response.metadata)?;
+        validate_node_command(node_id, active_execution_id, response.command.as_ref())?;
+        Ok(response.command)
+    }
+
+    pub async fn report_execution_event(
+        &self,
+        node_id: NodeId,
+        execution_id: ExecutionId,
+        event: ExecutionEvent,
+    ) -> Result<(), ControllerClientError> {
+        let request = ReportExecutionEventRequest {
+            metadata: RequestMetadata::new(),
+            node_id,
+            execution_id,
+            event,
+        };
+        let response = self
+            .http
+            .post(format!(
+                "{}{REPORT_EXECUTION_EVENT_PATH}",
+                self.controller_url
+            ))
             .json(&request)
             .send()
             .await
@@ -172,9 +249,38 @@ fn validate_response_metadata(
     Ok(())
 }
 
+fn validate_node_command(
+    expected_node_id: NodeId,
+    active_execution_id: Option<ExecutionId>,
+    command: Option<&NodeCommand>,
+) -> Result<(), ControllerClientError> {
+    match command {
+        Some(NodeCommand::Start { .. }) if active_execution_id.is_some() => {
+            Err(ControllerClientError::InvalidResponse(
+                "controller returned a start command while an execution is active".to_owned(),
+            ))
+        }
+        Some(NodeCommand::Start { assignment }) if assignment.node_id != expected_node_id => {
+            Err(ControllerClientError::InvalidResponse(
+                "controller returned an assignment for a different node".to_owned(),
+            ))
+        }
+        Some(NodeCommand::Cancel { execution_id })
+            if Some(*execution_id) != active_execution_id =>
+        {
+            Err(ControllerClientError::InvalidResponse(
+                "controller returned cancellation for a different execution".to_owned(),
+            ))
+        }
+        _ => Ok(()),
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use meld_core::{MessageId, ProtocolVersion};
+    use meld_core::{
+        ExecutionAssignment, JobId, JobSpec, MessageId, ProtocolVersion, ResourceRequirements,
+    };
 
     use super::*;
 
@@ -215,5 +321,32 @@ mod tests {
             .expect_err("uncorrelated response must be rejected");
 
         assert!(matches!(error, ControllerClientError::InvalidResponse(_)));
+    }
+
+    #[test]
+    fn assignment_must_belong_to_polling_node() {
+        let polling_node_id = NodeId::generate();
+        let assignment = ExecutionAssignment {
+            execution_id: ExecutionId::generate(),
+            job_id: JobId::generate(),
+            node_id: NodeId::generate(),
+            spec: JobSpec {
+                program: "rustc".to_owned(),
+                args: vec!["--version".to_owned()],
+                requirements: ResourceRequirements {
+                    logical_cpus: 1,
+                    memory_bytes: 256_000_000,
+                },
+                job_timeout_secs: None,
+                execution_timeout_secs: None,
+            },
+        };
+
+        let command = NodeCommand::Start { assignment };
+        let error = validate_node_command(polling_node_id, None, Some(&command))
+            .expect_err("foreign assignment must be rejected");
+
+        assert!(matches!(error, ControllerClientError::InvalidResponse(_)));
+        assert!(validate_node_command(polling_node_id, None, None).is_ok());
     }
 }

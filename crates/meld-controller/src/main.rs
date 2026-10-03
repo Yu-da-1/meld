@@ -16,6 +16,7 @@ use tracing_subscriber::EnvFilter;
 const HEARTBEAT_TIMEOUT_ENV: &str = "MELD_HEARTBEAT_TIMEOUT_SECS";
 const DEFAULT_HEARTBEAT_TIMEOUT_SECS: u64 = 15;
 const LIVENESS_CHECK_INTERVAL: Duration = Duration::from_secs(1);
+const JOB_TIMEOUT_CHECK_INTERVAL: Duration = Duration::from_millis(100);
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn Error>> {
@@ -39,9 +40,22 @@ async fn main() -> Result<(), Box<dyn Error>> {
 
     tokio::select! {
         result = axum::serve(listener, router(state.clone())) => result?,
-        result = monitor_liveness(state, FailureDetector::new(heartbeat_timeout)) => result?,
+        result = monitor_liveness(state.clone(), FailureDetector::new(heartbeat_timeout)) => result?,
+        result = monitor_job_timeouts(state) => result?,
     }
     Ok(())
+}
+
+async fn monitor_job_timeouts(state: ControllerState) -> Result<(), ControllerStateError> {
+    let mut ticker = interval(JOB_TIMEOUT_CHECK_INTERVAL);
+    ticker.set_missed_tick_behavior(MissedTickBehavior::Skip);
+
+    loop {
+        ticker.tick().await;
+        for job_id in state.expire_jobs(Instant::now())? {
+            tracing::warn!(%job_id, "job timeout elapsed");
+        }
+    }
 }
 
 async fn monitor_liveness(
