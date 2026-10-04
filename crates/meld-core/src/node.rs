@@ -28,6 +28,9 @@ pub struct NodeDescriptor {
     /// CPU architecture reported by the Rust target.
     pub architecture: String,
     pub capacity: ResourceCapacity,
+    /// Operator-assigned labels (for example `gpu`) that jobs may require.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub capabilities: Vec<String>,
 }
 
 #[cfg(test)]
@@ -44,7 +47,9 @@ mod tests {
             capacity: ResourceCapacity {
                 logical_cpus: 8,
                 memory_bytes: 16_000,
+                max_concurrent_executions: 8,
             },
+            capabilities: vec![],
         };
 
         let json = serde_json::to_string(&descriptor).expect("node descriptor should serialize");

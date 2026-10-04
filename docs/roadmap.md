@@ -179,6 +179,24 @@ controllerとnodeの再起動をまたぐdeadline復元や完全なreconciliatio
 
 最初のschedulerは賢さより説明可能性と正しさを優先します。
 
+### 現在地
+
+完了しています。
+
+- 予約: 実行中のexecutionの要求量をnodeごとに合計して予約量とし、capacityと`max_concurrent_executions`を超える配置を防ぎます。予約量は保持せず毎回導出するので、二重管理のずれが起きません。
+- 並列実行: nodeは複数のexecutionを同時に管理できます(`MELD_MAX_CONCURRENT_EXECUTIONS`、既定はCPU数)。pollは実行中のexecution一覧を送り、controllerは報告済みのexecutionを再送しません。共有protocol contractはversion 6です。
+- drain / resume: `meld drain / resume`で新規配置を止めたり再開したりできます。drainの意図は生存状態と別に保持し、heartbeat、`Unreachable`からの復帰、再登録をまたいで維持します。
+- 制約: `meld run --os / --arch / --require`と、nodeの`MELD_CAPABILITIES`でOS、architecture、capabilityによる絞り込みができます。
+- 選択: 候補のうち、そのjobを足した後のCPUとメモリの予約率の大きい方が最小のnodeを選びます。同率はNode IDの小さい方です。浮動小数点は使わず、判断は入力だけで決まります。
+- 説明: `meld status`が、nodeごとの判定(選択、見送り、drain中、制約不一致、容量不足、空き不足の資源)を表示します。
+- queue fairness: 原則FIFOですが、制約を満たすnodeがない、または合計容量を超えるjobは、後続のjobを止めません。単に空きを待っているjobは順番を守るため、大きなjobが小さなjobに追い越され続けて動かなくなることはありません。
+
+### 既知の制約
+
+- 予約は帳簿上のものです。jobが予約を超えてCPUやメモリを使っても止めません(Phase 7で扱います)。
+- macOSでは`sysinfo`が利用可能メモリを0と返すため、`meld nodes`の`usage`に反映されません。スケジューリングには使っていません。
+- 予約は実測の使用量を見ません。同じマシン上の他のprocessが使うCPUやメモリは考慮されません。
+
 ## 7. Phase 5 — Data Movement
 
 ### 目的

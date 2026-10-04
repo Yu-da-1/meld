@@ -8,7 +8,11 @@ use meld_core::{NodeDescriptor, NodeId, NodeState, ResourceSnapshot};
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RegisteredNode {
     descriptor: NodeDescriptor,
+    /// Liveness observed from heartbeats; never `Draining`.
     state: NodeState,
+    /// Operator intent. Kept separately so it survives heartbeats, timeouts
+    /// and re-registration instead of being overwritten by liveness changes.
+    draining: bool,
     snapshot: Option<ResourceSnapshot>,
     last_heartbeat_at: Option<Instant>,
 }
@@ -18,8 +22,12 @@ impl RegisteredNode {
         &self.descriptor
     }
 
+    /// Effective state: a live node the operator is draining reports `Draining`.
     pub const fn state(&self) -> NodeState {
-        self.state
+        match self.state {
+            NodeState::Ready if self.draining => NodeState::Draining,
+            state => state,
+        }
     }
 
     pub const fn snapshot(&self) -> Option<ResourceSnapshot> {
@@ -47,16 +55,38 @@ impl NodeRegistry {
     }
 
     /// Registers a node as joining, replacing stale data for the same identity.
+    ///
+    /// A drain requested for this identity is kept, so restarting a node does
+    /// not silently put it back into scheduling.
     pub fn register(&mut self, descriptor: NodeDescriptor) {
+        let draining = self
+            .nodes
+            .get(&descriptor.id)
+            .is_some_and(|node| node.draining);
         self.nodes.insert(
             descriptor.id,
             RegisteredNode {
                 descriptor,
                 state: NodeState::Joining,
+                draining,
                 snapshot: None,
                 last_heartbeat_at: None,
             },
         );
+    }
+
+    /// Stops (or resumes) new placements on a node and returns its effective state.
+    pub fn set_draining(
+        &mut self,
+        node_id: NodeId,
+        draining: bool,
+    ) -> Result<NodeState, NodeRegistryError> {
+        let node = self
+            .nodes
+            .get_mut(&node_id)
+            .ok_or(NodeRegistryError::NodeNotFound(node_id))?;
+        node.draining = draining;
+        Ok(node.state())
     }
 
     /// Records a heartbeat and makes the node available for scheduling.
@@ -144,6 +174,72 @@ mod tests {
     }
 
     #[test]
+    fn drain_persists_across_heartbeats_and_resume_restores_ready() {
+        let descriptor = descriptor();
+        let node_id = descriptor.id;
+        let mut registry = NodeRegistry::new();
+        registry.register(descriptor);
+        registry
+            .record_heartbeat(node_id, snapshot())
+            .expect("registered node should accept heartbeat");
+
+        assert_eq!(
+            registry.set_draining(node_id, true),
+            Ok(NodeState::Draining)
+        );
+        registry
+            .record_heartbeat(node_id, snapshot())
+            .expect("draining node should accept heartbeat");
+        assert_eq!(
+            registry.get(node_id).map(RegisteredNode::state),
+            Some(NodeState::Draining)
+        );
+
+        assert_eq!(registry.set_draining(node_id, false), Ok(NodeState::Ready));
+    }
+
+    #[test]
+    fn drain_survives_unreachable_and_reregistration() {
+        let descriptor = descriptor();
+        let node_id = descriptor.id;
+        let mut registry = NodeRegistry::new();
+        registry.register(descriptor.clone());
+        registry
+            .record_heartbeat(node_id, snapshot())
+            .expect("registered node should accept heartbeat");
+        registry
+            .set_draining(node_id, true)
+            .expect("registered node can be drained");
+
+        registry
+            .nodes_mut()
+            .for_each(RegisteredNode::mark_unreachable);
+        assert_eq!(
+            registry.get(node_id).map(RegisteredNode::state),
+            Some(NodeState::Unreachable)
+        );
+
+        registry.register(descriptor);
+        registry
+            .record_heartbeat(node_id, snapshot())
+            .expect("re-registered node should accept heartbeat");
+        assert_eq!(
+            registry.get(node_id).map(RegisteredNode::state),
+            Some(NodeState::Draining)
+        );
+    }
+
+    #[test]
+    fn draining_an_unknown_node_is_rejected() {
+        let node_id = NodeId::generate();
+
+        assert_eq!(
+            NodeRegistry::new().set_draining(node_id, true),
+            Err(NodeRegistryError::NodeNotFound(node_id))
+        );
+    }
+
+    #[test]
     fn heartbeat_from_unknown_node_is_rejected() {
         let mut registry = NodeRegistry::new();
         let node_id = NodeId::generate();
@@ -164,7 +260,9 @@ mod tests {
             capacity: ResourceCapacity {
                 logical_cpus: 8,
                 memory_bytes: 16_000,
+                max_concurrent_executions: 1,
             },
+            capabilities: vec![],
         }
     }
 

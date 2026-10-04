@@ -99,12 +99,12 @@ impl ControllerClient {
     pub async fn poll_node_command(
         &self,
         node_id: NodeId,
-        active_execution_id: Option<ExecutionId>,
+        active_execution_ids: &[ExecutionId],
     ) -> Result<Option<NodeCommand>, ControllerClientError> {
         let request = PollNodeCommandRequest {
             metadata: RequestMetadata::new(),
             node_id,
-            active_execution_id,
+            active_execution_ids: active_execution_ids.to_vec(),
         };
         let response = self
             .http
@@ -127,7 +127,7 @@ impl ControllerClient {
             .await
             .map_err(|error| ControllerClientError::InvalidResponse(error.to_string()))?;
         validate_response_metadata(request.metadata, response.metadata)?;
-        validate_node_command(node_id, active_execution_id, response.command.as_ref())?;
+        validate_node_command(node_id, active_execution_ids, response.command.as_ref())?;
         Ok(response.command)
     }
 
@@ -251,22 +251,24 @@ fn validate_response_metadata(
 
 fn validate_node_command(
     expected_node_id: NodeId,
-    active_execution_id: Option<ExecutionId>,
+    active_execution_ids: &[ExecutionId],
     command: Option<&NodeCommand>,
 ) -> Result<(), ControllerClientError> {
     match command {
-        Some(NodeCommand::Start { .. }) if active_execution_id.is_some() => {
-            Err(ControllerClientError::InvalidResponse(
-                "controller returned a start command while an execution is active".to_owned(),
-            ))
-        }
         Some(NodeCommand::Start { assignment }) if assignment.node_id != expected_node_id => {
             Err(ControllerClientError::InvalidResponse(
                 "controller returned an assignment for a different node".to_owned(),
             ))
         }
+        Some(NodeCommand::Start { assignment })
+            if active_execution_ids.contains(&assignment.execution_id) =>
+        {
+            Err(ControllerClientError::InvalidResponse(
+                "controller redelivered an execution that is already active".to_owned(),
+            ))
+        }
         Some(NodeCommand::Cancel { execution_id })
-            if Some(*execution_id) != active_execution_id =>
+            if !active_execution_ids.contains(execution_id) =>
         {
             Err(ControllerClientError::InvalidResponse(
                 "controller returned cancellation for a different execution".to_owned(),
@@ -339,14 +341,15 @@ mod tests {
                 },
                 job_timeout_secs: None,
                 execution_timeout_secs: None,
+                constraints: meld_core::PlacementConstraints::default(),
             },
         };
 
         let command = NodeCommand::Start { assignment };
-        let error = validate_node_command(polling_node_id, None, Some(&command))
+        let error = validate_node_command(polling_node_id, &[], Some(&command))
             .expect_err("foreign assignment must be rejected");
 
         assert!(matches!(error, ControllerClientError::InvalidResponse(_)));
-        assert!(validate_node_command(polling_node_id, None, None).is_ok());
+        assert!(validate_node_command(polling_node_id, &[], None).is_ok());
     }
 }

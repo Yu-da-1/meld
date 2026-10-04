@@ -8,14 +8,19 @@ Meld は、自宅や小規模な環境にある複数のコンピューターを
 
 ## 現在の状態
 
-Phase 0からPhase 2までが完了し、次はPhase 3のremote execution MVPへ進む段階です。
+Phase 0からPhase 4までが完了し、次はPhase 5のデータ移動へ進む段階です。
 
-- `meld-controller`、`meld-node`、`meld-core` の3 crateでvirtual workspaceを構成しています。
-- 共有domain model、job / execution状態遷移、in-memory Node RegistryとJob Manager、first-fit Schedulerを実装済みです。
+- `meld-controller`、`meld-node`、`meld-core`、`meld-cli` の4 crateでvirtual workspaceを構成しています。
+- 共有domain model、job / execution状態遷移、in-memory Node RegistryとJob Manager、least-loaded Schedulerを実装済みです。
 - nodeはHTTP/JSONでcontrollerへ登録し、永続化したidentity、capacity、resource snapshot、heartbeatを報告します。
 - controllerはheartbeat timeoutによる`Unreachable`判定と、再接続・同一identityでの再登録を扱います。
-- `GET /v1/nodes`でcontrollerが観測したnode状態、capacity、最新snapshotを取得できます。
-- native processのremote execution、log回収、cancelはPhase 3で実装します。
+- `meld run / status / logs / cancel`でnative processのremote execution、log回収、cancel、timeoutを扱えます。
+- Phase 4のスケジューリングと資源会計として、次の機能が動作します。
+  - nodeごとの予約済みCPU・メモリを合計し、capacityを超える配置を防ぎます。1つのnodeで複数jobを同時に実行できます(`MELD_MAX_CONCURRENT_EXECUTIONS`、既定はCPU数)。
+  - `meld drain / resume`で新規配置を止めたり再開したりできます。実行中のjobは完走します。
+  - `meld run --os / --arch / --require`で実行先のOS、architecture、capability(`MELD_CAPABILITIES`)を指定できます。
+  - 複数のnodeが候補のとき、予約率が最も低いnodeを選びます。`meld status`にnodeごとの判定理由が表示されます。
+  - 原則FIFOです。制約を満たすnodeがない、または合計容量を超えるjobは、後続のjobを止めません。
 
 ## 目指す利用イメージ
 

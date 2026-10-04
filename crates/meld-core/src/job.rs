@@ -4,7 +4,7 @@ use std::{error::Error, fmt};
 
 use serde::{Deserialize, Serialize};
 
-use crate::{InvalidStateTransition, JobId, ResourceRequirements};
+use crate::{InvalidStateTransition, JobId, NodeDescriptor, ResourceRequirements};
 
 /// Defines a program invocation and the resources it requires.
 ///
@@ -23,6 +23,63 @@ pub struct JobSpec {
     /// Maximum process runtime after the node starts execution.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub execution_timeout_secs: Option<u64>,
+    /// Restrictions on which nodes may run the job.
+    #[serde(default, skip_serializing_if = "PlacementConstraints::is_empty")]
+    pub constraints: PlacementConstraints,
+}
+
+/// Node properties a job requires beyond CPU and memory.
+///
+/// Every field that is set must match; an empty value accepts any node.
+/// Comparison ignores ASCII case.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PlacementConstraints {
+    /// Required operating system, as reported by the Rust target (`linux`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub operating_system: Option<String>,
+    /// Required CPU architecture, as reported by the Rust target (`aarch64`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub architecture: Option<String>,
+    /// Labels the node must advertise, such as `gpu`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub capabilities: Vec<String>,
+}
+
+impl PlacementConstraints {
+    pub fn is_empty(&self) -> bool {
+        self.operating_system.is_none()
+            && self.architecture.is_none()
+            && self.capabilities.is_empty()
+    }
+
+    /// Rejects blank values, which could never be matched intentionally.
+    pub fn validate(&self) -> Result<(), JobSpecValidationError> {
+        let blank = |value: &str| value.trim().is_empty();
+        if self.operating_system.as_deref().is_some_and(blank)
+            || self.architecture.as_deref().is_some_and(blank)
+            || self.capabilities.iter().any(|label| blank(label))
+        {
+            return Err(JobSpecValidationError::BlankConstraint);
+        }
+        Ok(())
+    }
+
+    /// Returns whether the node's static properties satisfy every constraint.
+    pub fn is_satisfied_by(&self, node: &NodeDescriptor) -> bool {
+        let matches = |required: &Option<String>, actual: &str| {
+            required
+                .as_deref()
+                .is_none_or(|required| required.trim().eq_ignore_ascii_case(actual))
+        };
+
+        matches(&self.operating_system, &node.operating_system)
+            && matches(&self.architecture, &node.architecture)
+            && self.capabilities.iter().all(|required| {
+                node.capabilities
+                    .iter()
+                    .any(|offered| offered.eq_ignore_ascii_case(required.trim()))
+            })
+    }
 }
 
 impl JobSpec {
@@ -43,6 +100,7 @@ impl JobSpec {
         if self.execution_timeout_secs == Some(0) {
             return Err(JobSpecValidationError::ZeroExecutionTimeout);
         }
+        self.constraints.validate()?;
         Ok(())
     }
 }
@@ -54,6 +112,7 @@ pub enum JobSpecValidationError {
     ZeroMemory,
     ZeroJobTimeout,
     ZeroExecutionTimeout,
+    BlankConstraint,
 }
 
 impl fmt::Display for JobSpecValidationError {
@@ -67,6 +126,9 @@ impl fmt::Display for JobSpecValidationError {
             Self::ZeroJobTimeout => formatter.write_str("job timeout must be greater than zero"),
             Self::ZeroExecutionTimeout => {
                 formatter.write_str("execution timeout must be greater than zero")
+            }
+            Self::BlankConstraint => {
+                formatter.write_str("placement constraints must not contain blank values")
             }
         }
     }
@@ -226,7 +288,87 @@ impl JobState {
 
 #[cfg(test)]
 mod tests {
+    use crate::{NodeId, ResourceCapacity};
+
     use super::*;
+
+    fn node(operating_system: &str, architecture: &str, capabilities: &[&str]) -> NodeDescriptor {
+        NodeDescriptor {
+            id: NodeId::generate(),
+            hostname: "worker".to_owned(),
+            operating_system: operating_system.to_owned(),
+            architecture: architecture.to_owned(),
+            capacity: ResourceCapacity {
+                logical_cpus: 8,
+                memory_bytes: 16_000,
+                max_concurrent_executions: 8,
+            },
+            capabilities: capabilities
+                .iter()
+                .map(|label| (*label).to_owned())
+                .collect(),
+        }
+    }
+
+    #[test]
+    fn empty_constraints_accept_any_node() {
+        let constraints = PlacementConstraints::default();
+
+        assert!(constraints.is_empty());
+        assert!(constraints.is_satisfied_by(&node("linux", "x86_64", &[])));
+    }
+
+    #[test]
+    fn every_set_constraint_must_match_ignoring_case() {
+        let constraints = PlacementConstraints {
+            operating_system: Some("Linux".to_owned()),
+            architecture: Some("aarch64".to_owned()),
+            capabilities: vec!["GPU".to_owned(), "docker".to_owned()],
+        };
+
+        assert!(constraints.is_satisfied_by(&node("linux", "aarch64", &["docker", "gpu"])));
+        assert!(!constraints.is_satisfied_by(&node("macos", "aarch64", &["docker", "gpu"])));
+        assert!(!constraints.is_satisfied_by(&node("linux", "x86_64", &["docker", "gpu"])));
+        assert!(!constraints.is_satisfied_by(&node("linux", "aarch64", &["gpu"])));
+    }
+
+    #[test]
+    fn blank_constraint_values_are_rejected() {
+        for constraints in [
+            PlacementConstraints {
+                operating_system: Some(" ".to_owned()),
+                ..PlacementConstraints::default()
+            },
+            PlacementConstraints {
+                architecture: Some(String::new()),
+                ..PlacementConstraints::default()
+            },
+            PlacementConstraints {
+                capabilities: vec!["gpu".to_owned(), "  ".to_owned()],
+                ..PlacementConstraints::default()
+            },
+        ] {
+            assert_eq!(
+                constraints.validate(),
+                Err(JobSpecValidationError::BlankConstraint)
+            );
+        }
+    }
+
+    #[test]
+    fn job_spec_without_constraints_deserializes_and_omits_them_when_empty() {
+        let json =
+            r#"{"program":"rustc","args":[],"requirements":{"logical_cpus":1,"memory_bytes":1}}"#;
+
+        let spec: JobSpec = serde_json::from_str(json).expect("older specs should deserialize");
+
+        assert!(spec.constraints.is_empty());
+        assert!(
+            !serde_json::to_string(&spec)
+                .expect("spec should serialize")
+                .contains("constraints")
+        );
+    }
 
     #[test]
     fn job_spec_preserves_argument_boundaries_in_json() {
@@ -239,6 +381,7 @@ mod tests {
             },
             job_timeout_secs: None,
             execution_timeout_secs: None,
+            constraints: PlacementConstraints::default(),
         };
 
         let json = serde_json::to_string(&spec).expect("job spec should serialize");
@@ -307,6 +450,7 @@ mod tests {
             },
             job_timeout_secs: None,
             execution_timeout_secs: None,
+            constraints: PlacementConstraints::default(),
         };
 
         let job = Job::new(spec.clone()).expect("valid spec should create a job");
@@ -326,6 +470,7 @@ mod tests {
             },
             job_timeout_secs: None,
             execution_timeout_secs: None,
+            constraints: PlacementConstraints::default(),
         })
         .expect("valid spec should create a job");
         job.queue().expect("job should be queued");
@@ -347,6 +492,7 @@ mod tests {
             },
             job_timeout_secs: None,
             execution_timeout_secs: None,
+            constraints: PlacementConstraints::default(),
         })
         .expect_err("blank program must be rejected");
 
@@ -364,6 +510,7 @@ mod tests {
             },
             job_timeout_secs: None,
             execution_timeout_secs: Some(0),
+            constraints: PlacementConstraints::default(),
         })
         .expect_err("zero execution timeout must be rejected");
 
@@ -381,6 +528,7 @@ mod tests {
             },
             job_timeout_secs: Some(0),
             execution_timeout_secs: None,
+            constraints: PlacementConstraints::default(),
         })
         .expect_err("zero job timeout must be rejected");
 

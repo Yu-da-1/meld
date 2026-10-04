@@ -17,10 +17,10 @@ use axum::{
 use meld_core::{
     Acknowledgement, ApiErrorResponse, CURRENT_PROTOCOL_VERSION, CancelJobResponse, ExecutionEvent,
     ExecutionOutput, ExecutionView, HeartbeatRequest, JobId, JobLogsResponse, JobSpec, JobState,
-    JobStatusResponse, ListNodesResponse, NodeCommand, NodeId, NodeState, NodeView,
-    PollNodeCommandRequest, PollNodeCommandResponse, ProtocolError, ProtocolErrorResponse,
-    QueueReason, RegisterNodeRequest, RegisterNodeResponse, ReportExecutionEventRequest,
-    ResponseMetadata, SubmitJobResponse,
+    JobStatusResponse, ListNodesResponse, NodeCommand, NodeId, NodeState, NodeStateResponse,
+    NodeView, PollNodeCommandRequest, PollNodeCommandResponse, ProtocolError,
+    ProtocolErrorResponse, QueueReason, RegisterNodeRequest, RegisterNodeResponse,
+    ReportExecutionEventRequest, ResponseMetadata, SubmitJobResponse,
 };
 use tokio::{sync::watch, time::timeout};
 
@@ -34,6 +34,8 @@ use crate::{
 pub const REGISTER_NODE_PATH: &str = "/v1/nodes/register";
 pub const HEARTBEAT_PATH: &str = "/v1/nodes/heartbeat";
 pub const LIST_NODES_PATH: &str = "/v1/nodes";
+pub const DRAIN_NODE_PATH: &str = "/v1/nodes/{node_id}/drain";
+pub const RESUME_NODE_PATH: &str = "/v1/nodes/{node_id}/resume";
 pub const SUBMIT_JOB_PATH: &str = "/v1/jobs";
 pub const JOB_STATUS_PATH: &str = "/v1/jobs/{job_id}";
 pub const JOB_LOGS_PATH: &str = "/v1/jobs/{job_id}/logs";
@@ -126,6 +128,8 @@ pub fn router(state: ControllerState) -> Router {
         .route(LIST_NODES_PATH, get(list_nodes))
         .route(REGISTER_NODE_PATH, post(register_node))
         .route(HEARTBEAT_PATH, post(record_heartbeat))
+        .route(DRAIN_NODE_PATH, post(drain_node))
+        .route(RESUME_NODE_PATH, post(resume_node))
         .route(SUBMIT_JOB_PATH, post(submit_job))
         .route(JOB_STATUS_PATH, get(job_status))
         .route(JOB_LOGS_PATH, get(job_logs))
@@ -356,7 +360,7 @@ fn command_for_node(
         }
     };
 
-    let command = if let Some(execution_id) = request.active_execution_id {
+    for &execution_id in &request.active_execution_ids {
         let Some(execution) = jobs.execution(execution_id) else {
             return Err(Box::new(
                 (
@@ -379,18 +383,28 @@ fn command_for_node(
                     .into_response(),
             ));
         }
-        jobs.cancellation_requested(execution_id, request.node_id)
-            .then_some(NodeCommand::Cancel { execution_id })
+    }
+
+    let cancellation = request
+        .active_execution_ids
+        .iter()
+        .copied()
+        .find(|&execution_id| jobs.cancellation_requested(execution_id, request.node_id));
+    let command = if let Some(execution_id) = cancellation {
+        Some(NodeCommand::Cancel { execution_id })
     } else {
-        let assignment = match jobs.pending_assignment_for(request.node_id) {
+        let assignment = match jobs
+            .pending_assignment_for(request.node_id, &request.active_execution_ids)
+        {
             Ok(Some(assignment)) => Some(assignment),
             Ok(None) if node.state() != NodeState::Ready => None,
             Ok(None) => {
                 match jobs.schedule_next(&Scheduler::new(), &registry) {
                     Ok(_)
-                    | Err(JobManagerError::Scheduling(SchedulingFailure::NoReadyNodes))
                     | Err(JobManagerError::Scheduling(
-                        SchedulingFailure::InsufficientResources
+                        SchedulingFailure::NoReadyNodes
+                        | SchedulingFailure::ConstraintsNotSatisfied
+                        | SchedulingFailure::InsufficientResources
                         | SchedulingFailure::NoAvailableNodes,
                     )) => {}
                     Err(error) => {
@@ -402,7 +416,7 @@ fn command_for_node(
                     }
                 }
 
-                match jobs.pending_assignment_for(request.node_id) {
+                match jobs.pending_assignment_for(request.node_id, &request.active_execution_ids) {
                     Ok(assignment) => assignment,
                     Err(error) => {
                         tracing::error!(node_id = %request.node_id, %error, "assignment lookup failed");
@@ -524,7 +538,13 @@ async fn job_status(State(state): State<ControllerState>, Path(job_id): Path<Job
         });
     let queue_reason = if job.state() == JobState::Queued {
         match jobs.pending_position(job_id) {
-            Some(position) if position > 0 => Some(QueueReason::WaitingForEarlierJob),
+            Some(_)
+                if jobs
+                    .is_behind_earlier_job(job_id, &Scheduler::new(), &registry)
+                    .expect("queued job should support scheduling diagnosis") =>
+            {
+                Some(QueueReason::WaitingForEarlierJob)
+            }
             Some(_) => Some(
                 match jobs
                     .scheduling_failure_for(job_id, &Scheduler::new(), &registry)
@@ -532,6 +552,9 @@ async fn job_status(State(state): State<ControllerState>, Path(job_id): Path<Job
                 {
                     None => QueueReason::AwaitingAssignment,
                     Some(SchedulingFailure::NoReadyNodes) => QueueReason::NoReadyNodes,
+                    Some(SchedulingFailure::ConstraintsNotSatisfied) => {
+                        QueueReason::ConstraintsNotSatisfied
+                    }
                     Some(SchedulingFailure::InsufficientResources) => {
                         QueueReason::InsufficientResources
                     }
@@ -544,12 +567,17 @@ async fn job_status(State(state): State<ControllerState>, Path(job_id): Path<Job
         None
     };
 
+    let placement = jobs
+        .placement_for(job_id, &Scheduler::new(), &registry)
+        .expect("job was found above");
+
     Json(JobStatusResponse {
         job_id,
         spec: job.spec().clone(),
         state: job.state(),
         queue_reason,
         execution,
+        placement,
     })
     .into_response()
 }
@@ -666,6 +694,56 @@ async fn list_nodes(State(state): State<ControllerState>) -> Response {
     }
 }
 
+async fn drain_node(State(state): State<ControllerState>, Path(node_id): Path<NodeId>) -> Response {
+    set_node_draining(state, node_id, true)
+}
+
+async fn resume_node(
+    State(state): State<ControllerState>,
+    Path(node_id): Path<NodeId>,
+) -> Response {
+    set_node_draining(state, node_id, false)
+}
+
+/// Stops or resumes new placements on a node; both directions are idempotent.
+fn set_node_draining(state: ControllerState, node_id: NodeId, draining: bool) -> Response {
+    let mut registry = match state.registry.write() {
+        Ok(registry) => registry,
+        Err(error) => {
+            tracing::error!(%node_id, %error, "node registry lock is poisoned");
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ApiErrorResponse {
+                    error: "controller state is unavailable".to_owned(),
+                }),
+            )
+                .into_response();
+        }
+    };
+    let node_state = match registry.set_draining(node_id, draining) {
+        Ok(node_state) => node_state,
+        Err(NodeRegistryError::NodeNotFound(node_id)) => {
+            return (
+                StatusCode::NOT_FOUND,
+                Json(ApiErrorResponse {
+                    error: format!("node {node_id} was not found"),
+                }),
+            )
+                .into_response();
+        }
+    };
+    drop(registry);
+    // Resuming makes capacity schedulable again, so wake waiting polls.
+    state.notify_command_update();
+
+    tracing::info!(%node_id, draining, state = ?node_state, "node drain setting changed");
+    Json(NodeStateResponse {
+        node_id,
+        state: node_state,
+    })
+    .into_response()
+}
+
 async fn register_node(
     State(state): State<ControllerState>,
     Json(request): Json<RegisterNodeRequest>,
@@ -722,7 +800,7 @@ async fn record_heartbeat(
 
     let was_ready = registry
         .get(request.node_id)
-        .is_some_and(|node| node.state() == NodeState::Ready);
+        .is_some_and(|node| matches!(node.state(), NodeState::Ready | NodeState::Draining));
     if let Err(NodeRegistryError::NodeNotFound(node_id)) =
         registry.record_heartbeat(request.node_id, request.snapshot)
     {
@@ -778,8 +856,8 @@ mod tests {
     };
     use meld_core::{
         CapturedStream, Execution, ExecutionOutput, ExecutionResult, ExecutionState, Job,
-        MessageId, NodeDescriptor, NodeId, NodeState, ProtocolVersion, RequestMetadata,
-        ResourceCapacity, ResourceRequirements, ResourceSnapshot,
+        MessageId, NodeDescriptor, NodeId, NodeState, NodeVerdict, ProtocolVersion,
+        RequestMetadata, ResourceCapacity, ResourceRequirements, ResourceSnapshot,
     };
     use tower::ServiceExt;
 
@@ -838,8 +916,77 @@ mod tests {
             .expect("job manager lock should be available")
             .submit(job_spec())
             .expect("valid job should be queued");
+        // The first job cannot fit any node, so it does not hold the second back;
+        // the second reports its own blocker instead of waiting in line.
         let status = get_job_status(state, second_job_id).await;
-        assert_eq!(status.queue_reason, Some(QueueReason::WaitingForEarlierJob));
+        assert_eq!(
+            status.queue_reason,
+            Some(QueueReason::InsufficientResources)
+        );
+    }
+
+    #[tokio::test]
+    async fn job_behind_one_waiting_for_capacity_reports_waiting_for_earlier_job() {
+        let state = ControllerState::new();
+        let node_id = NodeId::generate();
+        assigned_execution(&state, node_id);
+        let mut spec = job_spec();
+        spec.requirements.memory_bytes = 4_000;
+        let submit = |spec: JobSpec| {
+            state
+                .jobs
+                .write()
+                .expect("job manager lock should be available")
+                .submit(spec)
+                .expect("valid job should be queued")
+        };
+        let first = submit(spec.clone());
+        let second = submit(spec);
+
+        assert_eq!(
+            get_job_status(state.clone(), first).await.queue_reason,
+            Some(QueueReason::NoAvailableNodes)
+        );
+        assert_eq!(
+            get_job_status(state.clone(), second).await.queue_reason,
+            Some(QueueReason::WaitingForEarlierJob)
+        );
+    }
+
+    #[tokio::test]
+    async fn unplaceable_head_job_does_not_stop_the_node_from_polling_later_jobs() {
+        let state = ControllerState::new();
+        let node_id = NodeId::generate();
+        register_ready_node(&state, node_id);
+        let mut gpu_spec = job_spec();
+        gpu_spec.requirements.memory_bytes = 4_000;
+        gpu_spec.constraints.capabilities = vec!["gpu".to_owned()];
+        let mut plain_spec = job_spec();
+        plain_spec.requirements.memory_bytes = 4_000;
+        let (gpu_job, plain_job) = {
+            let mut jobs = state
+                .jobs
+                .write()
+                .expect("job manager lock should be available");
+            (
+                jobs.submit(gpu_spec).expect("job should be queued"),
+                jobs.submit(plain_spec).expect("job should be queued"),
+            )
+        };
+
+        let Some(NodeCommand::Start { assignment }) =
+            poll_for_command(&state, node_id, vec![]).await
+        else {
+            panic!("the runnable job should start despite the unplaceable one ahead of it");
+        };
+
+        assert_eq!(assignment.job_id, plain_job);
+        let waiting = get_job_status(state, gpu_job).await;
+        assert_eq!(waiting.state, JobState::Queued);
+        assert_eq!(
+            waiting.queue_reason,
+            Some(QueueReason::ConstraintsNotSatisfied)
+        );
     }
 
     #[tokio::test]
@@ -870,7 +1017,7 @@ mod tests {
         let request = PollNodeCommandRequest {
             metadata: RequestMetadata::new(),
             node_id,
-            active_execution_id: None,
+            active_execution_ids: vec![],
         };
         let polling_state = state.clone();
         let poll = tokio::spawn(async move {
@@ -915,7 +1062,7 @@ mod tests {
             PollNodeCommandRequest {
                 metadata: RequestMetadata::new(),
                 node_id,
-                active_execution_id: None,
+                active_execution_ids: vec![],
             },
             Duration::from_millis(10),
         )
@@ -948,7 +1095,7 @@ mod tests {
                 PollNodeCommandRequest {
                     metadata: RequestMetadata::new(),
                     node_id,
-                    active_execution_id: Some(execution_id),
+                    active_execution_ids: vec![execution_id],
                 },
                 Duration::from_secs(1),
             )
@@ -1099,7 +1246,7 @@ mod tests {
             .oneshot(poll_node_command_json_request(PollNodeCommandRequest {
                 metadata: RequestMetadata::new(),
                 node_id,
-                active_execution_id: Some(execution_id),
+                active_execution_ids: vec![execution_id],
             }))
             .await
             .expect("command poll should be handled");
@@ -1212,7 +1359,7 @@ mod tests {
         let first_request = PollNodeCommandRequest {
             metadata: RequestMetadata::new(),
             node_id,
-            active_execution_id: None,
+            active_execution_ids: vec![],
         };
         let first_request_metadata = first_request.metadata;
         let first_response = router(state.clone())
@@ -1243,7 +1390,7 @@ mod tests {
         let second_request = PollNodeCommandRequest {
             metadata: RequestMetadata::new(),
             node_id,
-            active_execution_id: None,
+            active_execution_ids: vec![],
         };
         let second_response = router(state)
             .oneshot(poll_node_command_json_request(second_request))
@@ -1266,13 +1413,352 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn busy_node_with_spare_capacity_receives_further_assignments() {
+        let state = ControllerState::new();
+        let node_id = NodeId::generate();
+        {
+            let mut node = descriptor(node_id);
+            node.capacity.max_concurrent_executions = 2;
+            let mut registry = state
+                .registry
+                .write()
+                .expect("registry lock should be available");
+            registry.register(node);
+            registry
+                .record_heartbeat(node_id, snapshot())
+                .expect("registered node should accept heartbeat");
+        }
+        let mut spec = job_spec();
+        spec.requirements.memory_bytes = 4_000;
+        let job_ids: Vec<_> = (0..3)
+            .map(|_| {
+                state
+                    .jobs
+                    .write()
+                    .expect("job manager lock should be available")
+                    .submit(spec.clone())
+                    .expect("valid job should be queued")
+            })
+            .collect();
+
+        let first = poll_for_command(&state, node_id, vec![]).await;
+        let NodeCommand::Start { assignment: first } = first.expect("first job should start")
+        else {
+            panic!("idle node should receive a start command");
+        };
+        assert_eq!(first.job_id, job_ids[0]);
+
+        let repeated = poll_for_command(&state, node_id, vec![]).await;
+        let Some(NodeCommand::Start {
+            assignment: repeated,
+        }) = repeated
+        else {
+            panic!("unacknowledged assignment should be repeated");
+        };
+        assert_eq!(repeated.execution_id, first.execution_id);
+
+        let second = poll_for_command(&state, node_id, vec![first.execution_id]).await;
+        let Some(NodeCommand::Start { assignment: second }) = second else {
+            panic!("node with spare capacity should receive a second job");
+        };
+        assert_eq!(second.job_id, job_ids[1]);
+        assert_ne!(second.execution_id, first.execution_id);
+
+        let both_active = vec![first.execution_id, second.execution_id];
+        assert_eq!(
+            poll_for_command(&state, node_id, both_active.clone()).await,
+            None,
+            "a full node must not receive a third job"
+        );
+        assert_eq!(
+            get_job_status(state.clone(), job_ids[2]).await.state,
+            JobState::Queued
+        );
+
+        state
+            .jobs
+            .write()
+            .expect("job manager lock should be available")
+            .request_job_cancellation(job_ids[1])
+            .expect("active job should accept cancellation");
+        assert_eq!(
+            poll_for_command(&state, node_id, both_active).await,
+            Some(NodeCommand::Cancel {
+                execution_id: second.execution_id
+            })
+        );
+    }
+
+    #[tokio::test]
+    async fn draining_node_keeps_running_work_but_receives_no_new_jobs() {
+        let state = ControllerState::new();
+        let node_id = NodeId::generate();
+        let (_, running_execution_id) = assigned_execution(&state, node_id);
+        let mut spec = job_spec();
+        spec.requirements.memory_bytes = 8_000;
+        let queued_job_id = state
+            .jobs
+            .write()
+            .expect("job manager lock should be available")
+            .submit(spec)
+            .expect("valid job should be queued");
+
+        let response = drain(&state, node_id).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("response body should be readable");
+        let drained: NodeStateResponse =
+            serde_json::from_slice(&body).expect("response should contain node state JSON");
+        assert_eq!(drained.state, NodeState::Draining);
+
+        // A heartbeat must not turn the node back into a scheduling target.
+        let heartbeat = router(state.clone())
+            .oneshot(heartbeat_json_request(HeartbeatRequest {
+                metadata: RequestMetadata::new(),
+                node_id,
+                snapshot: snapshot(),
+            }))
+            .await
+            .expect("heartbeat should be handled");
+        assert_eq!(heartbeat.status(), StatusCode::OK);
+
+        // The unacknowledged assignment made before the drain is still delivered.
+        let delivered = poll_for_command(&state, node_id, vec![]).await;
+        assert!(matches!(delivered, Some(NodeCommand::Start { .. })));
+
+        assert_eq!(
+            poll_for_command(&state, node_id, vec![running_execution_id]).await,
+            None
+        );
+        let status = get_job_status(state.clone(), queued_job_id).await;
+        assert_eq!(status.state, JobState::Queued);
+        assert_eq!(status.queue_reason, Some(QueueReason::NoReadyNodes));
+
+        // The node has one slot, still held by the running execution, so
+        // resuming alone cannot start the queued job.
+        let response = resume(&state, node_id).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            poll_for_command(&state, node_id, vec![running_execution_id]).await,
+            None
+        );
+        assert_eq!(
+            get_job_status(state.clone(), queued_job_id)
+                .await
+                .queue_reason,
+            Some(QueueReason::NoAvailableNodes)
+        );
+    }
+
+    #[tokio::test]
+    async fn resumed_node_receives_queued_jobs_again() {
+        let state = ControllerState::new();
+        let node_id = NodeId::generate();
+        register_ready_node(&state, node_id);
+        let mut spec = job_spec();
+        spec.requirements.memory_bytes = 8_000;
+        let job_id = state
+            .jobs
+            .write()
+            .expect("job manager lock should be available")
+            .submit(spec)
+            .expect("valid job should be queued");
+
+        drain(&state, node_id).await;
+        assert_eq!(poll_for_command(&state, node_id, vec![]).await, None);
+
+        let response = resume(&state, node_id).await;
+        let body = to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("response body should be readable");
+        let resumed: NodeStateResponse =
+            serde_json::from_slice(&body).expect("response should contain node state JSON");
+        assert_eq!(resumed.state, NodeState::Ready);
+        let Some(NodeCommand::Start { assignment }) =
+            poll_for_command(&state, node_id, vec![]).await
+        else {
+            panic!("resumed node should receive the queued job");
+        };
+        assert_eq!(assignment.job_id, job_id);
+    }
+
+    #[tokio::test]
+    async fn job_with_unmet_constraints_waits_without_breaking_node_polls() {
+        let state = ControllerState::new();
+        let node_id = NodeId::generate();
+        register_ready_node(&state, node_id);
+        let mut spec = job_spec();
+        spec.requirements.memory_bytes = 8_000;
+        spec.constraints.capabilities = vec!["gpu".to_owned()];
+        let job_id = state
+            .jobs
+            .write()
+            .expect("job manager lock should be available")
+            .submit(spec)
+            .expect("valid job should be queued");
+
+        assert_eq!(poll_for_command(&state, node_id, vec![]).await, None);
+        let status = get_job_status(state.clone(), job_id).await;
+        assert_eq!(status.state, JobState::Queued);
+        assert_eq!(
+            status.queue_reason,
+            Some(QueueReason::ConstraintsNotSatisfied)
+        );
+
+        // A node that advertises the capability joins and receives the job.
+        let gpu_node_id = NodeId::generate();
+        {
+            let mut node = descriptor(gpu_node_id);
+            node.capabilities = vec!["gpu".to_owned()];
+            let mut registry = state
+                .registry
+                .write()
+                .expect("registry lock should be available");
+            registry.register(node);
+            registry
+                .record_heartbeat(gpu_node_id, snapshot())
+                .expect("registered node should accept heartbeat");
+        }
+        let Some(NodeCommand::Start { assignment }) =
+            poll_for_command(&state, gpu_node_id, vec![]).await
+        else {
+            panic!("node with the capability should receive the job");
+        };
+        assert_eq!(assignment.job_id, job_id);
+    }
+
+    #[tokio::test]
+    async fn status_explains_why_a_job_waits_and_where_it_was_placed() {
+        let state = ControllerState::new();
+        let drained_id = NodeId::generate();
+        register_ready_node(&state, drained_id);
+        drain(&state, drained_id).await;
+        let mut spec = job_spec();
+        spec.requirements.memory_bytes = 8_000;
+        let job_id = state
+            .jobs
+            .write()
+            .expect("job manager lock should be available")
+            .submit(spec)
+            .expect("valid job should be queued");
+
+        let waiting = get_job_status(state.clone(), job_id).await;
+        assert_eq!(waiting.state, JobState::Queued);
+        assert_eq!(waiting.placement.len(), 1);
+        assert_eq!(waiting.placement[0].node_id, drained_id);
+        assert_eq!(
+            waiting.placement[0].verdict,
+            NodeVerdict::NotReady {
+                state: NodeState::Draining
+            }
+        );
+
+        resume(&state, drained_id).await;
+        let Some(NodeCommand::Start { .. }) = poll_for_command(&state, drained_id, vec![]).await
+        else {
+            panic!("resumed node should receive the job");
+        };
+
+        let placed = get_job_status(state.clone(), job_id).await;
+        assert_eq!(placed.state, JobState::Assigned);
+        assert_eq!(placed.queue_reason, None);
+        assert_eq!(placed.placement.len(), 1);
+        assert!(matches!(
+            placed.placement[0].verdict,
+            NodeVerdict::Selected { .. }
+        ));
+    }
+
+    #[tokio::test]
+    async fn blank_constraint_is_rejected_at_submission() {
+        let state = ControllerState::new();
+        let mut spec = job_spec();
+        spec.constraints.operating_system = Some("  ".to_owned());
+
+        let response = router(state)
+            .oneshot(submit_job_json_request(spec))
+            .await
+            .expect("submission should be handled");
+
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn draining_an_unknown_node_returns_not_found() {
+        let response = drain(&ControllerState::new(), NodeId::generate()).await;
+
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    }
+
+    async fn drain(state: &ControllerState, node_id: NodeId) -> Response {
+        router(state.clone())
+            .oneshot(post_empty_request(&format!("/v1/nodes/{node_id}/drain")))
+            .await
+            .expect("drain should be handled")
+    }
+
+    async fn resume(state: &ControllerState, node_id: NodeId) -> Response {
+        router(state.clone())
+            .oneshot(post_empty_request(&format!("/v1/nodes/{node_id}/resume")))
+            .await
+            .expect("resume should be handled")
+    }
+
+    #[tokio::test]
+    async fn poll_reporting_an_execution_of_another_node_is_rejected() {
+        let state = ControllerState::new();
+        let other_node_id = NodeId::generate();
+        let (_, execution_id) = assigned_execution(&state, other_node_id);
+        let node_id = NodeId::generate();
+        register_ready_node(&state, node_id);
+
+        let response = poll_node_command_with_timeout(
+            state,
+            PollNodeCommandRequest {
+                metadata: RequestMetadata::new(),
+                node_id,
+                active_execution_ids: vec![execution_id],
+            },
+            Duration::from_millis(20),
+        )
+        .await;
+
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+    }
+
+    async fn poll_for_command(
+        state: &ControllerState,
+        node_id: NodeId,
+        active_execution_ids: Vec<meld_core::ExecutionId>,
+    ) -> Option<NodeCommand> {
+        let response = poll_node_command_with_timeout(
+            state.clone(),
+            PollNodeCommandRequest {
+                metadata: RequestMetadata::new(),
+                node_id,
+                active_execution_ids,
+            },
+            Duration::from_millis(20),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("response body should be readable");
+        serde_json::from_slice::<PollNodeCommandResponse>(&body)
+            .expect("response should contain command JSON")
+            .command
+    }
+
+    #[tokio::test]
     async fn assignment_poll_from_unregistered_node_is_rejected() {
         let state = ControllerState::new();
         let node_id = NodeId::generate();
         let request = PollNodeCommandRequest {
             metadata: RequestMetadata::new(),
             node_id,
-            active_execution_id: None,
+            active_execution_ids: vec![],
         };
 
         let response = router(state)
@@ -1329,7 +1815,7 @@ mod tests {
             PollNodeCommandRequest {
                 metadata: RequestMetadata::new(),
                 node_id,
-                active_execution_id: None,
+                active_execution_ids: vec![],
             },
             Duration::from_millis(10),
         )
@@ -1823,7 +2309,9 @@ mod tests {
             capacity: ResourceCapacity {
                 logical_cpus: 8,
                 memory_bytes: 16_000,
+                max_concurrent_executions: 1,
             },
+            capabilities: vec![],
         }
     }
 
@@ -1879,6 +2367,7 @@ mod tests {
             },
             job_timeout_secs: None,
             execution_timeout_secs: None,
+            constraints: meld_core::PlacementConstraints::default(),
         }
     }
 }

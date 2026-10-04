@@ -123,7 +123,9 @@ mod tests {
             capacity: ResourceCapacity {
                 logical_cpus: 8,
                 memory_bytes: 16_000,
+                max_concurrent_executions: 1,
             },
+            capabilities: vec![],
         }
     }
 

@@ -8,7 +8,7 @@ use crate::{
 };
 
 /// Protocol version implemented by this build.
-pub const CURRENT_PROTOCOL_VERSION: ProtocolVersion = ProtocolVersion::new(5);
+pub const CURRENT_PROTOCOL_VERSION: ProtocolVersion = ProtocolVersion::new(6);
 
 /// Version of the controller-node message contract.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -114,11 +114,13 @@ pub struct Acknowledgement {
 }
 
 /// Polls for the next control command for a node.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PollNodeCommandRequest {
     pub metadata: RequestMetadata,
     pub node_id: NodeId,
-    pub active_execution_id: Option<ExecutionId>,
+    /// Executions the node currently manages. The controller does not
+    /// redeliver these and may request cancellation of any of them.
+    pub active_execution_ids: Vec<ExecutionId>,
 }
 
 /// Returns a control command or no value when the poll expires.
@@ -230,6 +232,7 @@ mod tests {
                         },
                         job_timeout_secs: None,
                         execution_timeout_secs: None,
+                        constraints: crate::PlacementConstraints::default(),
                     },
                 },
             }),
@@ -287,7 +290,9 @@ mod tests {
             capacity: ResourceCapacity {
                 logical_cpus: 8,
                 memory_bytes: 16_000_000_000,
+                max_concurrent_executions: 8,
             },
+            capabilities: vec![],
         }
     }
 }

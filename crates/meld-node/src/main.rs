@@ -3,14 +3,22 @@ mod executor;
 mod identity;
 mod resource_reporter;
 
-use std::{env, error::Error, io, time::Duration};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    env,
+    error::Error,
+    future::Future,
+    io,
+    time::Duration,
+};
 
 use meld_core::{
-    ExecutionAssignment, ExecutionEvent, ExecutionOutput, ExecutionResult, NodeCommand,
-    NodeDescriptor, ResourceCapacity,
+    ExecutionAssignment, ExecutionEvent, ExecutionId, ExecutionOutput, ExecutionResult,
+    NodeCommand, NodeDescriptor, ResourceCapacity,
 };
 use tokio::{
     sync::oneshot,
+    task::JoinSet,
     time::{Instant as TokioInstant, MissedTickBehavior, interval, sleep, sleep_until},
 };
 use tracing_subscriber::EnvFilter;
@@ -24,6 +32,8 @@ use crate::{
 
 const HEARTBEAT_INTERVAL_ENV: &str = "MELD_HEARTBEAT_INTERVAL_SECS";
 const DEFAULT_HEARTBEAT_INTERVAL_SECS: u64 = 5;
+const MAX_CONCURRENT_EXECUTIONS_ENV: &str = "MELD_MAX_CONCURRENT_EXECUTIONS";
+const CAPABILITIES_ENV: &str = "MELD_CAPABILITIES";
 const COMMAND_POLL_RETRY_DELAY: Duration = Duration::from_secs(1);
 const INITIAL_RECONNECT_DELAY: Duration = Duration::from_secs(1);
 const MAX_RECONNECT_DELAY: Duration = Duration::from_secs(30);
@@ -57,10 +67,81 @@ async fn main() -> Result<(), Box<dyn Error>> {
     Ok(())
 }
 
+/// Executions this node is currently running, keyed by Execution ID.
+#[derive(Default)]
+struct ActiveExecutions {
+    tasks: JoinSet<ExecutionId>,
+    entries: BTreeMap<ExecutionId, ActiveExecution>,
+}
+
 struct ActiveExecution {
-    execution_id: meld_core::ExecutionId,
-    task: tokio::task::JoinHandle<()>,
+    task_id: tokio::task::Id,
     cancellation: Option<oneshot::Sender<()>>,
+}
+
+impl ActiveExecutions {
+    fn len(&self) -> usize {
+        self.entries.len()
+    }
+
+    fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
+
+    fn ids(&self) -> Vec<ExecutionId> {
+        self.entries.keys().copied().collect()
+    }
+
+    /// Starts a task unless the execution is already running here.
+    fn spawn<F>(
+        &mut self,
+        execution_id: ExecutionId,
+        cancellation: oneshot::Sender<()>,
+        task: F,
+    ) -> bool
+    where
+        F: Future<Output = ()> + Send + 'static,
+    {
+        if self.entries.contains_key(&execution_id) {
+            return false;
+        }
+        let handle = self.tasks.spawn(async move {
+            task.await;
+            execution_id
+        });
+        self.entries.insert(
+            execution_id,
+            ActiveExecution {
+                task_id: handle.id(),
+                cancellation: Some(cancellation),
+            },
+        );
+        true
+    }
+
+    /// Signals cancellation once; returns whether a signal was sent.
+    fn cancel(&mut self, execution_id: ExecutionId) -> bool {
+        self.entries
+            .get_mut(&execution_id)
+            .and_then(|active| active.cancellation.take())
+            .is_some_and(|cancellation| cancellation.send(()).is_ok())
+    }
+
+    /// Waits for the next task to end and forgets it; `None` when nothing runs.
+    async fn next_finished(&mut self) -> Option<Result<ExecutionId, tokio::task::JoinError>> {
+        let finished = self.tasks.join_next_with_id().await?;
+        let (task_id, result) = match finished {
+            Ok((task_id, execution_id)) => (task_id, Ok(execution_id)),
+            Err(error) => (error.id(), Err(error)),
+        };
+        self.entries.retain(|_, active| active.task_id != task_id);
+        Some(result)
+    }
+
+    async fn abort_all(&mut self) {
+        self.tasks.shutdown().await;
+        self.entries.clear();
+    }
 }
 
 async fn run_node(
@@ -101,12 +182,10 @@ async fn run_node(
         let mut ticker = interval(heartbeat_interval);
         ticker.set_missed_tick_behavior(MissedTickBehavior::Skip);
         let mut command_poll_not_before = TokioInstant::now();
-        let mut active_execution = None;
+        let mut active_executions = ActiveExecutions::default();
         loop {
-            let running_executions = u32::from(active_execution.is_some());
-            let active_execution_id = active_execution
-                .as_ref()
-                .map(|execution: &ActiveExecution| execution.execution_id);
+            let running_executions = u32::try_from(active_executions.len()).unwrap_or(u32::MAX);
+            let active_execution_ids = active_executions.ids();
             tokio::select! {
                 heartbeat = async {
                     ticker.tick().await;
@@ -130,27 +209,27 @@ async fn run_node(
                         }
                         Err(error) if error.requires_registration() => {
                             tracing::warn!(%node_id, %error, "controller requested node re-registration");
-                            abort_execution(&mut active_execution).await;
+                            active_executions.abort_all().await;
                             continue 'connection;
                         }
                         Err(error) if error.is_retryable() => {
                             let delay = backoff.next_delay();
                             tracing::warn!(%node_id, %error, retry_in_secs = delay.as_secs(), "heartbeat failed");
                             if wait_for_retry_or_shutdown(delay).await? {
-                                abort_execution(&mut active_execution).await;
+                                active_executions.abort_all().await;
                                 return Ok(());
                             }
                             continue;
                         }
                         Err(error) => {
-                            abort_execution(&mut active_execution).await;
+                            active_executions.abort_all().await;
                             return Err(error.into());
                         }
                     }
                 }
                 command = async {
                     sleep_until(command_poll_not_before).await;
-                    client.poll_node_command(node_id, active_execution_id).await
+                    client.poll_node_command(node_id, &active_execution_ids).await
                 } => {
                     if command.is_ok() {
                         command_poll_not_before = TokioInstant::now();
@@ -167,27 +246,29 @@ async fn run_node(
                             let executor = executor.clone();
                             let execution_id = assignment.execution_id;
                             let (cancellation, cancellation_receiver) = oneshot::channel();
-                            let task = tokio::spawn(async move {
-                                run_assignment(
-                                    &client,
-                                    &executor,
-                                    assignment,
-                                    cancellation_receiver,
-                                )
-                                .await;
-                            });
-                            active_execution = Some(ActiveExecution {
+                            let spawned = active_executions.spawn(
                                 execution_id,
-                                task,
-                                cancellation: Some(cancellation),
-                            });
+                                cancellation,
+                                async move {
+                                    run_assignment(
+                                        &client,
+                                        &executor,
+                                        assignment,
+                                        cancellation_receiver,
+                                    )
+                                    .await;
+                                },
+                            );
+                            if !spawned {
+                                tracing::warn!(
+                                    %node_id,
+                                    %execution_id,
+                                    "ignoring assignment for an execution that is already running"
+                                );
+                            }
                         }
                         Ok(Some(NodeCommand::Cancel { execution_id })) => {
-                            if let Some(active) = active_execution.as_mut()
-                                && active.execution_id == execution_id
-                                && let Some(cancellation) = active.cancellation.take()
-                            {
-                                let _ = cancellation.send(());
+                            if active_executions.cancel(execution_id) {
                                 tracing::info!(%node_id, %execution_id, "execution cancellation requested");
                             }
                         }
@@ -205,20 +286,14 @@ async fn run_node(
                         Err(error) => return Err(error.into()),
                     }
                 }
-                completed = async {
-                    let active = active_execution
-                        .as_mut()
-                        .expect("branch is disabled without an active execution");
-                    (&mut active.task).await
-                }, if active_execution.is_some() => {
-                    if let Err(error) = completed {
+                completed = active_executions.next_finished(), if !active_executions.is_empty() => {
+                    if let Some(Err(error)) = completed {
                         tracing::error!(%node_id, %error, "execution task failed");
                     }
-                    active_execution = None;
                 }
                 shutdown = tokio::signal::ctrl_c() => {
                     shutdown?;
-                    abort_execution(&mut active_execution).await;
+                    active_executions.abort_all().await;
                     return Ok(());
                 }
             }
@@ -353,13 +428,6 @@ async fn report_event_with_retry(
     }
 }
 
-async fn abort_execution(active_execution: &mut Option<ActiveExecution>) {
-    if let Some(execution) = active_execution.take() {
-        execution.task.abort();
-        let _ = execution.task.await;
-    }
-}
-
 async fn wait_for_retry_or_shutdown(delay: Duration) -> io::Result<bool> {
     tokio::select! {
         _ = sleep(delay) => Ok(false),
@@ -416,8 +484,61 @@ fn local_node_descriptor(
         capacity: ResourceCapacity {
             logical_cpus,
             memory_bytes: resource_reporter.total_memory(),
+            max_concurrent_executions: max_concurrent_executions_from_env(logical_cpus)?,
         },
+        capabilities: capabilities_from_env()?,
     })
+}
+
+fn capabilities_from_env() -> io::Result<Vec<String>> {
+    match env::var(CAPABILITIES_ENV) {
+        Ok(value) => Ok(parse_capabilities(&value)),
+        Err(env::VarError::NotPresent) => Ok(Vec::new()),
+        Err(env::VarError::NotUnicode(_)) => Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("{CAPABILITIES_ENV} must contain valid Unicode"),
+        )),
+    }
+}
+
+/// Splits a comma-separated label list into sorted, lowercase, unique labels.
+fn parse_capabilities(value: &str) -> Vec<String> {
+    value
+        .split(',')
+        .map(|label| label.trim().to_ascii_lowercase())
+        .filter(|label| !label.is_empty())
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect()
+}
+
+/// Each execution reserves at least one CPU, so the CPU count is the natural default.
+fn max_concurrent_executions_from_env(logical_cpus: u32) -> io::Result<u32> {
+    match env::var(MAX_CONCURRENT_EXECUTIONS_ENV) {
+        Ok(value) => parse_max_concurrent_executions(&value),
+        Err(env::VarError::NotPresent) => Ok(logical_cpus),
+        Err(env::VarError::NotUnicode(_)) => Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("{MAX_CONCURRENT_EXECUTIONS_ENV} must contain valid Unicode"),
+        )),
+    }
+}
+
+fn parse_max_concurrent_executions(value: &str) -> io::Result<u32> {
+    let limit = value.parse::<u32>().map_err(|error| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("{MAX_CONCURRENT_EXECUTIONS_ENV} must be a positive integer: {error}"),
+        )
+    })?;
+    if limit == 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("{MAX_CONCURRENT_EXECUTIONS_ENV} must be greater than zero"),
+        ));
+    }
+
+    Ok(limit)
 }
 
 fn heartbeat_interval_from_env() -> io::Result<Duration> {
@@ -457,6 +578,76 @@ mod tests {
         let error = parse_heartbeat_interval("0").expect_err("zero interval must be rejected");
 
         assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+    }
+
+    #[test]
+    fn capabilities_are_normalized_and_deduplicated() {
+        assert_eq!(
+            parse_capabilities(" GPU, docker ,,gpu"),
+            vec!["docker".to_owned(), "gpu".to_owned()]
+        );
+        assert!(parse_capabilities("").is_empty());
+    }
+
+    #[test]
+    fn max_concurrent_executions_must_be_a_positive_integer() {
+        assert_eq!(parse_max_concurrent_executions("4").ok(), Some(4));
+        for invalid in ["0", "-1", "many"] {
+            let error = parse_max_concurrent_executions(invalid)
+                .expect_err("invalid limit must be rejected");
+            assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+        }
+    }
+
+    #[tokio::test]
+    async fn active_executions_run_concurrently_and_are_forgotten_when_done() {
+        let mut active = ActiveExecutions::default();
+        let (first, second) = (ExecutionId::generate(), ExecutionId::generate());
+        let (release_first, first_gate) = oneshot::channel::<()>();
+        let (cancel_first, _) = oneshot::channel();
+        let (cancel_second, _) = oneshot::channel();
+
+        assert!(active.spawn(first, cancel_first, async move {
+            let _ = first_gate.await;
+        }));
+        assert!(active.spawn(second, cancel_second, async {}));
+        let (duplicate_cancel, _) = oneshot::channel();
+        assert!(!active.spawn(first, duplicate_cancel, async {}));
+        assert_eq!(active.len(), 2);
+
+        assert_eq!(
+            active.next_finished().await.and_then(Result::ok),
+            Some(second)
+        );
+        assert_eq!(active.ids(), vec![first]);
+
+        release_first
+            .send(())
+            .expect("first task should be waiting");
+        assert_eq!(
+            active.next_finished().await.and_then(Result::ok),
+            Some(first)
+        );
+        assert!(active.is_empty());
+        assert!(active.next_finished().await.is_none());
+    }
+
+    #[tokio::test]
+    async fn cancellation_signal_is_sent_once() {
+        let mut active = ActiveExecutions::default();
+        let execution_id = ExecutionId::generate();
+        let (cancellation, receiver) = oneshot::channel();
+        active.spawn(execution_id, cancellation, async move {
+            let _ = receiver.await;
+        });
+
+        assert!(active.cancel(execution_id));
+        assert!(!active.cancel(execution_id));
+        assert!(!active.cancel(ExecutionId::generate()));
+        assert_eq!(
+            active.next_finished().await.and_then(Result::ok),
+            Some(execution_id)
+        );
     }
 
     #[test]

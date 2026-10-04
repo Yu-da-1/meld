@@ -2,7 +2,7 @@ use std::{error::Error, fmt, time::Duration};
 
 use meld_core::{
     ApiErrorResponse, CancelJobResponse, JobId, JobLogsResponse, JobSpec, JobStatusResponse,
-    SubmitJobResponse,
+    ListNodesResponse, NodeId, NodeStateResponse, SubmitJobResponse,
 };
 use reqwest::{Client, Response, StatusCode, Url};
 use serde::de::DeserializeOwned;
@@ -66,6 +66,41 @@ impl ControllerClient {
         let response = self
             .http
             .post(self.endpoint(&format!("v1/jobs/{job_id}/cancel")))
+            .send()
+            .await
+            .map_err(ControllerClientError::Request)?;
+        decode_response(response).await
+    }
+
+    pub async fn nodes(&self) -> Result<ListNodesResponse, ControllerClientError> {
+        let response = self
+            .http
+            .get(self.endpoint("v1/nodes"))
+            .send()
+            .await
+            .map_err(ControllerClientError::Request)?;
+        decode_response(response).await
+    }
+
+    pub async fn drain(&self, node_id: NodeId) -> Result<NodeStateResponse, ControllerClientError> {
+        self.post_node_action(node_id, "drain").await
+    }
+
+    pub async fn resume(
+        &self,
+        node_id: NodeId,
+    ) -> Result<NodeStateResponse, ControllerClientError> {
+        self.post_node_action(node_id, "resume").await
+    }
+
+    async fn post_node_action(
+        &self,
+        node_id: NodeId,
+        action: &str,
+    ) -> Result<NodeStateResponse, ControllerClientError> {
+        let response = self
+            .http
+            .post(self.endpoint(&format!("v1/nodes/{node_id}/{action}")))
             .send()
             .await
             .map_err(ControllerClientError::Request)?;
@@ -160,6 +195,7 @@ mod tests {
             },
             job_timeout_secs: None,
             execution_timeout_secs: Some(30),
+            constraints: meld_core::PlacementConstraints::default(),
         };
 
         let submitted = client.submit(&spec).await.expect("job should be submitted");
@@ -178,6 +214,36 @@ mod tests {
             .await
             .expect("queued job should be cancellable");
         assert_eq!(cancelled.state, JobState::Cancelled);
+
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn client_rejects_draining_an_unknown_node_and_lists_no_nodes() {
+        let (controller_url, server) = start_controller().await;
+        let client =
+            ControllerClient::new(&controller_url).expect("controller URL should be valid");
+        let node_id = NodeId::generate();
+
+        let error = client
+            .drain(node_id)
+            .await
+            .expect_err("unknown node cannot be drained");
+        assert!(matches!(
+            error,
+            ControllerClientError::Rejected {
+                status: StatusCode::NOT_FOUND,
+                ..
+            }
+        ));
+        assert!(
+            client
+                .nodes()
+                .await
+                .expect("node list should be readable")
+                .nodes
+                .is_empty()
+        );
 
         server.abort();
     }

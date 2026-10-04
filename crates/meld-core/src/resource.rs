@@ -9,6 +9,8 @@ pub struct ResourceCapacity {
     pub logical_cpus: u32,
     /// Total memory capacity in bytes.
     pub memory_bytes: u64,
+    /// Upper bound on executions the node runs at the same time.
+    pub max_concurrent_executions: u32,
 }
 
 impl ResourceCapacity {
@@ -46,6 +48,7 @@ mod tests {
     const CAPACITY: ResourceCapacity = ResourceCapacity {
         logical_cpus: 8,
         memory_bytes: 16_000,
+        max_concurrent_executions: 8,
     };
 
     #[test]

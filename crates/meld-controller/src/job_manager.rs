@@ -10,12 +10,12 @@ use std::{
 use meld_core::{
     Execution, ExecutionAssignment, ExecutionCompletionError, ExecutionId, ExecutionOutput,
     ExecutionResult, ExecutionState, InvalidStateTransition, Job, JobId, JobSpec,
-    JobSpecValidationError, JobState, NodeId,
+    JobSpecValidationError, JobState, NodeAssessment, NodeId,
 };
 
 use crate::{
     node_registry::NodeRegistry,
-    scheduler::{Scheduler, SchedulingFailure},
+    scheduler::{NodeAllocation, Scheduler, SchedulingFailure},
 };
 
 /// Owns controller-authoritative Job and Execution records.
@@ -29,6 +29,8 @@ pub struct JobManager {
     job_timeout_requests: BTreeSet<ExecutionId>,
     job_submitted_at: BTreeMap<JobId, Instant>,
     pending_jobs: VecDeque<JobId>,
+    /// The scheduler's verdict on every node at the latest placement of each job.
+    placements: BTreeMap<JobId, Vec<NodeAssessment>>,
 }
 
 impl JobManager {
@@ -58,17 +60,57 @@ impl JobManager {
         Ok(job_id)
     }
 
-    /// Schedules the oldest queued job without allowing later jobs to overtake it.
+    /// Schedules the oldest queued job that can be placed.
+    ///
+    /// Order is FIFO, with one exception: a job that no current node could
+    /// ever take (see [`SchedulingFailure::can_be_overtaken`]) does not hold
+    /// back later jobs. A job that is merely waiting for capacity does, so
+    /// large jobs are not starved by a stream of small ones.
+    ///
+    /// When nothing can be placed, the error is the first blocker found, so a
+    /// queue holding only unplaceable jobs still reports why.
     pub fn schedule_next(
         &mut self,
         scheduler: &Scheduler,
         registry: &NodeRegistry,
     ) -> Result<Option<ExecutionId>, JobManagerError> {
-        let Some(job_id) = self.pending_jobs.front().copied() else {
-            return Ok(None);
-        };
+        let mut first_overtaken = None;
+        for job_id in self.pending_jobs.clone() {
+            match self.schedule(job_id, scheduler, registry) {
+                Ok(execution_id) => return Ok(Some(execution_id)),
+                Err(JobManagerError::Scheduling(failure)) if failure.can_be_overtaken() => {
+                    first_overtaken.get_or_insert(failure);
+                }
+                Err(error) => return Err(error),
+            }
+        }
 
-        self.schedule(job_id, scheduler, registry).map(Some)
+        first_overtaken.map_or(Ok(None), |failure| {
+            Err(JobManagerError::Scheduling(failure))
+        })
+    }
+
+    /// Whether an earlier queued job will be placed before this one, or is
+    /// waiting for capacity that this job must not take.
+    pub fn is_behind_earlier_job(
+        &self,
+        job_id: JobId,
+        scheduler: &Scheduler,
+        registry: &NodeRegistry,
+    ) -> Result<bool, JobManagerError> {
+        for &earlier in self
+            .pending_jobs
+            .iter()
+            .take_while(|queued| **queued != job_id)
+        {
+            let overtakable = self
+                .scheduling_failure_for(earlier, scheduler, registry)?
+                .is_some_and(SchedulingFailure::can_be_overtaken);
+            if !overtakable {
+                return Ok(true);
+            }
+        }
+        Ok(false)
     }
 
     /// Selects a node and creates one assigned execution attempt.
@@ -90,10 +132,20 @@ impl JobManager {
             });
         }
 
-        let unavailable_nodes = self.unavailable_node_ids();
-        let node_id = scheduler
-            .select_node(job.spec().requirements, registry, &unavailable_nodes)
-            .map_err(JobManagerError::Scheduling)?;
+        let allocations = self.node_allocations();
+        let placement = scheduler.place(
+            job.spec().requirements,
+            &job.spec().constraints,
+            registry,
+            &allocations,
+        );
+        let Some(node_id) = placement.selected else {
+            return Err(JobManagerError::Scheduling(
+                placement
+                    .failure()
+                    .expect("an unselected placement always has a failure"),
+            ));
+        };
 
         let execution = loop {
             let candidate = Execution::new(job_id, node_id);
@@ -113,9 +165,36 @@ impl JobManager {
             .entry(job_id)
             .or_default()
             .push(execution_id);
+        self.placements.insert(job_id, placement.assessments);
         self.remove_pending_job(job_id);
 
         Ok(execution_id)
+    }
+
+    /// Per-node reasoning for a job: what the scheduler would decide right now
+    /// while the job is queued, otherwise what it decided when placing the job.
+    pub fn placement_for(
+        &self,
+        job_id: JobId,
+        scheduler: &Scheduler,
+        registry: &NodeRegistry,
+    ) -> Result<Vec<NodeAssessment>, JobManagerError> {
+        let job = self
+            .jobs
+            .get(&job_id)
+            .ok_or(JobManagerError::JobNotFound(job_id))?;
+        if job.state() != JobState::Queued {
+            return Ok(self.placements.get(&job_id).cloned().unwrap_or_default());
+        }
+
+        Ok(scheduler
+            .place(
+                job.spec().requirements,
+                &job.spec().constraints,
+                registry,
+                &self.node_allocations(),
+            )
+            .assessments)
     }
 
     pub fn job(&self, job_id: JobId) -> Option<&Job> {
@@ -159,9 +238,14 @@ impl JobManager {
                 state: job.state(),
             });
         }
-        let unavailable_nodes = self.unavailable_node_ids();
+        let allocations = self.node_allocations();
         Ok(scheduler
-            .select_node(job.spec().requirements, registry, &unavailable_nodes)
+            .select_node(
+                job.spec().requirements,
+                &job.spec().constraints,
+                registry,
+                &allocations,
+            )
             .err())
     }
 
@@ -317,13 +401,20 @@ impl JobManager {
         Ok(())
     }
 
-    /// Returns the assignment that still awaits acknowledgement from one node.
+    /// Returns an assignment that still awaits acknowledgement from one node.
+    ///
+    /// Executions the node already reports as active are skipped, so a node
+    /// that has received an assignment but not yet acknowledged it is not
+    /// handed the same execution twice.
     pub fn pending_assignment_for(
         &self,
         node_id: NodeId,
+        active_execution_ids: &[ExecutionId],
     ) -> Result<Option<ExecutionAssignment>, JobManagerError> {
         let Some(execution) = self.executions.values().find(|execution| {
-            execution.node_id() == node_id && execution.state() == ExecutionState::Assigned
+            execution.node_id() == node_id
+                && execution.state() == ExecutionState::Assigned
+                && !active_execution_ids.contains(&execution.id())
         }) else {
             return Ok(None);
         };
@@ -711,20 +802,26 @@ impl JobManager {
         }
     }
 
-    fn unavailable_node_ids(&self) -> BTreeSet<NodeId> {
-        self.executions
-            .values()
-            .filter(|execution| {
-                matches!(
-                    execution.state(),
-                    ExecutionState::Assigned
-                        | ExecutionState::Accepted
-                        | ExecutionState::Running
-                        | ExecutionState::Cancelling
-                )
-            })
-            .map(Execution::node_id)
-            .collect()
+    /// Sums the requirements of every execution still holding node resources.
+    fn node_allocations(&self) -> BTreeMap<NodeId, NodeAllocation> {
+        let mut allocations = BTreeMap::<NodeId, NodeAllocation>::new();
+        for execution in self.executions.values().filter(|execution| {
+            matches!(
+                execution.state(),
+                ExecutionState::Assigned
+                    | ExecutionState::Accepted
+                    | ExecutionState::Running
+                    | ExecutionState::Cancelling
+            )
+        }) {
+            if let Some(job) = self.jobs.get(&execution.job_id()) {
+                allocations
+                    .entry(execution.node_id())
+                    .or_default()
+                    .reserve(job.spec().requirements);
+            }
+        }
+        allocations
     }
 }
 
@@ -828,7 +925,7 @@ mod tests {
             .expect("one job should be queued");
 
         let assignment = manager
-            .pending_assignment_for(node_id)
+            .pending_assignment_for(node_id, &[])
             .expect("linked job should exist")
             .expect("assigned execution should be pending");
 
@@ -842,7 +939,7 @@ mod tests {
             .expect("assignment acknowledgement should be accepted");
         assert_eq!(
             manager
-                .pending_assignment_for(node_id)
+                .pending_assignment_for(node_id, &[])
                 .expect("linked job should still exist"),
             None
         );
@@ -889,6 +986,40 @@ mod tests {
     }
 
     #[test]
+    fn executions_share_a_node_until_reservations_fill_its_capacity() {
+        let scheduler = Scheduler::new();
+        let (registry, node_id) = ready_registry_with_limit(8);
+        let mut manager = JobManager::new();
+        let mut half = spec();
+        half.requirements.logical_cpus = 4;
+        half.requirements.memory_bytes = 8_000;
+        for _ in 0..2 {
+            manager.submit(half.clone()).expect("job should be queued");
+        }
+        let third = manager.submit(half).expect("job should be queued");
+
+        for _ in 0..2 {
+            let execution_id = manager
+                .schedule_next(&scheduler, &registry)
+                .expect("reservation should fit")
+                .expect("job should be pending");
+            assert_eq!(
+                manager.execution(execution_id).map(Execution::node_id),
+                Some(node_id)
+            );
+        }
+        let error = manager
+            .schedule_next(&scheduler, &registry)
+            .expect_err("node capacity is fully reserved");
+
+        assert_eq!(
+            error,
+            JobManagerError::Scheduling(SchedulingFailure::NoAvailableNodes)
+        );
+        assert_eq!(manager.job(third).map(Job::state), Some(JobState::Queued));
+    }
+
+    #[test]
     fn schedule_next_selects_jobs_in_submission_order() {
         let mut manager = JobManager::new();
         let first_job_id = manager
@@ -917,33 +1048,102 @@ mod tests {
     }
 
     #[test]
-    fn unschedulable_head_job_is_not_overtaken() {
+    fn head_job_no_node_can_ever_take_is_overtaken() {
         let mut manager = JobManager::new();
         let mut oversized_spec = spec();
         oversized_spec.requirements.logical_cpus = 9;
-        let first_job_id = manager
+        let oversized_job_id = manager
             .submit(oversized_spec)
             .expect("oversized job should still be queued");
-        let second_job_id = manager
+        let mut gpu_spec = spec();
+        gpu_spec.constraints.capabilities = vec!["gpu".to_owned()];
+        let gpu_job_id = manager
+            .submit(gpu_spec)
+            .expect("constrained job should be queued");
+        let runnable_job_id = manager
             .submit(spec())
-            .expect("second valid job should be queued");
+            .expect("runnable job should be queued");
+        let (registry, _) = ready_registry();
+
+        let execution_id = manager
+            .schedule_next(&Scheduler::new(), &registry)
+            .expect("runnable job should not be held back")
+            .expect("a job should have been scheduled");
+
+        assert_eq!(
+            manager.execution(execution_id).map(Execution::job_id),
+            Some(runnable_job_id)
+        );
+        for blocked in [oversized_job_id, gpu_job_id] {
+            assert_eq!(manager.job(blocked).map(Job::state), Some(JobState::Queued));
+        }
+    }
+
+    #[test]
+    fn queue_of_only_unplaceable_jobs_reports_the_first_blocker() {
+        let mut manager = JobManager::new();
+        let mut oversized_spec = spec();
+        oversized_spec.requirements.logical_cpus = 9;
+        manager
+            .submit(oversized_spec)
+            .expect("oversized job should still be queued");
+        let mut gpu_spec = spec();
+        gpu_spec.constraints.capabilities = vec!["gpu".to_owned()];
+        manager
+            .submit(gpu_spec)
+            .expect("constrained job should be queued");
         let (registry, _) = ready_registry();
 
         let error = manager
             .schedule_next(&Scheduler::new(), &registry)
-            .expect_err("insufficient capacity for the head job should stop FIFO scheduling");
+            .expect_err("nothing in the queue can be placed");
 
         assert_eq!(
             error,
             JobManagerError::Scheduling(SchedulingFailure::InsufficientResources)
         );
+    }
+
+    #[test]
+    fn job_waiting_for_busy_capacity_is_not_overtaken() {
+        let mut manager = JobManager::new();
+        let mut large = spec();
+        large.requirements.logical_cpus = 8;
+        let small = spec();
+        let (registry, _) = ready_registry_with_limit(8);
+        let scheduler = Scheduler::new();
+        let running_id = manager
+            .submit(spec())
+            .expect("running job should be queued");
+        manager
+            .schedule(running_id, &scheduler, &registry)
+            .expect("first job should be assigned");
+        let large_id = manager.submit(large).expect("large job should be queued");
+        let small_id = manager.submit(small).expect("small job should be queued");
+
+        let error = manager
+            .schedule_next(&scheduler, &registry)
+            .expect_err("the large job must keep its place in line");
+
         assert_eq!(
-            manager.job(first_job_id).map(Job::state),
+            error,
+            JobManagerError::Scheduling(SchedulingFailure::NoAvailableNodes)
+        );
+        assert_eq!(
+            manager.job(large_id).map(Job::state),
             Some(JobState::Queued)
         );
         assert_eq!(
-            manager.job(second_job_id).map(Job::state),
+            manager.job(small_id).map(Job::state),
             Some(JobState::Queued)
+        );
+        assert_eq!(
+            manager.is_behind_earlier_job(small_id, &scheduler, &registry),
+            Ok(true)
+        );
+        assert_eq!(
+            manager.is_behind_earlier_job(large_id, &scheduler, &registry),
+            Ok(false)
         );
     }
 
@@ -1292,10 +1492,15 @@ mod tests {
             },
             job_timeout_secs: None,
             execution_timeout_secs: None,
+            constraints: meld_core::PlacementConstraints::default(),
         }
     }
 
     fn ready_registry() -> (NodeRegistry, NodeId) {
+        ready_registry_with_limit(1)
+    }
+
+    fn ready_registry_with_limit(max_concurrent_executions: u32) -> (NodeRegistry, NodeId) {
         let node_id = NodeId::generate();
         let mut registry = NodeRegistry::new();
         registry.register(NodeDescriptor {
@@ -1306,7 +1511,9 @@ mod tests {
             capacity: ResourceCapacity {
                 logical_cpus: 8,
                 memory_bytes: 16_000_000_000,
+                max_concurrent_executions,
             },
+            capabilities: vec![],
         });
         registry
             .record_heartbeat(

@@ -449,6 +449,7 @@ mod tests {
                 },
                 job_timeout_secs: None,
                 execution_timeout_secs: None,
+                constraints: meld_core::PlacementConstraints::default(),
             },
         }
     }
