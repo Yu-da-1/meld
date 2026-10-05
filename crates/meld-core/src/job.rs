@@ -4,7 +4,9 @@ use std::{error::Error, fmt};
 
 use serde::{Deserialize, Serialize};
 
-use crate::{InvalidStateTransition, JobId, NodeDescriptor, ResourceRequirements};
+use crate::{
+    DataSpec, DataSpecError, InvalidStateTransition, JobId, NodeDescriptor, ResourceRequirements,
+};
 
 /// Defines a program invocation and the resources it requires.
 ///
@@ -26,6 +28,9 @@ pub struct JobSpec {
     /// Restrictions on which nodes may run the job.
     #[serde(default, skip_serializing_if = "PlacementConstraints::is_empty")]
     pub constraints: PlacementConstraints,
+    /// Files moved to the node before the run and collected after it.
+    #[serde(default, skip_serializing_if = "DataSpec::is_empty")]
+    pub data: DataSpec,
 }
 
 /// Node properties a job requires beyond CPU and memory.
@@ -101,12 +106,14 @@ impl JobSpec {
             return Err(JobSpecValidationError::ZeroExecutionTimeout);
         }
         self.constraints.validate()?;
+        self.data.validate()?;
         Ok(())
     }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum JobSpecValidationError {
+    InvalidData(DataSpecError),
     EmptyProgram,
     ZeroLogicalCpus,
     ZeroMemory,
@@ -118,6 +125,7 @@ pub enum JobSpecValidationError {
 impl fmt::Display for JobSpecValidationError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::InvalidData(error) => error.fmt(formatter),
             Self::EmptyProgram => formatter.write_str("job program must not be empty"),
             Self::ZeroLogicalCpus => {
                 formatter.write_str("job must request at least one logical CPU")
@@ -131,6 +139,12 @@ impl fmt::Display for JobSpecValidationError {
                 formatter.write_str("placement constraints must not contain blank values")
             }
         }
+    }
+}
+
+impl From<DataSpecError> for JobSpecValidationError {
+    fn from(error: DataSpecError) -> Self {
+        Self::InvalidData(error)
     }
 }
 
@@ -370,6 +384,59 @@ mod tests {
         );
     }
 
+    fn spec_with_data(data: DataSpec) -> JobSpec {
+        JobSpec {
+            program: "python3".to_owned(),
+            args: Vec::new(),
+            requirements: ResourceRequirements {
+                logical_cpus: 1,
+                memory_bytes: 1,
+            },
+            job_timeout_secs: None,
+            execution_timeout_secs: None,
+            constraints: PlacementConstraints::default(),
+            data,
+        }
+    }
+
+    #[test]
+    fn job_spec_data_round_trips_and_is_omitted_when_empty() {
+        let data = DataSpec {
+            inputs: vec![crate::InputFile {
+                path: "data.csv".to_owned(),
+                sha256: "a".repeat(64).parse().expect("valid digest"),
+                size_bytes: 3,
+            }],
+            outputs: vec![crate::OutputSpec {
+                path: "result.json".to_owned(),
+            }],
+        };
+        let spec = spec_with_data(data);
+
+        let json = serde_json::to_string(&spec).expect("spec should serialize");
+        let deserialized: JobSpec = serde_json::from_str(&json).expect("spec should deserialize");
+
+        assert_eq!(deserialized, spec);
+        assert!(
+            !serde_json::to_string(&spec_with_data(DataSpec::default()))
+                .expect("spec should serialize")
+                .contains("data")
+        );
+    }
+
+    #[test]
+    fn job_with_unsafe_data_path_is_rejected() {
+        let error = Job::new(spec_with_data(DataSpec {
+            inputs: vec![],
+            outputs: vec![crate::OutputSpec {
+                path: "../escape".to_owned(),
+            }],
+        }))
+        .expect_err("path traversal must be rejected");
+
+        assert!(matches!(error, JobSpecValidationError::InvalidData(_)));
+    }
+
     #[test]
     fn job_spec_preserves_argument_boundaries_in_json() {
         let spec = JobSpec {
@@ -382,6 +449,7 @@ mod tests {
             job_timeout_secs: None,
             execution_timeout_secs: None,
             constraints: PlacementConstraints::default(),
+            data: DataSpec::default(),
         };
 
         let json = serde_json::to_string(&spec).expect("job spec should serialize");
@@ -451,6 +519,7 @@ mod tests {
             job_timeout_secs: None,
             execution_timeout_secs: None,
             constraints: PlacementConstraints::default(),
+            data: DataSpec::default(),
         };
 
         let job = Job::new(spec.clone()).expect("valid spec should create a job");
@@ -471,6 +540,7 @@ mod tests {
             job_timeout_secs: None,
             execution_timeout_secs: None,
             constraints: PlacementConstraints::default(),
+            data: DataSpec::default(),
         })
         .expect("valid spec should create a job");
         job.queue().expect("job should be queued");
@@ -493,6 +563,7 @@ mod tests {
             job_timeout_secs: None,
             execution_timeout_secs: None,
             constraints: PlacementConstraints::default(),
+            data: DataSpec::default(),
         })
         .expect_err("blank program must be rejected");
 
@@ -511,6 +582,7 @@ mod tests {
             job_timeout_secs: None,
             execution_timeout_secs: Some(0),
             constraints: PlacementConstraints::default(),
+            data: DataSpec::default(),
         })
         .expect_err("zero execution timeout must be rejected");
 
@@ -529,6 +601,7 @@ mod tests {
             job_timeout_secs: Some(0),
             execution_timeout_secs: None,
             constraints: PlacementConstraints::default(),
+            data: DataSpec::default(),
         })
         .expect_err("zero job timeout must be rejected");
 

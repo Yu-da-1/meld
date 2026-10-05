@@ -7,7 +7,7 @@ use std::{
 
 use clap::{Args, Parser, Subcommand};
 use meld_core::{
-    ExecutionState, JobId, JobSpec, JobState, LimitedResource, NodeId, NodeState,
+    DataSpec, ExecutionState, JobId, JobSpec, JobState, LimitedResource, NodeId, NodeState,
     NodeStateResponse, NodeVerdict, PlacementConstraints, QueueReason, ResourceRequirements,
 };
 
@@ -88,6 +88,7 @@ impl RunArgs {
                 architecture: self.architecture,
                 capabilities: self.capabilities,
             },
+            data: DataSpec::default(),
         }
     }
 }

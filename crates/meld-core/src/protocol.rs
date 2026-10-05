@@ -8,7 +8,7 @@ use crate::{
 };
 
 /// Protocol version implemented by this build.
-pub const CURRENT_PROTOCOL_VERSION: ProtocolVersion = ProtocolVersion::new(6);
+pub const CURRENT_PROTOCOL_VERSION: ProtocolVersion = ProtocolVersion::new(7);
 
 /// Version of the controller-node message contract.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -132,6 +132,9 @@ pub struct PollNodeCommandResponse {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
+// One command is built per poll and never stored in bulk, so the size gap
+// costs nothing; boxing would only add indirection at every call site.
+#[allow(clippy::large_enum_variant)]
 pub enum NodeCommand {
     Start { assignment: ExecutionAssignment },
     Cancel { execution_id: ExecutionId },
@@ -233,6 +236,7 @@ mod tests {
                         job_timeout_secs: None,
                         execution_timeout_secs: None,
                         constraints: crate::PlacementConstraints::default(),
+                        data: crate::DataSpec::default(),
                     },
                 },
             }),

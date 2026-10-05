@@ -1,6 +1,7 @@
 //! Shared domain model and protocol contracts for Meld.
 
 mod client;
+mod data;
 mod execution;
 mod id;
 mod job;
@@ -13,6 +14,11 @@ pub use client::{
     ApiErrorResponse, CancelJobResponse, ExecutionView, JobLogsResponse, JobStatusResponse,
     LimitedResource, ListNodesResponse, NodeAssessment, NodeStateResponse, NodeVerdict, NodeView,
     QueueReason, SubmitJobResponse,
+};
+pub use data::{
+    DataFailure, DataSpec, DataSpecError, InputFile, InvalidDigest, InvalidPath, MAX_FILE_BYTES,
+    MAX_FILES_PER_JOB, MAX_JOB_INPUT_BYTES, MAX_PATH_BYTES, OutputFile, OutputSpec, Sha256Digest,
+    validate_relative_path,
 };
 pub use execution::{
     CapturedStream, Execution, ExecutionCompletionError, ExecutionOutput, ExecutionResult,
