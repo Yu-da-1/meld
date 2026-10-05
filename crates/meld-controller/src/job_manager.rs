@@ -10,7 +10,7 @@ use std::{
 use meld_core::{
     Execution, ExecutionAssignment, ExecutionCompletionError, ExecutionId, ExecutionOutput,
     ExecutionResult, ExecutionState, InvalidStateTransition, Job, JobId, JobSpec,
-    JobSpecValidationError, JobState, NodeAssessment, NodeId,
+    JobSpecValidationError, JobState, NodeAssessment, NodeId, Sha256Digest,
 };
 
 use crate::{
@@ -195,6 +195,25 @@ impl JobManager {
                 &self.node_allocations(),
             )
             .assessments)
+    }
+
+    /// Input content that jobs which have not finished may still need.
+    pub fn pinned_input_digests(&self) -> BTreeSet<Sha256Digest> {
+        self.jobs
+            .values()
+            .filter(|job| {
+                !matches!(
+                    job.state(),
+                    JobState::Succeeded
+                        | JobState::Failed
+                        | JobState::Cancelled
+                        | JobState::TimedOut
+                        | JobState::Lost
+                )
+            })
+            .flat_map(|job| job.spec().data.inputs.iter())
+            .map(|input| input.sha256.clone())
+            .collect()
     }
 
     pub fn job(&self, job_id: JobId) -> Option<&Job> {

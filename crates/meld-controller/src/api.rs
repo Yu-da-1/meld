@@ -9,22 +9,26 @@ use std::{
 
 use axum::{
     Json, Router,
+    body::Body,
     extract::{Path, State},
-    http::StatusCode,
+    http::{HeaderMap, StatusCode, header},
     response::{IntoResponse, Response},
-    routing::{get, post},
+    routing::{get, post, put},
 };
 use meld_core::{
-    Acknowledgement, ApiErrorResponse, CURRENT_PROTOCOL_VERSION, CancelJobResponse, ExecutionEvent,
-    ExecutionOutput, ExecutionView, HeartbeatRequest, JobId, JobLogsResponse, JobSpec, JobState,
-    JobStatusResponse, ListNodesResponse, NodeCommand, NodeId, NodeState, NodeStateResponse,
-    NodeView, PollNodeCommandRequest, PollNodeCommandResponse, ProtocolError,
-    ProtocolErrorResponse, QueueReason, RegisterNodeRequest, RegisterNodeResponse,
-    ReportExecutionEventRequest, ResponseMetadata, SubmitJobResponse,
+    Acknowledgement, ApiErrorResponse, BlobResponse, CURRENT_PROTOCOL_VERSION, CancelJobResponse,
+    ExecutionEvent, ExecutionOutput, ExecutionView, HeartbeatRequest, JobId, JobLogsResponse,
+    JobSpec, JobState, JobStatusResponse, ListNodesResponse, MissingInputsResponse, NodeCommand,
+    NodeId, NodeState, NodeStateResponse, NodeView, PollNodeCommandRequest,
+    PollNodeCommandResponse, ProtocolError, ProtocolErrorResponse, QueueReason,
+    RegisterNodeRequest, RegisterNodeResponse, ReportExecutionEventRequest, ResponseMetadata,
+    Sha256Digest, SubmitJobResponse,
 };
 use tokio::{sync::watch, time::timeout};
+use tokio_util::io::ReaderStream;
 
 use crate::{
+    blob_store::{BlobError, BlobStore, PutOutcome},
     failure_detector::FailureDetector,
     job_manager::{JobManager, JobManagerError},
     node_registry::{NodeRegistry, NodeRegistryError},
@@ -40,6 +44,7 @@ pub const SUBMIT_JOB_PATH: &str = "/v1/jobs";
 pub const JOB_STATUS_PATH: &str = "/v1/jobs/{job_id}";
 pub const JOB_LOGS_PATH: &str = "/v1/jobs/{job_id}/logs";
 pub const CANCEL_JOB_PATH: &str = "/v1/jobs/{job_id}/cancel";
+pub const BLOB_PATH: &str = "/v1/blobs/{sha256}";
 pub const POLL_NODE_COMMAND_PATH: &str = "/v1/nodes/commands/poll";
 pub const REPORT_EXECUTION_EVENT_PATH: &str = "/v1/nodes/executions/events";
 const COMMAND_LONG_POLL_TIMEOUT: Duration = Duration::from_secs(25);
@@ -49,6 +54,8 @@ const COMMAND_LONG_POLL_TIMEOUT: Duration = Duration::from_secs(25);
 pub struct ControllerState {
     registry: Arc<RwLock<NodeRegistry>>,
     jobs: Arc<RwLock<JobManager>>,
+    /// Absent until configured; blob routes and file inputs then report 503.
+    blobs: Option<Arc<BlobStore>>,
     command_updates: watch::Sender<u64>,
 }
 
@@ -58,6 +65,7 @@ impl Default for ControllerState {
         Self {
             registry: Arc::default(),
             jobs: Arc::default(),
+            blobs: None,
             command_updates,
         }
     }
@@ -66,6 +74,13 @@ impl Default for ControllerState {
 impl ControllerState {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Enables storage of job input and output files.
+    #[must_use]
+    pub fn with_blob_store(mut self, blobs: Arc<BlobStore>) -> Self {
+        self.blobs = Some(blobs);
+        self
     }
 
     pub fn detect_unreachable_nodes(
@@ -130,6 +145,7 @@ pub fn router(state: ControllerState) -> Router {
         .route(HEARTBEAT_PATH, post(record_heartbeat))
         .route(DRAIN_NODE_PATH, post(drain_node))
         .route(RESUME_NODE_PATH, post(resume_node))
+        .route(BLOB_PATH, put(put_blob).get(get_blob))
         .route(SUBMIT_JOB_PATH, post(submit_job))
         .route(JOB_STATUS_PATH, get(job_status))
         .route(JOB_LOGS_PATH, get(job_logs))
@@ -637,15 +653,21 @@ async fn submit_job(State(state): State<ControllerState>, Json(spec): Json<JobSp
         Ok(jobs) => jobs,
         Err(error) => {
             tracing::error!(%error, "job manager lock is poisoned");
-            return (
+            return api_error(
                 StatusCode::INTERNAL_SERVER_ERROR,
-                Json(ApiErrorResponse {
-                    error: "controller state is unavailable".to_owned(),
-                }),
-            )
-                .into_response();
+                "controller state is unavailable",
+            );
         }
     };
+
+    if let Err(error) = spec.validate() {
+        return api_error(StatusCode::BAD_REQUEST, error.to_string());
+    }
+    // Checked while the job lock is held: the lookup also refreshes each
+    // blob's retention, which keeps it until the job starts pinning it.
+    if let Some(rejection) = check_inputs_are_stored(&state, &spec) {
+        return rejection;
+    }
 
     match jobs.submit(spec) {
         Ok(job_id) => {
@@ -660,24 +682,167 @@ async fn submit_job(State(state): State<ControllerState>, Json(spec): Json<JobSp
             )
                 .into_response()
         }
-        Err(JobManagerError::InvalidSpec(error)) => (
-            StatusCode::BAD_REQUEST,
-            Json(ApiErrorResponse {
-                error: error.to_string(),
+        Err(JobManagerError::InvalidSpec(error)) => {
+            api_error(StatusCode::BAD_REQUEST, error.to_string())
+        }
+        Err(error) => {
+            tracing::error!(%error, "job submission failed");
+            api_error(StatusCode::INTERNAL_SERVER_ERROR, "job submission failed")
+        }
+    }
+}
+
+/// Returns the rejection for a spec whose input files are not all uploaded.
+fn check_inputs_are_stored(state: &ControllerState, spec: &JobSpec) -> Option<Response> {
+    if spec.data.inputs.is_empty() {
+        return None;
+    }
+    let Some(blobs) = &state.blobs else {
+        return Some(api_error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "this controller has no file storage configured",
+        ));
+    };
+
+    let mut missing = std::collections::BTreeSet::new();
+    for input in &spec.data.inputs {
+        match blobs.size_of(&input.sha256) {
+            Ok(Some(stored)) if stored == input.size_bytes => {}
+            Ok(Some(_)) => {
+                return Some(api_error(
+                    StatusCode::BAD_REQUEST,
+                    format!(
+                        "declared size of input `{}` differs from its content",
+                        input.path
+                    ),
+                ));
+            }
+            Ok(None) => {
+                missing.insert(input.sha256.clone());
+            }
+            Err(error) => return Some(blob_error_response(&error)),
+        }
+    }
+    if missing.is_empty() {
+        return None;
+    }
+    Some(
+        (
+            StatusCode::UNPROCESSABLE_ENTITY,
+            Json(MissingInputsResponse {
+                error: "input files have not been uploaded".to_owned(),
+                missing: missing.into_iter().collect(),
             }),
         )
             .into_response(),
+    )
+}
+
+async fn put_blob(
+    State(state): State<ControllerState>,
+    Path(sha256): Path<String>,
+    headers: HeaderMap,
+    body: Body,
+) -> Response {
+    let (blobs, digest) = match blob_request(&state, &sha256) {
+        Ok(parts) => parts,
+        Err((status, message)) => return api_error(status, message),
+    };
+    // Reject early what the limit would reject after the whole transfer.
+    let declared_length = headers
+        .get(header::CONTENT_LENGTH)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.parse::<u64>().ok());
+    let limit_bytes = blobs.limits().max_blob_bytes;
+    if declared_length.is_some_and(|length| length > limit_bytes) {
+        return blob_error_response(&BlobError::TooLarge { limit_bytes });
+    }
+
+    let pinned = match state.jobs.read() {
+        Ok(jobs) => jobs.pinned_input_digests(),
         Err(error) => {
-            tracing::error!(%error, "job submission failed");
-            (
+            tracing::error!(%error, "job manager lock is poisoned");
+            return api_error(
                 StatusCode::INTERNAL_SERVER_ERROR,
-                Json(ApiErrorResponse {
-                    error: "job submission failed".to_owned(),
+                "controller state is unavailable",
+            );
+        }
+    };
+    match blobs.put(&digest, body.into_data_stream(), &pinned).await {
+        Ok(outcome) => {
+            let status = match outcome {
+                PutOutcome::Created { .. } => StatusCode::CREATED,
+                PutOutcome::Existing { .. } => StatusCode::OK,
+            };
+            (
+                status,
+                Json(BlobResponse {
+                    sha256: digest,
+                    size_bytes: outcome.size_bytes(),
                 }),
             )
                 .into_response()
         }
+        Err(error) => blob_error_response(&error),
     }
+}
+
+async fn get_blob(State(state): State<ControllerState>, Path(sha256): Path<String>) -> Response {
+    let (blobs, digest) = match blob_request(&state, &sha256) {
+        Ok(parts) => parts,
+        Err((status, message)) => return api_error(status, message),
+    };
+    match blobs.read(&digest).await {
+        Ok(Some(stored)) => Response::builder()
+            .header(header::CONTENT_TYPE, "application/octet-stream")
+            .header(header::CONTENT_LENGTH, stored.size_bytes)
+            .body(Body::from_stream(ReaderStream::new(stored.file)))
+            .unwrap_or_else(|error| {
+                tracing::error!(%error, "failed to build blob response");
+                api_error(StatusCode::INTERNAL_SERVER_ERROR, "blob response failed")
+            }),
+        Ok(None) => api_error(StatusCode::NOT_FOUND, "blob not found"),
+        Err(error) => blob_error_response(&error),
+    }
+}
+
+fn blob_request(
+    state: &ControllerState,
+    sha256: &str,
+) -> Result<(Arc<BlobStore>, Sha256Digest), (StatusCode, String)> {
+    let Some(blobs) = &state.blobs else {
+        return Err((
+            StatusCode::SERVICE_UNAVAILABLE,
+            "this controller has no file storage configured".to_owned(),
+        ));
+    };
+    let digest = sha256
+        .parse::<Sha256Digest>()
+        .map_err(|error| (StatusCode::BAD_REQUEST, error.to_string()))?;
+    Ok((Arc::clone(blobs), digest))
+}
+
+fn blob_error_response(error: &BlobError) -> Response {
+    let status = match error {
+        BlobError::TooLarge { .. } => StatusCode::PAYLOAD_TOO_LARGE,
+        BlobError::DigestMismatch | BlobError::Body(_) => StatusCode::BAD_REQUEST,
+        BlobError::QuotaExceeded { .. } => StatusCode::INSUFFICIENT_STORAGE,
+        BlobError::Io(_) | BlobError::Unavailable => {
+            tracing::error!(%error, "blob storage failed");
+            return api_error(StatusCode::INTERNAL_SERVER_ERROR, "blob storage failed");
+        }
+    };
+    api_error(status, error.to_string())
+}
+
+fn api_error(status: StatusCode, message: impl Into<String>) -> Response {
+    (
+        status,
+        Json(ApiErrorResponse {
+            error: message.into(),
+        }),
+    )
+        .into_response()
 }
 
 async fn list_nodes(State(state): State<ControllerState>) -> Response {
@@ -2355,6 +2520,308 @@ mod tests {
             .expect("queued job should be schedulable")
             .expect("one job should be queued");
         (job_id, execution_id)
+    }
+
+    mod blobs {
+        use meld_core::{DataSpec, InputFile};
+        use sha2::{Digest, Sha256};
+        use tempfile::TempDir;
+
+        use crate::blob_store::BlobLimits;
+
+        use super::*;
+
+        fn limits() -> BlobLimits {
+            BlobLimits {
+                max_blob_bytes: 100,
+                quota_bytes: 1000,
+                min_retention: Duration::ZERO,
+            }
+        }
+
+        fn state_with_blobs(directory: &TempDir, limits: BlobLimits) -> ControllerState {
+            ControllerState::new().with_blob_store(Arc::new(
+                BlobStore::new(directory.path(), limits).expect("blob store should open"),
+            ))
+        }
+
+        fn digest_of(data: &[u8]) -> Sha256Digest {
+            Sha256Digest::from_bytes(Sha256::digest(data).into())
+        }
+
+        fn blob_http_request(method: &str, digest: &str, body: &[u8]) -> Request<Body> {
+            Request::builder()
+                .method(method)
+                .uri(format!("/v1/blobs/{digest}"))
+                .body(Body::from(body.to_vec()))
+                .expect("HTTP request should be valid")
+        }
+
+        async fn send(state: &ControllerState, request: Request<Body>) -> Response {
+            router(state.clone())
+                .oneshot(request)
+                .await
+                .expect("request should be handled")
+        }
+
+        async fn upload(state: &ControllerState, data: &[u8]) -> StatusCode {
+            send(
+                state,
+                blob_http_request("PUT", digest_of(data).as_str(), data),
+            )
+            .await
+            .status()
+        }
+
+        async fn json<T: serde::de::DeserializeOwned>(response: Response) -> T {
+            let body = to_bytes(response.into_body(), usize::MAX)
+                .await
+                .expect("response body should be readable");
+            serde_json::from_slice(&body).expect("response should contain JSON")
+        }
+
+        fn spec_with_input(data: &[u8]) -> JobSpec {
+            let mut spec = job_spec();
+            spec.data = DataSpec {
+                inputs: vec![InputFile {
+                    path: "input.txt".to_owned(),
+                    sha256: digest_of(data),
+                    size_bytes: data.len() as u64,
+                }],
+                outputs: vec![],
+            };
+            spec
+        }
+
+        #[tokio::test]
+        async fn uploaded_blob_can_be_downloaded() {
+            let directory = TempDir::new().expect("temp dir");
+            let state = state_with_blobs(&directory, limits());
+            let digest = digest_of(b"payload");
+
+            let created = send(
+                &state,
+                blob_http_request("PUT", digest.as_str(), b"payload"),
+            )
+            .await;
+            assert_eq!(created.status(), StatusCode::CREATED);
+            let info: BlobResponse = json(created).await;
+            assert_eq!(info.sha256, digest);
+            assert_eq!(info.size_bytes, 7);
+
+            let repeated = upload(&state, b"payload").await;
+            assert_eq!(repeated, StatusCode::OK);
+
+            let download = send(&state, blob_http_request("GET", digest.as_str(), b"")).await;
+            assert_eq!(download.status(), StatusCode::OK);
+            assert_eq!(download.headers()[header::CONTENT_LENGTH], "7");
+            let body = to_bytes(download.into_body(), usize::MAX)
+                .await
+                .expect("body should be readable");
+            assert_eq!(&body[..], b"payload");
+        }
+
+        #[tokio::test]
+        async fn head_reports_size_without_a_body() {
+            let directory = TempDir::new().expect("temp dir");
+            let state = state_with_blobs(&directory, limits());
+            upload(&state, b"payload").await;
+
+            let response = send(
+                &state,
+                blob_http_request("HEAD", digest_of(b"payload").as_str(), b""),
+            )
+            .await;
+
+            assert_eq!(response.status(), StatusCode::OK);
+            assert_eq!(response.headers()[header::CONTENT_LENGTH], "7");
+            let body = to_bytes(response.into_body(), usize::MAX)
+                .await
+                .expect("body should be readable");
+            assert!(body.is_empty());
+        }
+
+        #[tokio::test]
+        async fn missing_blob_is_not_found() {
+            let directory = TempDir::new().expect("temp dir");
+            let state = state_with_blobs(&directory, limits());
+
+            let response = send(
+                &state,
+                blob_http_request("GET", digest_of(b"absent").as_str(), b""),
+            )
+            .await;
+
+            assert_eq!(response.status(), StatusCode::NOT_FOUND);
+        }
+
+        #[tokio::test]
+        async fn content_that_does_not_match_the_url_digest_is_rejected() {
+            let directory = TempDir::new().expect("temp dir");
+            let state = state_with_blobs(&directory, limits());
+            let claimed = digest_of(b"expected");
+
+            let response = send(
+                &state,
+                blob_http_request("PUT", claimed.as_str(), b"different"),
+            )
+            .await;
+
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+            let lookup = send(&state, blob_http_request("GET", claimed.as_str(), b"")).await;
+            assert_eq!(lookup.status(), StatusCode::NOT_FOUND);
+        }
+
+        #[tokio::test]
+        async fn malformed_digest_is_rejected() {
+            let directory = TempDir::new().expect("temp dir");
+            let state = state_with_blobs(&directory, limits());
+
+            for digest in ["short", "..%2F..%2Fetc%2Fpasswd", &"G".repeat(64)] {
+                let response = send(&state, blob_http_request("GET", digest, b"")).await;
+                assert_eq!(response.status(), StatusCode::BAD_REQUEST, "{digest}");
+            }
+        }
+
+        #[tokio::test]
+        async fn oversized_upload_is_rejected() {
+            let directory = TempDir::new().expect("temp dir");
+            let state = state_with_blobs(&directory, limits());
+
+            let status = upload(&state, &[1u8; 101]).await;
+
+            assert_eq!(status, StatusCode::PAYLOAD_TOO_LARGE);
+        }
+
+        #[tokio::test]
+        async fn upload_beyond_quota_is_refused() {
+            let directory = TempDir::new().expect("temp dir");
+            let state = state_with_blobs(
+                &directory,
+                BlobLimits {
+                    quota_bytes: 3,
+                    ..limits()
+                },
+            );
+
+            let status = upload(&state, b"four").await;
+
+            assert_eq!(status, StatusCode::INSUFFICIENT_STORAGE);
+        }
+
+        #[tokio::test]
+        async fn blob_routes_report_unavailable_without_storage() {
+            let state = ControllerState::new();
+
+            let put = upload(&state, b"data").await;
+            let get = send(
+                &state,
+                blob_http_request("GET", digest_of(b"data").as_str(), b""),
+            )
+            .await
+            .status();
+
+            assert_eq!(put, StatusCode::SERVICE_UNAVAILABLE);
+            assert_eq!(get, StatusCode::SERVICE_UNAVAILABLE);
+        }
+
+        #[tokio::test]
+        async fn job_with_unuploaded_input_is_rejected_with_the_missing_digests() {
+            let directory = TempDir::new().expect("temp dir");
+            let state = state_with_blobs(&directory, limits());
+
+            let response = send(&state, submit_job_json_request(spec_with_input(b"data"))).await;
+
+            assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
+            let rejection: MissingInputsResponse = json(response).await;
+            assert_eq!(rejection.missing, vec![digest_of(b"data")]);
+            assert!(
+                state
+                    .jobs
+                    .read()
+                    .expect("job manager lock should be available")
+                    .pinned_input_digests()
+                    .is_empty(),
+                "a rejected job must not be queued"
+            );
+        }
+
+        #[tokio::test]
+        async fn job_is_accepted_once_its_inputs_are_uploaded() {
+            let directory = TempDir::new().expect("temp dir");
+            let state = state_with_blobs(&directory, limits());
+            upload(&state, b"data").await;
+
+            let response = send(&state, submit_job_json_request(spec_with_input(b"data"))).await;
+
+            assert_eq!(response.status(), StatusCode::ACCEPTED);
+        }
+
+        #[tokio::test]
+        async fn declared_size_must_match_the_stored_content() {
+            let directory = TempDir::new().expect("temp dir");
+            let state = state_with_blobs(&directory, limits());
+            upload(&state, b"data").await;
+            let mut spec = spec_with_input(b"data");
+            spec.data.inputs[0].size_bytes = 99;
+
+            let response = send(&state, submit_job_json_request(spec)).await;
+
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        }
+
+        #[tokio::test]
+        async fn job_with_inputs_is_unavailable_without_storage() {
+            let state = ControllerState::new();
+
+            let response = send(&state, submit_job_json_request(spec_with_input(b"data"))).await;
+
+            assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        }
+
+        #[tokio::test]
+        async fn job_with_unsafe_data_path_is_rejected_before_storage_is_consulted() {
+            let directory = TempDir::new().expect("temp dir");
+            let state = state_with_blobs(&directory, limits());
+            let mut spec = spec_with_input(b"data");
+            spec.data.inputs[0].path = "../escape".to_owned();
+
+            let response = send(&state, submit_job_json_request(spec)).await;
+
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        }
+
+        #[tokio::test]
+        async fn inputs_of_unfinished_jobs_survive_eviction() {
+            let directory = TempDir::new().expect("temp dir");
+            let state = state_with_blobs(
+                &directory,
+                BlobLimits {
+                    quota_bytes: 8,
+                    ..limits()
+                },
+            );
+            upload(&state, b"aaaa").await;
+            let submitted = send(&state, submit_job_json_request(spec_with_input(b"aaaa"))).await;
+            assert_eq!(submitted.status(), StatusCode::ACCEPTED);
+            upload(&state, b"bbbb").await;
+
+            // Full store: `bbbb` is unreferenced and goes, `aaaa` is needed.
+            assert_eq!(upload(&state, b"cccc").await, StatusCode::CREATED);
+
+            let kept = send(
+                &state,
+                blob_http_request("GET", digest_of(b"aaaa").as_str(), b""),
+            )
+            .await;
+            let evicted = send(
+                &state,
+                blob_http_request("GET", digest_of(b"bbbb").as_str(), b""),
+            )
+            .await;
+            assert_eq!(kept.status(), StatusCode::OK);
+            assert_eq!(evicted.status(), StatusCode::NOT_FOUND);
+        }
     }
 
     fn job_spec() -> JobSpec {

@@ -4,7 +4,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::{
     ExecutionId, ExecutionOutput, ExecutionResult, ExecutionState, JobId, JobSpec, JobState,
-    NodeDescriptor, NodeId, NodeState, ResourceSnapshot,
+    NodeDescriptor, NodeId, NodeState, ResourceSnapshot, Sha256Digest,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -118,6 +118,21 @@ pub struct JobLogsResponse {
     pub job_id: JobId,
     pub execution_id: ExecutionId,
     pub output: ExecutionOutput,
+}
+
+/// Describes a blob held by the controller.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BlobResponse {
+    pub sha256: Sha256Digest,
+    pub size_bytes: u64,
+}
+
+/// Rejects a submission whose input content has not been uploaded.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MissingInputsResponse {
+    pub error: String,
+    /// Digests the client must upload before submitting again.
+    pub missing: Vec<Sha256Digest>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
