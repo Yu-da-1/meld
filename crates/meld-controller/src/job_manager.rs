@@ -8,9 +8,9 @@ use std::{
 };
 
 use meld_core::{
-    Execution, ExecutionAssignment, ExecutionCompletionError, ExecutionId, ExecutionOutput,
-    ExecutionResult, ExecutionState, InvalidStateTransition, Job, JobId, JobSpec,
-    JobSpecValidationError, JobState, NodeAssessment, NodeId, Sha256Digest,
+    DataFailure, Execution, ExecutionAssignment, ExecutionCompletionError, ExecutionId,
+    ExecutionOutput, ExecutionResult, ExecutionState, InvalidStateTransition, Job, JobId, JobSpec,
+    JobSpecValidationError, JobState, NodeAssessment, NodeId, OutputFile, Sha256Digest,
 };
 
 use crate::{
@@ -25,6 +25,10 @@ pub struct JobManager {
     executions: BTreeMap<ExecutionId, Execution>,
     execution_ids_by_job: BTreeMap<JobId, Vec<ExecutionId>>,
     outputs: BTreeMap<ExecutionId, ExecutionOutput>,
+    /// Why an execution failed to move its job's data.
+    data_failures: BTreeMap<ExecutionId, DataFailure>,
+    /// Files each execution left behind for collection.
+    output_files: BTreeMap<ExecutionId, Vec<OutputFile>>,
     cancellation_requests: BTreeSet<ExecutionId>,
     job_timeout_requests: BTreeSet<ExecutionId>,
     job_submitted_at: BTreeMap<JobId, Instant>,
@@ -753,6 +757,37 @@ impl JobManager {
         self.job_submitted_at.remove(&job_id);
 
         Ok(())
+    }
+
+    /// Records that the execution failed because its data could not be moved.
+    ///
+    /// The reason is kept for the first report only, so a repeated report of
+    /// the same failure changes nothing.
+    pub fn fail_execution_data(
+        &mut self,
+        execution_id: ExecutionId,
+        failure: DataFailure,
+    ) -> Result<(), JobManagerError> {
+        self.fail_execution_start(execution_id)?;
+        self.data_failures.entry(execution_id).or_insert(failure);
+        Ok(())
+    }
+
+    /// Records the files a finished execution left for collection.
+    pub fn record_output_files(&mut self, execution_id: ExecutionId, files: Vec<OutputFile>) {
+        if !files.is_empty() {
+            self.output_files.insert(execution_id, files);
+        }
+    }
+
+    pub fn data_failure(&self, execution_id: ExecutionId) -> Option<&DataFailure> {
+        self.data_failures.get(&execution_id)
+    }
+
+    pub fn output_files(&self, execution_id: ExecutionId) -> &[OutputFile] {
+        self.output_files
+            .get(&execution_id)
+            .map_or(&[], Vec::as_slice)
     }
 
     /// Records that the assigned process could not be started on the node.

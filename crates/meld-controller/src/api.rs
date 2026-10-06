@@ -17,12 +17,12 @@ use axum::{
 };
 use meld_core::{
     Acknowledgement, ApiErrorResponse, BlobResponse, CURRENT_PROTOCOL_VERSION, CancelJobResponse,
-    ExecutionEvent, ExecutionOutput, ExecutionView, HeartbeatRequest, JobId, JobLogsResponse,
-    JobSpec, JobState, JobStatusResponse, ListNodesResponse, MissingInputsResponse, NodeCommand,
-    NodeId, NodeState, NodeStateResponse, NodeView, PollNodeCommandRequest,
-    PollNodeCommandResponse, ProtocolError, ProtocolErrorResponse, QueueReason,
-    RegisterNodeRequest, RegisterNodeResponse, ReportExecutionEventRequest, ResponseMetadata,
-    Sha256Digest, SubmitJobResponse,
+    DataFailure, ExecutionEvent, ExecutionId, ExecutionOutput, ExecutionView, HeartbeatRequest,
+    JobId, JobLogsResponse, JobSpec, JobState, JobStatusResponse, ListNodesResponse,
+    MissingInputsResponse, NodeCommand, NodeId, NodeState, NodeStateResponse, NodeView, OutputFile,
+    PollNodeCommandRequest, PollNodeCommandResponse, ProtocolError, ProtocolErrorResponse,
+    QueueReason, RegisterNodeRequest, RegisterNodeResponse, ReportExecutionEventRequest,
+    ResponseMetadata, Sha256Digest, SubmitJobResponse,
 };
 use tokio::{sync::watch, time::timeout};
 use tokio_util::io::ReaderStream;
@@ -227,9 +227,35 @@ async fn report_execution_event(
             ExecutionEvent::Finished { output, .. } if job_timeout_requested => {
                 jobs.confirm_job_timeout_with_output(request.execution_id, output)
             }
-            ExecutionEvent::Finished { result, output } => {
-                jobs.finish_execution_with_output(request.execution_id, result, output)
-            }
+            ExecutionEvent::Finished {
+                result,
+                output,
+                outputs,
+            } => match verify_outputs(
+                &state,
+                &jobs,
+                request.execution_id,
+                result.exit_code,
+                &outputs,
+            ) {
+                Ok(()) => {
+                    let finished =
+                        jobs.finish_execution_with_output(request.execution_id, result, output);
+                    if finished.is_ok() {
+                        jobs.record_output_files(request.execution_id, outputs);
+                    }
+                    finished
+                }
+                Err(failure) => {
+                    tracing::warn!(
+                        node_id = %request.node_id,
+                        execution_id = %request.execution_id,
+                        %failure,
+                        "execution outputs are not available on the controller"
+                    );
+                    jobs.fail_execution_data(request.execution_id, failure)
+                }
+            },
             ExecutionEvent::StartFailed { .. } if job_timeout_requested => jobs
                 .confirm_job_timeout_with_output(request.execution_id, ExecutionOutput::default()),
             ExecutionEvent::StartFailed { reason } => {
@@ -250,7 +276,7 @@ async fn report_execution_event(
                     %failure,
                     "execution data could not be moved"
                 );
-                jobs.fail_execution_start(request.execution_id)
+                jobs.fail_execution_data(request.execution_id, failure)
             }
             ExecutionEvent::Rejected { reason } => {
                 tracing::warn!(
@@ -563,6 +589,11 @@ async fn job_status(State(state): State<ControllerState>, Path(job_id): Path<Job
             state: execution.state(),
             result: execution.result(),
         });
+    let latest_execution_id = execution.map(|view| view.execution_id);
+    let data_failure = latest_execution_id.and_then(|id| jobs.data_failure(id).cloned());
+    let outputs = latest_execution_id
+        .map(|id| jobs.output_files(id).to_vec())
+        .unwrap_or_default();
     let queue_reason = if job.state() == JobState::Queued {
         match jobs.pending_position(job_id) {
             Some(_)
@@ -604,6 +635,8 @@ async fn job_status(State(state): State<ControllerState>, Path(job_id): Path<Job
         state: job.state(),
         queue_reason,
         execution,
+        data_failure,
+        outputs,
         placement,
     })
     .into_response()
@@ -703,9 +736,61 @@ async fn submit_job(State(state): State<ControllerState>, Json(spec): Json<JobSp
     }
 }
 
+/// Checks that a successful execution left exactly the declared outputs and
+/// that each one is stored on the controller.
+///
+/// Outputs are only expected from a process that succeeded; the node collects
+/// nothing otherwise.
+fn verify_outputs(
+    state: &ControllerState,
+    jobs: &JobManager,
+    execution_id: ExecutionId,
+    exit_code: Option<i32>,
+    reported: &[OutputFile],
+) -> Result<(), DataFailure> {
+    if exit_code != Some(0) {
+        return Ok(());
+    }
+    let Some(job) = jobs
+        .execution(execution_id)
+        .and_then(|execution| jobs.job(execution.job_id()))
+    else {
+        return Ok(());
+    };
+
+    let unavailable = |path: &str| DataFailure::OutputUploadFailed {
+        path: path.to_owned(),
+    };
+    let declared = &job.spec().data.outputs;
+    if let Some(missing) = declared
+        .iter()
+        .find(|spec| reported.iter().all(|file| file.path != spec.path))
+    {
+        return Err(DataFailure::OutputMissing {
+            path: missing.path.clone(),
+        });
+    }
+    if let Some(extra) = reported
+        .iter()
+        .find(|file| declared.iter().all(|spec| spec.path != file.path))
+    {
+        return Err(unavailable(&extra.path));
+    }
+    for file in reported {
+        let stored = state
+            .blobs
+            .as_ref()
+            .and_then(|blobs| blobs.size_of(&file.sha256).ok().flatten());
+        if stored != Some(file.size_bytes) {
+            return Err(unavailable(&file.path));
+        }
+    }
+    Ok(())
+}
+
 /// Returns the rejection for a spec whose input files are not all uploaded.
 fn check_inputs_are_stored(state: &ControllerState, spec: &JobSpec) -> Option<Response> {
-    if spec.data.inputs.is_empty() {
+    if spec.data.is_empty() {
         return None;
     }
     let Some(blobs) = &state.blobs else {
@@ -1344,6 +1429,7 @@ mod tests {
             event: ExecutionEvent::Finished {
                 result: ExecutionResult { exit_code: Some(0) },
                 output: output.clone(),
+                outputs: vec![],
             },
         };
         let response = router(state.clone())
@@ -2138,6 +2224,7 @@ mod tests {
                 ExecutionEvent::Finished {
                     result,
                     output: ExecutionOutput::default(),
+                    outputs: vec![],
                 },
             )
             .await,
@@ -2638,6 +2725,7 @@ mod tests {
                     path: "input.txt".to_owned(),
                     sha256: digest_of(data),
                     size_bytes: data.len() as u64,
+                    executable: false,
                 }],
                 outputs: vec![],
             };
@@ -2840,6 +2928,258 @@ mod tests {
             let response = send(&state, submit_job_json_request(spec)).await;
 
             assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        }
+
+        fn spec_with_output(path: &str) -> JobSpec {
+            let mut spec = job_spec();
+            spec.requirements.memory_bytes = 8_000;
+            spec.data.outputs = vec![meld_core::OutputSpec {
+                path: path.to_owned(),
+            }];
+            spec
+        }
+
+        /// Queues, places and starts a job, returning it ready to finish.
+        async fn running_execution(
+            state: &ControllerState,
+            spec: JobSpec,
+        ) -> (NodeId, JobId, meld_core::ExecutionId) {
+            let node_id = NodeId::generate();
+            register_ready_node(state, node_id);
+            let (job_id, execution_id) = {
+                let registry = state
+                    .registry
+                    .read()
+                    .expect("registry lock should be available");
+                let mut jobs = state
+                    .jobs
+                    .write()
+                    .expect("job manager lock should be available");
+                let job_id = jobs.submit(spec).expect("valid job should be queued");
+                let execution_id = jobs
+                    .schedule_next(&Scheduler::new(), &registry)
+                    .expect("queued job should be schedulable")
+                    .expect("one job should be queued");
+                (job_id, execution_id)
+            };
+            for event in [ExecutionEvent::Accepted, ExecutionEvent::Running] {
+                assert_eq!(
+                    report_event(state.clone(), node_id, execution_id, event).await,
+                    StatusCode::OK
+                );
+            }
+            (node_id, job_id, execution_id)
+        }
+
+        fn finished(exit_code: i32, outputs: Vec<OutputFile>) -> ExecutionEvent {
+            ExecutionEvent::Finished {
+                result: ExecutionResult {
+                    exit_code: Some(exit_code),
+                },
+                output: ExecutionOutput::default(),
+                outputs,
+            }
+        }
+
+        fn output_file(path: &str, data: &[u8]) -> OutputFile {
+            OutputFile {
+                path: path.to_owned(),
+                sha256: digest_of(data),
+                size_bytes: data.len() as u64,
+            }
+        }
+
+        #[tokio::test]
+        async fn uploaded_outputs_are_recorded_and_shown_in_status() {
+            let directory = TempDir::new().expect("temp dir");
+            let state = state_with_blobs(&directory, limits());
+            upload(&state, b"{}").await;
+            let (node_id, job_id, execution_id) =
+                running_execution(&state, spec_with_output("result.json")).await;
+            let produced = vec![output_file("result.json", b"{}")];
+
+            let status = report_event(
+                state.clone(),
+                node_id,
+                execution_id,
+                finished(0, produced.clone()),
+            )
+            .await;
+
+            assert_eq!(status, StatusCode::OK);
+            let job = get_job_status(state.clone(), job_id).await;
+            assert_eq!(job.state, JobState::Succeeded);
+            assert_eq!(job.outputs, produced);
+            assert_eq!(job.data_failure, None);
+            // A repeated report, as a node retries after a lost reply, is harmless.
+            assert_eq!(
+                report_event(state.clone(), node_id, execution_id, finished(0, produced)).await,
+                StatusCode::OK
+            );
+        }
+
+        #[tokio::test]
+        async fn declared_output_that_was_not_reported_fails_the_job() {
+            let directory = TempDir::new().expect("temp dir");
+            let state = state_with_blobs(&directory, limits());
+            let (node_id, job_id, execution_id) =
+                running_execution(&state, spec_with_output("result.json")).await;
+
+            let status =
+                report_event(state.clone(), node_id, execution_id, finished(0, vec![])).await;
+
+            assert_eq!(status, StatusCode::OK);
+            let job = get_job_status(state, job_id).await;
+            assert_eq!(job.state, JobState::Failed);
+            assert_eq!(
+                job.data_failure,
+                Some(DataFailure::OutputMissing {
+                    path: "result.json".to_owned()
+                })
+            );
+            assert!(job.outputs.is_empty());
+        }
+
+        #[tokio::test]
+        async fn reported_output_that_is_not_stored_fails_the_job() {
+            let directory = TempDir::new().expect("temp dir");
+            let state = state_with_blobs(&directory, limits());
+            let (node_id, job_id, execution_id) =
+                running_execution(&state, spec_with_output("result.json")).await;
+
+            report_event(
+                state.clone(),
+                node_id,
+                execution_id,
+                finished(0, vec![output_file("result.json", b"never uploaded")]),
+            )
+            .await;
+
+            let job = get_job_status(state, job_id).await;
+            assert_eq!(job.state, JobState::Failed);
+            assert_eq!(
+                job.data_failure,
+                Some(DataFailure::OutputUploadFailed {
+                    path: "result.json".to_owned()
+                })
+            );
+        }
+
+        #[tokio::test]
+        async fn reported_size_must_match_the_stored_content() {
+            let directory = TempDir::new().expect("temp dir");
+            let state = state_with_blobs(&directory, limits());
+            upload(&state, b"{}").await;
+            let (node_id, job_id, execution_id) =
+                running_execution(&state, spec_with_output("result.json")).await;
+            let mut lying = output_file("result.json", b"{}");
+            lying.size_bytes = 999;
+
+            report_event(
+                state.clone(),
+                node_id,
+                execution_id,
+                finished(0, vec![lying]),
+            )
+            .await;
+
+            let job = get_job_status(state, job_id).await;
+            assert_eq!(job.state, JobState::Failed);
+            assert!(matches!(
+                job.data_failure,
+                Some(DataFailure::OutputUploadFailed { .. })
+            ));
+        }
+
+        #[tokio::test]
+        async fn undeclared_output_is_refused() {
+            let directory = TempDir::new().expect("temp dir");
+            let state = state_with_blobs(&directory, limits());
+            upload(&state, b"{}").await;
+            upload(&state, b"secret").await;
+            let (node_id, job_id, execution_id) =
+                running_execution(&state, spec_with_output("result.json")).await;
+
+            report_event(
+                state.clone(),
+                node_id,
+                execution_id,
+                finished(
+                    0,
+                    vec![
+                        output_file("result.json", b"{}"),
+                        output_file("extra.txt", b"secret"),
+                    ],
+                ),
+            )
+            .await;
+
+            let job = get_job_status(state, job_id).await;
+            assert_eq!(job.state, JobState::Failed);
+            assert_eq!(
+                job.data_failure,
+                Some(DataFailure::OutputUploadFailed {
+                    path: "extra.txt".to_owned()
+                })
+            );
+        }
+
+        #[tokio::test]
+        async fn failed_process_is_not_expected_to_leave_outputs() {
+            let directory = TempDir::new().expect("temp dir");
+            let state = state_with_blobs(&directory, limits());
+            let (node_id, job_id, execution_id) =
+                running_execution(&state, spec_with_output("result.json")).await;
+
+            let status =
+                report_event(state.clone(), node_id, execution_id, finished(2, vec![])).await;
+
+            assert_eq!(status, StatusCode::OK);
+            let job = get_job_status(state, job_id).await;
+            assert_eq!(job.state, JobState::Failed);
+            assert_eq!(job.data_failure, None, "the process failed, not the data");
+        }
+
+        #[tokio::test]
+        async fn data_failure_is_kept_and_shown_in_status() {
+            let directory = TempDir::new().expect("temp dir");
+            let state = state_with_blobs(&directory, limits());
+            let mut spec = job_spec();
+            spec.requirements.memory_bytes = 8_000;
+            let (node_id, job_id, execution_id) = running_execution(&state, spec).await;
+            let failure = DataFailure::OutputUploadFailed {
+                path: "result.json".to_owned(),
+            };
+
+            for _ in 0..2 {
+                let status = report_event(
+                    state.clone(),
+                    node_id,
+                    execution_id,
+                    ExecutionEvent::DataFailed {
+                        failure: failure.clone(),
+                    },
+                )
+                .await;
+                assert_eq!(status, StatusCode::OK, "reports are idempotent");
+            }
+
+            let job = get_job_status(state, job_id).await;
+            assert_eq!(job.state, JobState::Failed);
+            assert_eq!(job.data_failure, Some(failure));
+        }
+
+        #[tokio::test]
+        async fn job_with_only_outputs_is_unavailable_without_storage() {
+            let state = ControllerState::new();
+
+            let response = send(
+                &state,
+                submit_job_json_request(spec_with_output("result.json")),
+            )
+            .await;
+
+            assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
         }
 
         #[tokio::test]

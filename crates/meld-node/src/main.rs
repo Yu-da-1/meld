@@ -1,3 +1,4 @@
+mod collection;
 mod controller_client;
 mod executor;
 mod identity;
@@ -25,8 +26,9 @@ use tokio::{
 use tracing_subscriber::EnvFilter;
 
 use crate::{
+    collection::collect_outputs,
     controller_client::{ControllerClient, ControllerClientError},
-    executor::{CompletedExecution, ControlledExecutionOutcome, NativeExecutor},
+    executor::{CompletedExecution, ControlledExecutionOutcome, NativeExecutor, Workspace},
     identity::{load_or_create_node_id, state_directory},
     resource_reporter::ResourceReporter,
     staging::{DEFAULT_CACHE_MAX_BYTES, InputCache, stage_inputs},
@@ -411,27 +413,23 @@ async fn run_assignment(
         tracing::error!(%node_id, %execution_id, %error, "failed to report running execution");
     }
 
-    let outcome = match execution.wait_controlled(cancellation, timeout).await {
-        Ok((outcome, workspace)) => {
-            drop(workspace);
-            outcome
-        }
+    let (outcome, workspace) = match execution.wait_controlled(cancellation, timeout).await {
+        Ok((outcome, workspace)) => (outcome, Some(workspace)),
         Err(error) => {
             tracing::error!(%node_id, %execution_id, %error, "failed to wait for execution process");
-            ControlledExecutionOutcome::Finished(CompletedExecution {
-                result: ExecutionResult { exit_code: None },
-                output: ExecutionOutput::default(),
-            })
+            (
+                ControlledExecutionOutcome::Finished(CompletedExecution {
+                    result: ExecutionResult { exit_code: None },
+                    output: ExecutionOutput::default(),
+                }),
+                None,
+            )
         }
     };
     let (event, result) = match outcome {
-        ControlledExecutionOutcome::Finished(completed) => (
-            ExecutionEvent::Finished {
-                result: completed.result,
-                output: completed.output,
-            },
-            Some(completed.result),
-        ),
+        ControlledExecutionOutcome::Finished(completed) => {
+            finished_event(client, &assignment, workspace.as_ref(), completed).await
+        }
         ControlledExecutionOutcome::Cancelled { output } => {
             (ExecutionEvent::Cancelled { output }, None)
         }
@@ -439,6 +437,8 @@ async fn run_assignment(
             (ExecutionEvent::TimedOut { output }, None)
         }
     };
+    // Whatever the process left behind has been collected or is not wanted.
+    drop(workspace);
     if let Err(error) = report_event_with_retry(client, node_id, execution_id, event).await {
         tracing::error!(%node_id, %execution_id, %error, "failed to report execution result");
         return;
@@ -450,6 +450,46 @@ async fn run_assignment(
         exit_code = ?result.and_then(|result| result.exit_code),
         "execution finished"
     );
+}
+
+/// Builds the report for a process that ran to completion.
+///
+/// A process that succeeded must also leave its declared outputs; if they
+/// cannot be collected the execution fails, because reporting success without
+/// the promised files would hand the user an incomplete result.
+async fn finished_event(
+    client: &ControllerClient,
+    assignment: &ExecutionAssignment,
+    workspace: Option<&Workspace>,
+    completed: CompletedExecution,
+) -> (ExecutionEvent, Option<ExecutionResult>) {
+    let CompletedExecution { result, output } = completed;
+    let data = &assignment.spec.data;
+    let outputs = match workspace {
+        Some(workspace) if result.exit_code == Some(0) && !data.outputs.is_empty() => {
+            match collect_outputs(client, data, workspace.path()).await {
+                Ok(outputs) => outputs,
+                Err(failure) => {
+                    tracing::warn!(
+                        node_id = %assignment.node_id,
+                        execution_id = %assignment.execution_id,
+                        %failure,
+                        "execution outputs could not be collected"
+                    );
+                    return (ExecutionEvent::DataFailed { failure }, None);
+                }
+            }
+        }
+        _ => Vec::new(),
+    };
+    (
+        ExecutionEvent::Finished {
+            result,
+            output,
+            outputs,
+        },
+        Some(result),
+    )
 }
 
 async fn report_start_failure(

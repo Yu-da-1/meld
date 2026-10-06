@@ -4,7 +4,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::{
     DataFailure, ExecutionId, ExecutionOutput, ExecutionResult, JobId, JobSpec, MessageId,
-    NodeDescriptor, NodeId, ResourceSnapshot,
+    NodeDescriptor, NodeId, OutputFile, ResourceSnapshot,
 };
 
 /// Protocol version implemented by this build.
@@ -167,6 +167,10 @@ pub enum ExecutionEvent {
     Finished {
         result: ExecutionResult,
         output: ExecutionOutput,
+        /// Declared outputs, already uploaded to the controller. Empty unless
+        /// the process succeeded.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        outputs: Vec<OutputFile>,
     },
     StartFailed {
         reason: String,
@@ -281,6 +285,7 @@ mod tests {
             execution_id: ExecutionId::generate(),
             event: ExecutionEvent::Finished {
                 result: ExecutionResult { exit_code: Some(0) },
+                outputs: vec![],
                 output: ExecutionOutput {
                     stdout: CapturedStream {
                         content: "done\n".to_owned(),

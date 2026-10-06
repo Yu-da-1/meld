@@ -10,9 +10,13 @@ use meld_core::{
     ProtocolError, ProtocolErrorResponse, RegisterNodeRequest, RegisterNodeResponse,
     ReportExecutionEventRequest, RequestMetadata, ResourceSnapshot, ResponseMetadata,
 };
-use reqwest::{Client, Response, StatusCode};
+use reqwest::{Body, Client, Response, StatusCode, header::CONTENT_LENGTH};
+use tokio_util::io::ReaderStream;
 
-use crate::staging::{BlobSource, BlobStream, DownloadError};
+use crate::{
+    collection::{BlobSink, UploadError},
+    staging::{BlobSource, BlobStream, DownloadError},
+};
 
 const REGISTER_NODE_PATH: &str = "/v1/nodes/register";
 const HEARTBEAT_PATH: &str = "/v1/nodes/heartbeat";
@@ -204,6 +208,47 @@ impl BlobSource for ControllerClient {
     }
 }
 
+impl BlobSink for ControllerClient {
+    async fn upload(
+        &self,
+        digest: &Sha256Digest,
+        file: &std::path::Path,
+        size_bytes: u64,
+    ) -> Result<(), UploadError> {
+        let url = format!("{}{BLOBS_PATH}/{digest}", self.controller_url);
+        // Content is named by its digest, so an existing blob needs no transfer.
+        if let Ok(existing) = self.blob_http.head(&url).send().await
+            && existing.status().is_success()
+        {
+            return Ok(());
+        }
+
+        let file = tokio::fs::File::open(file)
+            .await
+            .map_err(|error| UploadError::Rejected(error.to_string()))?;
+        let response = self
+            .blob_http
+            .put(&url)
+            .header(CONTENT_LENGTH, size_bytes)
+            .body(Body::wrap_stream(ReaderStream::new(file)))
+            .send()
+            .await
+            .map_err(|error| UploadError::Unavailable(error.to_string()))?;
+
+        let status = response.status();
+        if status.is_success() {
+            Ok(())
+        } else if status == StatusCode::INSUFFICIENT_STORAGE {
+            // Full storage is a verdict, not a hiccup.
+            Err(UploadError::Rejected(format!("HTTP {status}")))
+        } else if status.is_server_error() || status == StatusCode::TOO_MANY_REQUESTS {
+            Err(UploadError::Unavailable(format!("HTTP {status}")))
+        } else {
+            Err(UploadError::Rejected(format!("HTTP {status}")))
+        }
+    }
+}
+
 #[derive(Debug)]
 pub enum ControllerClientError {
     Unavailable(reqwest::Error),
@@ -321,26 +366,40 @@ mod tests {
 
     use super::*;
 
-    #[tokio::test]
-    async fn blob_source_streams_content_from_a_real_controller() {
+    /// Starts a real controller with file storage on an ephemeral port.
+    async fn spawn_controller(
+        limits: meld_controller::blob_store::BlobLimits,
+    ) -> (std::net::SocketAddr, tempfile::TempDir) {
         use std::sync::Arc;
 
         use meld_controller::{
             api::{ControllerState, router},
-            blob_store::{BlobLimits, BlobStore},
+            blob_store::BlobStore,
         };
-        use sha2::{Digest, Sha256};
 
         let directory = tempfile::tempdir().expect("temp dir");
-        let store = BlobStore::new(directory.path(), BlobLimits::default()).expect("blob store");
+        let store = BlobStore::new(directory.path(), limits).expect("blob store");
         let state = ControllerState::new().with_blob_store(Arc::new(store));
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
             .await
             .expect("bind an ephemeral port");
         let address = listener.local_addr().expect("local address");
         tokio::spawn(async move { axum::serve(listener, router(state)).await });
+        (address, directory)
+    }
+
+    fn digest_of(content: &[u8]) -> Sha256Digest {
+        use sha2::{Digest, Sha256};
+
+        Sha256Digest::from_bytes(Sha256::digest(content).into())
+    }
+
+    #[tokio::test]
+    async fn blob_source_streams_content_from_a_real_controller() {
+        let (address, _directory) =
+            spawn_controller(meld_controller::blob_store::BlobLimits::default()).await;
         let content = vec![42u8; 300_000];
-        let digest = Sha256Digest::from_bytes(Sha256::digest(&content).into());
+        let digest = digest_of(&content);
         reqwest::Client::new()
             .put(format!("http://{address}/v1/blobs/{digest}"))
             .body(content.clone())
@@ -356,13 +415,77 @@ mod tests {
         while let Some(chunk) = stream.next().await {
             received.extend_from_slice(&chunk.expect("chunk should arrive"));
         }
-        let absent = Sha256Digest::from_bytes(Sha256::digest(b"absent").into());
 
         assert_eq!(received, content);
         assert!(matches!(
-            client.open(&absent).await,
+            client.open(&digest_of(b"absent")).await,
             Err(DownloadError::NotFound)
         ));
+    }
+
+    #[tokio::test]
+    async fn blob_sink_uploads_a_file_a_controller_can_serve_back() {
+        let (address, _directory) =
+            spawn_controller(meld_controller::blob_store::BlobLimits::default()).await;
+        let client = ControllerClient::new(&format!("http://{address}")).expect("client");
+        let workspace = tempfile::tempdir().expect("workspace");
+        let content = vec![7u8; 300_000];
+        let file = workspace.path().join("result.bin");
+        std::fs::write(&file, &content).expect("write output");
+        let digest = digest_of(&content);
+
+        client
+            .upload(&digest, &file, content.len() as u64)
+            .await
+            .expect("upload should succeed");
+        // Uploading again finds the content stored and sends nothing.
+        client
+            .upload(&digest, &file, content.len() as u64)
+            .await
+            .expect("repeat upload should succeed");
+
+        let mut stream = client.open(&digest).await.expect("blob should open");
+        let mut received = Vec::new();
+        while let Some(chunk) = stream.next().await {
+            received.extend_from_slice(&chunk.expect("chunk should arrive"));
+        }
+        assert_eq!(received, content);
+    }
+
+    #[tokio::test]
+    async fn blob_sink_treats_a_full_store_as_a_refusal() {
+        let (address, _directory) = spawn_controller(meld_controller::blob_store::BlobLimits {
+            max_blob_bytes: 100,
+            quota_bytes: 100,
+            ..meld_controller::blob_store::BlobLimits::default()
+        })
+        .await;
+        let client = ControllerClient::new(&format!("http://{address}")).expect("client");
+        let workspace = tempfile::tempdir().expect("workspace");
+        let file = workspace.path().join("big.bin");
+        std::fs::write(&file, vec![1u8; 101]).expect("write output");
+
+        let error = client
+            .upload(&digest_of(&[1u8; 101]), &file, 101)
+            .await
+            .expect_err("over the limit");
+
+        assert!(matches!(error, UploadError::Rejected(_)), "{error:?}");
+    }
+
+    #[tokio::test]
+    async fn blob_sink_reports_an_unreachable_controller_as_retryable() {
+        let client = ControllerClient::new("http://127.0.0.1:1").expect("client");
+        let workspace = tempfile::tempdir().expect("workspace");
+        let file = workspace.path().join("f");
+        std::fs::write(&file, b"x").expect("write output");
+
+        let error = client
+            .upload(&digest_of(b"x"), &file, 1)
+            .await
+            .expect_err("nothing is listening");
+
+        assert!(matches!(error, UploadError::Unavailable(_)), "{error:?}");
     }
 
     #[test]

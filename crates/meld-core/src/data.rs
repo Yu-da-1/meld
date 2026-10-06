@@ -94,6 +94,9 @@ pub struct InputFile {
     pub path: String,
     pub sha256: Sha256Digest,
     pub size_bytes: u64,
+    /// Whether the file is made executable in the workspace.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub executable: bool,
 }
 
 /// A file the job promises to leave in its workspace for collection.
@@ -374,6 +377,7 @@ mod tests {
             path: path.to_owned(),
             sha256: digest('a'),
             size_bytes: 10,
+            executable: false,
         }
     }
 
@@ -412,6 +416,31 @@ mod tests {
 
         assert_eq!(valid.expect("valid digest"), digest('b'));
         assert!(invalid.is_err());
+    }
+
+    #[test]
+    fn executable_flag_defaults_to_false_and_is_omitted_unless_set() {
+        let plain: InputFile = serde_json::from_str(&format!(
+            r#"{{"path":"a","sha256":"{}","size_bytes":1}}"#,
+            "a".repeat(64)
+        ))
+        .expect("older manifests should deserialize");
+        let executable = InputFile {
+            executable: true,
+            ..plain.clone()
+        };
+
+        assert!(!plain.executable);
+        assert!(
+            !serde_json::to_string(&plain)
+                .expect("serializes")
+                .contains("executable")
+        );
+        assert!(
+            serde_json::to_string(&executable)
+                .expect("serializes")
+                .contains(r#""executable":true"#)
+        );
     }
 
     #[test]

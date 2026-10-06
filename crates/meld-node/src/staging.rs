@@ -500,7 +500,28 @@ async fn stage_inputs_with_free_space<S: BlobSource>(
             })?;
         }
         cache.place(source, input, &destination).await?;
+        if input.executable {
+            make_executable(&destination).await.map_err(|error| {
+                tracing::warn!(path = %destination.display(), %error, "failed to mark input executable");
+                DataFailure::LocalStorage {
+                    path: input.path.clone(),
+                }
+            })?;
+        }
     }
+    Ok(())
+}
+
+#[cfg(unix)]
+async fn make_executable(path: &Path) -> io::Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+
+    tokio::fs::set_permissions(path, fs::Permissions::from_mode(0o755)).await
+}
+
+/// Windows decides what is executable by file name, so there is nothing to set.
+#[cfg(not(unix))]
+async fn make_executable(_path: &Path) -> io::Result<()> {
     Ok(())
 }
 
@@ -572,6 +593,7 @@ mod tests {
             path: path.to_owned(),
             sha256: digest_of(data),
             size_bytes: data.len() as u64,
+            executable: false,
         }
     }
 
@@ -993,6 +1015,59 @@ mod tests {
             b"two"
         );
         assert!(!fixture.at("out.txt").exists());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn only_inputs_marked_executable_can_be_run() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let fixture = Fixture::new();
+        let cache = fixture.cache(1000);
+        let script = b"#!/bin/sh\necho staged\n";
+        let source = FakeSource::with(&[script, b"data"]);
+        let data = DataSpec {
+            inputs: vec![
+                InputFile {
+                    executable: true,
+                    ..input("run.sh", script)
+                },
+                input("data.txt", b"data"),
+            ],
+            outputs: vec![],
+        };
+
+        stage_inputs(&cache, &source, &data, fixture.workspace.path())
+            .await
+            .expect("staging should succeed");
+
+        let mode = |name: &str| {
+            fs::metadata(fixture.at(name))
+                .expect("staged file")
+                .permissions()
+                .mode()
+        };
+        assert_ne!(mode("run.sh") & 0o111, 0);
+        assert_eq!(mode("data.txt") & 0o111, 0);
+        let output = std::process::Command::new(fixture.at("run.sh"))
+            .output()
+            .expect("the staged script should run");
+        assert_eq!(output.stdout, b"staged\n");
+        // The cached copy stays unmarked, so other jobs get what they ask for.
+        let cached = fixture
+            .state
+            .path()
+            .join("cache")
+            .join("blobs")
+            .join(digest_of(script).as_str());
+        assert_eq!(
+            fs::metadata(cached)
+                .expect("cached file")
+                .permissions()
+                .mode()
+                & 0o111,
+            0
+        );
     }
 
     #[tokio::test]

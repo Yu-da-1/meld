@@ -406,6 +406,7 @@ mod tests {
                 path: "data.csv".to_owned(),
                 sha256: "a".repeat(64).parse().expect("valid digest"),
                 size_bytes: 3,
+                executable: true,
             }],
             outputs: vec![crate::OutputSpec {
                 path: "result.json".to_owned(),
