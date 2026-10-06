@@ -221,6 +221,39 @@ controllerとnodeの再起動をまたぐdeadline復元や完全なreconciliatio
 
 この段階までは、controller/client側を正本とする中央集約モデルで構いません。
 
+### 現在地
+
+完了しています。`meld run --input / --output`でファイルを渡して成果物を受け取れます。ファイルは内容のsha256で識別し、controllerが保管します。共有protocol contractはversion 7です。
+
+- manifest: `JobSpec.data`が、nodeへ渡す`inputs`(path、sha256、サイズ、実行権限)と、回収する`outputs`(path)を宣言します。宣言されたファイルだけが移動します。pathは相対のみで、`..`、絶対path、`\`、drive prefix、重複(大文字小文字を無視)、ファイルとディレクトリの入れ子を拒否します。上限は1ファイル1GiB、1 jobの入力合計4GiB、入力と出力それぞれ1,000件です。
+- 転送: CLIがディレクトリをファイル単位に展開してhashを計算し、controllerが持たない内容だけを`PUT /v1/blobs/{sha256}`でuploadします。受信側は、streamで書きながらhashとサイズを検証し、一致したときだけ確定します。nodeは`GET`で取得します。同一内容は1回だけ転送します。
+- 入力の配置: nodeは取得した内容をローカルcacheに置き、jobのworkspaceへ**コピー**します。jobがファイルを書き換えてもcacheは変わりません。cacheはLRUで`MELD_CACHE_MAX_BYTES`(既定8GiB)に収め、コピー中の内容は削除しません。同一内容の同時取得は1回にまとめ、一時的な失敗は3回まで再試行します。実行前に空き容量を確認します。
+- 出力の回収: process が正常終了(exit 0)したときだけ、宣言された各fileをhash→uploadし、完了報告にmanifestを載せます。pathの全成分を`symlink_metadata`で検査し、symbolic link経由でworkspace外のファイルを持ち出せないようにしています。cancelとtimeoutでは回収しません。controllerは、宣言と一致すること、保管されたblobのサイズが一致することを確認してから成功にします。
+- 失敗の反映: `DataFailure`(入力の取得不能、checksum不一致、容量不足、出力の未生成、upload失敗、安全でないpathなど)を持つ`DataFailed`で報告します。jobはFailedとなり、理由が`meld status`に出ます。process自体の失敗とは区別されます。
+- 保持: 未完了のjobが参照する入力は削除しません。出力は完了から24時間(`MELD_OUTPUT_RETENTION_SECS`)保護します。これは最低限の保証で、期間後は容量が必要になったときだけ古い順に削除します。controllerの合計容量は`MELD_BLOB_QUOTA_BYTES`(既定16GiB)です。
+- 利用者向け操作: `meld run --input SRC[=DEST] --output PATH`、`meld fetch <job> [--out-dir DIR] [--force]`、`meld status`の入出力・失敗理由の表示。既存ファイルは`--force`なしでは上書きしません。
+
+unit / API testに加え、controller、node、`meld`の実processを起動するend-to-end test(`crates/meld-cli/tests/data_movement.rs`)で、入力の加工と回収、cacheの再利用、20MiBのファイル、出力の未生成、symbolic linkによる持ち出しの拒否、controllerから消えた入力などを検証しています。
+
+### 完了条件の確認
+
+| 完了条件 | 状態 |
+|---|---|
+| jobが宣言したinputだけを転送できる | 達成。manifestにないファイルは送らない |
+| outputを指定場所へ回収できる | 達成。`meld fetch --out-dir`で検証付きに保存 |
+| 転送失敗がjob状態とerror reasonに反映される | 達成。Failedと`data_failure` |
+| 同一inputを安全に再利用する最小cacheを検証できる | 達成。nodeのcacheとcontrollerの重複排除 |
+
+### 既知の制約
+
+- 認証と暗号化はありません。ファイルは平文で通信されるため、機密データは扱えません。信頼された開発用LANに限定します(Phase 7)。
+- controllerの再起動でjobの情報と出力の保持期限は失われます。保管済みのblobはディスクに残り、再起動時に取り込みます(Phase 6)。
+- 空き容量の確認は、同時に準備される複数のjobの間では競合し得ます。controllerのquotaも、進行中のuploadを合計に含めません。
+- process が正常終了したあと、バックグラウンドに残った子孫processがworkspaceを書き換え得ます。回収はprocessの終了時点のファイルを読みます。
+- 扱うメタデータはパスと内容と実行権限だけです。所有者、時刻、symbolic linkは扱わず、入力ディレクトリにsymbolic linkがあるとエラーにします。Windowsのnodeでは実行権限を設定しません。
+- 出力はファイル単位で宣言します。ディレクトリを丸ごと指定することはできません。
+- 転送は常にcontroller経由です。node同士の転送や、データの所在を考慮した配置はPhase 8で扱います。
+
 ## 8. Phase 6 — Persistence and Recovery
 
 ### 目的

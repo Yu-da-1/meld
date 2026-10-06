@@ -8,7 +8,7 @@ Meld は、自宅や小規模な環境にある複数のコンピューターを
 
 ## 現在の状態
 
-Phase 0からPhase 4までが完了し、次はPhase 5のデータ移動へ進む段階です。
+Phase 0からPhase 5までが完了し、次はPhase 6の永続化と障害復旧へ進む段階です。
 
 - `meld-controller`、`meld-node`、`meld-core`、`meld-cli` の4 crateでvirtual workspaceを構成しています。
 - 共有domain model、job / execution状態遷移、in-memory Node RegistryとJob Manager、least-loaded Schedulerを実装済みです。
@@ -21,20 +21,39 @@ Phase 0からPhase 4までが完了し、次はPhase 5のデータ移動へ進�
   - `meld run --os / --arch / --require`で実行先のOS、architecture、capability(`MELD_CAPABILITIES`)を指定できます。
   - 複数のnodeが候補のとき、予約率が最も低いnodeを選びます。`meld status`にnodeごとの判定理由が表示されます。
   - 原則FIFOです。制約を満たすnodeがない、または合計容量を超えるjobは、後続のjobを止めません。
+- Phase 5のデータ移動として、ファイルを渡して成果物を受け取れます。
+  - `meld run --input SRC[=DEST] --output PATH -- <command>`で、手元のファイルやディレクトリをjobの作業ディレクトリへ送り、jobが作ったファイルを宣言できます。`meld fetch <job-id>`で回収します。
+  - ファイルは内容のsha256で識別し、controllerが持たない内容だけを転送します。nodeはローカルcacheで再利用します。受信側は常にhashとサイズを検証します。
+  - 転送の失敗は、jobの失敗と理由(`meld status`の`data_failure`)として表示されます。
+  - 認証と暗号化はまだありません。信頼された開発用LANでのみ使用してください。
 
-## 目指す利用イメージ
-
-将来的には、利用者が物理的な実行先を毎回指定せず、次のように操作できる状態を目指します。
+## 使い方
 
 ```text
 meld nodes
 meld run --cpu 4 --memory 8G -- cargo build --release
-meld jobs
+meld run --input data.csv --input scripts --output out/result.json -- python3 scripts/analyze.py data.csv
+meld status <job-id>
 meld logs <job-id>
+meld fetch <job-id> --out-dir ./results
 meld cancel <job-id>
 ```
 
-Meld は各ノードの容量、現在の負荷、必要な機能、将来的にはデータの所在も考慮して実行先を決定します。
+`--input`にディレクトリを渡すと、中のファイルをすべて、そのディレクトリ名の下へ送ります。`SRC=DEST`で配置先を指定できます。`jobs`のような一覧表示は、まだありません。
+
+### 設定
+
+| 対象 | 環境変数 | 既定値 | 内容 |
+|---|---|---|---|
+| controller | `MELD_CONTROLLER_STATE_DIR` | OSのデータディレクトリ配下 | blobの保管先 |
+| controller | `MELD_MAX_BLOB_BYTES` | 1GiB | 1ファイルの上限 |
+| controller | `MELD_BLOB_QUOTA_BYTES` | 16GiB | 保管する内容の合計 |
+| controller | `MELD_OUTPUT_RETENTION_SECS` | 86400 | 完了したjobの出力を削除しない期間 |
+| node | `MELD_CACHE_MAX_BYTES` | 8GiB | 入力のcacheの上限 |
+
+将来的には、利用者が物理的な実行先を毎回指定せず、データの所在も考慮して実行先が決まる状態を目指します。
+
+Meld は各ノードの容量、現在の負荷、必要な機能を考慮して実行先を決定します。データの所在を考慮した配置は、今後のPhaseで扱います。
 
 ## 構成
 

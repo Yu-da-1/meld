@@ -87,7 +87,7 @@ controllerから割り当てられたジョブを各物理マシンで実行し�
 
 ### 3.3 Data Plane
 
-入力データ、成果物、キャッシュを移動・保持します。MVPではcontroller側のファイルを実行先へ転送し、結果を戻す単純なモデルから始めます。汎用分散ストレージは別段階です。
+入力データ、成果物、キャッシュを移動・保持します。現在は、controllerを正本とする単純なモデルです。ファイルは内容のsha256で識別し、controllerが保管します。nodeは取得した入力をローカルcacheに置き、jobのworkspaceへコピーします。汎用分散ストレージは別段階です。
 
 ## 4. crate の責務
 
@@ -212,21 +212,33 @@ MVPでは設定済みtokenなどの単純な認証でも構いませんが、nod
 ### 6.2 job の実行
 
 ```text
-User -> controller: SubmitJob(command, requirements)
+User -> controller: UploadBlob(sha256, content)      # controllerが持たない入力だけ
+User -> controller: SubmitJob(command, requirements, input/output manifest)
 controller / Job Manager: create Job, state = Queued
 controller / Scheduler: query ready nodes and resources
 controller / Scheduler: select node
 controller -> meld-node: AssignExecution(job, attempt)
 meld-node -> controller: Accepted
-meld-node: start process
+meld-node <- controller: GetBlob(sha256)            # cacheにない入力だけ。hashとサイズを検証
+meld-node: place inputs in workspace, start process
 meld-node -> controller: Running
 meld-node -> controller: logs / status
-meld-node -> controller: Finished(exit code, usage)
+meld-node -> controller: UploadBlob(output)          # 正常終了時、宣言された出力だけ
+meld-node -> controller: Finished(exit code, usage, output manifest)
 controller / Job Manager: Succeeded or Failed
 User <- controller: status / logs / result
+User <- controller: GetBlob(sha256)                  # meld fetch
 ```
 
 assignmentには一意なattempt IDを持たせ、再送時にも同じprocessを二重起動しないidempotencyを目指します。
+
+データの移動には次の規則があります。
+
+- 宣言されたファイルだけが移動します。入力はmanifestにあるものだけがnodeへ届き、出力は宣言されたものだけが回収されます。
+- 受け取る側が必ずsha256とサイズを検証し、一致したときだけ確定します。途中の失敗が完成したファイルのように見えることはありません。
+- 入力の取得と出力の回収に失敗した場合、processは起動せず、または成功扱いにならず、jobはFailedとなり、型付きの理由(`DataFailure`)が記録されます。processの失敗とは区別されます。
+- staging中のcancelとjob timeoutは、転送の完了を待たずに反映されます。execution timeoutはprocessの起動後だけを数えます。
+- 未完了のjobが参照する入力と、完了から一定期間内の出力は、容量不足でも削除されません。
 
 ### 6.3 node 障害
 
@@ -275,6 +287,8 @@ transportより先に、次のcontractを安定させます。
 - nodeの切断とprocessの停止を同一視しない。
 - schedulerによる選択とresource reservationを将来的にatomicに扱う。
 - user commandは任意コード実行であるため、参加nodeと操作主体を認証する。
+- jobが作ったworkspaceの中身は信頼しない。出力を読むときはsymbolic linkを辿らず、宣言されたpathだけを読む。
+- 外部から受け取ったpath(manifest、controllerの応答)は、使う側で再検証する。
 - secretをjob definitionや通常ログへ平文で残さない。
 - native executorから始めても、将来container executorへ差し替えられる境界を保つ。
 - root権限を前提にせず、最小権限でnodeを動かす。

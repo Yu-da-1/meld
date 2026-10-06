@@ -203,9 +203,16 @@ impl InputCache {
             // this one then finds it cached.
             let _turn = flight.lock().await;
             if let Some(lease) = self.lease_cached(input) {
+                tracing::debug!(digest = %input.sha256, path = %input.path, "input served from cache");
                 return self.copy_cached(&lease, input, destination).await;
             }
             let mut partial = self.download(source, input).await?;
+            tracing::debug!(
+                digest = %input.sha256,
+                path = %input.path,
+                size_bytes = input.size_bytes,
+                "input downloaded"
+            );
             match self.admit(input, &mut partial)? {
                 Some(lease) => self.copy_cached(&lease, input, destination).await,
                 // Too large to cache: hand the download over directly.
