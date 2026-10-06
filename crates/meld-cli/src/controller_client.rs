@@ -1,17 +1,24 @@
-use std::{error::Error, fmt, time::Duration};
+use std::{error::Error, fmt, path::Path, time::Duration};
 
 use meld_core::{
-    ApiErrorResponse, CancelJobResponse, JobId, JobLogsResponse, JobSpec, JobStatusResponse,
-    ListNodesResponse, NodeId, NodeStateResponse, SubmitJobResponse,
+    ApiErrorResponse, BlobResponse, CancelJobResponse, JobId, JobLogsResponse, JobSpec,
+    JobStatusResponse, ListNodesResponse, MissingInputsResponse, NodeId, NodeStateResponse,
+    Sha256Digest, SubmitJobResponse,
 };
-use reqwest::{Client, Response, StatusCode, Url};
+use reqwest::{Body, Client, Response, StatusCode, Url, header::CONTENT_LENGTH};
 use serde::de::DeserializeOwned;
+use tokio_util::io::ReaderStream;
 
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
+const BLOB_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+/// Longest a transfer may stall; its total duration is deliberately unbounded.
+const BLOB_READ_TIMEOUT: Duration = Duration::from_secs(30);
 
 #[derive(Clone)]
 pub struct ControllerClient {
     http: Client,
+    /// Without a total timeout, so large files can transfer.
+    blob_http: Client,
     controller_url: Url,
 }
 
@@ -25,12 +32,21 @@ impl ControllerClient {
             .build()
             .map_err(ControllerClientError::Request)?;
 
+        let blob_http = Client::builder()
+            .connect_timeout(BLOB_CONNECT_TIMEOUT)
+            .read_timeout(BLOB_READ_TIMEOUT)
+            .build()
+            .map_err(ControllerClientError::Request)?;
+
         Ok(Self {
             http,
+            blob_http,
             controller_url,
         })
     }
 
+    /// Submits a job. Input files must already be uploaded; if some are not,
+    /// the error names them so the caller can upload and submit again.
     pub async fn submit(&self, spec: &JobSpec) -> Result<SubmitJobResponse, ControllerClientError> {
         let response = self
             .http
@@ -39,7 +55,74 @@ impl ControllerClient {
             .send()
             .await
             .map_err(ControllerClientError::Request)?;
+        if response.status() == StatusCode::UNPROCESSABLE_ENTITY {
+            let missing = response
+                .json::<MissingInputsResponse>()
+                .await
+                .map_err(ControllerClientError::InvalidResponse)?;
+            return Err(ControllerClientError::MissingInputs(missing.missing));
+        }
         decode_response(response).await
+    }
+
+    /// Returns whether the controller already holds this content.
+    pub async fn has_blob(&self, digest: &Sha256Digest) -> Result<bool, ControllerClientError> {
+        let response = self
+            .blob_http
+            .head(self.endpoint(&format!("v1/blobs/{digest}")))
+            .send()
+            .await
+            .map_err(ControllerClientError::Request)?;
+        match response.status() {
+            StatusCode::NOT_FOUND => Ok(false),
+            status if status.is_success() => Ok(true),
+            status => Err(ControllerClientError::Rejected {
+                status,
+                message: format!("controller returned HTTP {status}"),
+            }),
+        }
+    }
+
+    /// Streams a local file to the controller as the content named by `digest`.
+    pub async fn upload_blob(
+        &self,
+        digest: &Sha256Digest,
+        file: &Path,
+        size_bytes: u64,
+    ) -> Result<BlobResponse, ControllerClientError> {
+        let file = tokio::fs::File::open(file)
+            .await
+            .map_err(ControllerClientError::Io)?;
+        let response = self
+            .blob_http
+            .put(self.endpoint(&format!("v1/blobs/{digest}")))
+            .header(CONTENT_LENGTH, size_bytes)
+            .body(Body::wrap_stream(ReaderStream::new(file)))
+            .send()
+            .await
+            .map_err(ControllerClientError::Request)?;
+        decode_response(response).await
+    }
+
+    /// Opens the content named by `digest`, or `None` if it is not stored.
+    pub async fn open_blob(
+        &self,
+        digest: &Sha256Digest,
+    ) -> Result<Option<Response>, ControllerClientError> {
+        let response = self
+            .blob_http
+            .get(self.endpoint(&format!("v1/blobs/{digest}")))
+            .send()
+            .await
+            .map_err(ControllerClientError::Request)?;
+        match response.status() {
+            StatusCode::NOT_FOUND => Ok(None),
+            status if status.is_success() => Ok(Some(response)),
+            status => Err(ControllerClientError::Rejected {
+                status,
+                message: format!("controller returned HTTP {status}"),
+            }),
+        }
     }
 
     pub async fn status(&self, job_id: JobId) -> Result<JobStatusResponse, ControllerClientError> {
@@ -138,8 +221,14 @@ where
 pub enum ControllerClientError {
     InvalidUrl(String),
     Request(reqwest::Error),
-    Rejected { status: StatusCode, message: String },
+    Rejected {
+        status: StatusCode,
+        message: String,
+    },
     InvalidResponse(reqwest::Error),
+    /// The job's input files are not all stored on the controller.
+    MissingInputs(Vec<Sha256Digest>),
+    Io(std::io::Error),
 }
 
 impl fmt::Display for ControllerClientError {
@@ -159,6 +248,12 @@ impl fmt::Display for ControllerClientError {
                     "controller returned an invalid response: {error}"
                 )
             }
+            Self::MissingInputs(missing) => write!(
+                formatter,
+                "controller is missing {} input file(s) that were uploaded earlier",
+                missing.len()
+            ),
+            Self::Io(error) => write!(formatter, "failed to read a local file: {error}"),
         }
     }
 }
@@ -167,7 +262,8 @@ impl Error for ControllerClientError {
     fn source(&self) -> Option<&(dyn Error + 'static)> {
         match self {
             Self::Request(error) | Self::InvalidResponse(error) => Some(error),
-            Self::InvalidUrl(_) | Self::Rejected { .. } => None,
+            Self::Io(error) => Some(error),
+            Self::InvalidUrl(_) | Self::Rejected { .. } | Self::MissingInputs(_) => None,
         }
     }
 }

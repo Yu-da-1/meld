@@ -9,7 +9,7 @@ use std::{
 
 use directories::BaseDirs;
 use meld_controller::{
-    api::{ControllerState, ControllerStateError, router},
+    api::{ControllerState, ControllerStateError, DEFAULT_OUTPUT_RETENTION, router},
     blob_store::{BlobLimits, BlobStore},
     failure_detector::FailureDetector,
 };
@@ -23,6 +23,7 @@ const LIVENESS_CHECK_INTERVAL: Duration = Duration::from_secs(1);
 const STATE_DIR_ENV: &str = "MELD_CONTROLLER_STATE_DIR";
 const MAX_BLOB_BYTES_ENV: &str = "MELD_MAX_BLOB_BYTES";
 const BLOB_QUOTA_BYTES_ENV: &str = "MELD_BLOB_QUOTA_BYTES";
+const OUTPUT_RETENTION_ENV: &str = "MELD_OUTPUT_RETENTION_SECS";
 const JOB_TIMEOUT_CHECK_INTERVAL: Duration = Duration::from_millis(100);
 
 #[tokio::main]
@@ -40,7 +41,13 @@ async fn main() -> Result<(), Box<dyn Error>> {
     let blob_limits = blob_limits_from_env()?;
     let state_directory = state_directory()?;
     let blobs = BlobStore::new(&state_directory, blob_limits)?;
-    let state = ControllerState::new().with_blob_store(Arc::new(blobs));
+    let output_retention = Duration::from_secs(positive_u64_from_env(
+        OUTPUT_RETENTION_ENV,
+        DEFAULT_OUTPUT_RETENTION.as_secs(),
+    )?);
+    let state = ControllerState::new()
+        .with_blob_store(Arc::new(blobs))
+        .with_output_retention(output_retention);
     let listener = TcpListener::bind(&bind_address).await?;
     tracing::info!(
         address = %listener.local_addr()?,
@@ -48,6 +55,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
         state_directory = %state_directory.display(),
         max_blob_bytes = blob_limits.max_blob_bytes,
         blob_quota_bytes = blob_limits.quota_bytes,
+        output_retention_secs = output_retention.as_secs(),
         "controller listening"
     );
 

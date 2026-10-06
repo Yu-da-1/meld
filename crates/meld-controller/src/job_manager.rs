@@ -29,6 +29,8 @@ pub struct JobManager {
     data_failures: BTreeMap<ExecutionId, DataFailure>,
     /// Files each execution left behind for collection.
     output_files: BTreeMap<ExecutionId, Vec<OutputFile>>,
+    /// When each execution's outputs were recorded, to bound how long they are kept.
+    outputs_recorded_at: BTreeMap<ExecutionId, Instant>,
     cancellation_requests: BTreeSet<ExecutionId>,
     job_timeout_requests: BTreeSet<ExecutionId>,
     job_submitted_at: BTreeMap<JobId, Instant>,
@@ -201,9 +203,27 @@ impl JobManager {
             .assessments)
     }
 
-    /// Input content that jobs which have not finished may still need.
-    pub fn pinned_input_digests(&self) -> BTreeSet<Sha256Digest> {
-        self.jobs
+    /// Content that must not be evicted at `now`: the inputs of jobs that have
+    /// not finished, and outputs recorded less than `output_retention` ago.
+    ///
+    /// Retention is a guaranteed minimum. Older outputs are only removed when
+    /// the store needs the room.
+    pub fn pinned_digests(
+        &self,
+        now: Instant,
+        output_retention: Duration,
+    ) -> BTreeSet<Sha256Digest> {
+        let recent_outputs = self
+            .outputs_recorded_at
+            .iter()
+            .filter(|(_, recorded_at)| {
+                now.saturating_duration_since(**recorded_at) < output_retention
+            })
+            .filter_map(|(execution_id, _)| self.output_files.get(execution_id))
+            .flatten()
+            .map(|file| file.sha256.clone());
+        let unfinished_inputs = self
+            .jobs
             .values()
             .filter(|job| {
                 !matches!(
@@ -216,8 +236,8 @@ impl JobManager {
                 )
             })
             .flat_map(|job| job.spec().data.inputs.iter())
-            .map(|input| input.sha256.clone())
-            .collect()
+            .map(|input| input.sha256.clone());
+        unfinished_inputs.chain(recent_outputs).collect()
     }
 
     pub fn job(&self, job_id: JobId) -> Option<&Job> {
@@ -777,6 +797,9 @@ impl JobManager {
     pub fn record_output_files(&mut self, execution_id: ExecutionId, files: Vec<OutputFile>) {
         if !files.is_empty() {
             self.output_files.insert(execution_id, files);
+            self.outputs_recorded_at
+                .entry(execution_id)
+                .or_insert_with(Instant::now);
         }
     }
 
@@ -1534,6 +1557,72 @@ mod tests {
             .schedule(job_id, &Scheduler::new(), &registry)
             .expect("ready node should receive execution");
         (manager, job_id, execution_id)
+    }
+
+    fn output_file(path: &str, fill: char) -> OutputFile {
+        OutputFile {
+            path: path.to_owned(),
+            sha256: fill.to_string().repeat(64).parse().expect("valid digest"),
+            size_bytes: 1,
+        }
+    }
+
+    #[test]
+    fn recent_outputs_are_pinned_until_retention_ends() {
+        let mut manager = JobManager::new();
+        let execution_id = ExecutionId::generate();
+        let file = output_file("result.json", 'a');
+        manager.record_output_files(execution_id, vec![file.clone()]);
+        let retention = Duration::from_secs(3600);
+        let now = Instant::now();
+
+        let within = manager.pinned_digests(now, retention);
+        let after = manager.pinned_digests(now + retention + Duration::from_secs(1), retention);
+
+        assert!(within.contains(&file.sha256));
+        assert!(
+            after.is_empty(),
+            "retention is a minimum, not a promise forever"
+        );
+    }
+
+    #[test]
+    fn recording_outputs_again_does_not_extend_retention() {
+        let mut manager = JobManager::new();
+        let execution_id = ExecutionId::generate();
+        let file = output_file("result.json", 'b');
+        manager.record_output_files(execution_id, vec![file.clone()]);
+        let first = manager.outputs_recorded_at[&execution_id];
+
+        manager.record_output_files(execution_id, vec![file]);
+
+        assert_eq!(manager.outputs_recorded_at[&execution_id], first);
+    }
+
+    #[test]
+    fn inputs_are_pinned_only_while_their_job_is_unfinished() {
+        let mut manager = JobManager::new();
+        let mut spec = spec();
+        let digest: Sha256Digest = "c".repeat(64).parse().expect("valid digest");
+        spec.data.inputs = vec![meld_core::InputFile {
+            path: "in.txt".to_owned(),
+            sha256: digest.clone(),
+            size_bytes: 1,
+            executable: false,
+        }];
+        let job_id = manager.submit(spec).expect("job should be queued");
+        let now = Instant::now();
+
+        assert!(
+            manager
+                .pinned_digests(now, Duration::ZERO)
+                .contains(&digest)
+        );
+
+        manager
+            .request_job_cancellation(job_id)
+            .expect("queued job should be cancellable");
+        assert!(manager.pinned_digests(now, Duration::ZERO).is_empty());
     }
 
     fn spec() -> JobSpec {

@@ -1,17 +1,26 @@
 mod controller_client;
+mod fetch;
+mod transfer;
 
 use std::{
     error::Error,
     io::{self, Write},
+    path::PathBuf,
+    process::ExitCode,
 };
 
 use clap::{Args, Parser, Subcommand};
 use meld_core::{
     DataSpec, ExecutionState, JobId, JobSpec, JobState, LimitedResource, NodeId, NodeState,
-    NodeStateResponse, NodeVerdict, PlacementConstraints, QueueReason, ResourceRequirements,
+    NodeStateResponse, NodeVerdict, OutputSpec, PlacementConstraints, QueueReason,
+    ResourceRequirements,
 };
 
-use crate::controller_client::ControllerClient;
+use crate::{
+    controller_client::ControllerClient,
+    fetch::{FetchOptions, fetch_outputs},
+    transfer::{InputArg, StagedInput, hash_inputs, plan_inputs, submit_with_inputs},
+};
 
 const CONTROLLER_URL_ENV: &str = "MELD_CONTROLLER_URL";
 const DEFAULT_CONTROLLER_URL: &str = "http://127.0.0.1:3000";
@@ -63,18 +72,29 @@ struct RunArgs {
     #[arg(long = "require", value_name = "CAPABILITY")]
     capabilities: Vec<String>,
 
+    /// Send a file or directory to the job. Use SRC=DEST to choose where it
+    /// goes in the job's working directory. Repeat for several.
+    #[arg(long = "input", value_name = "SRC[=DEST]")]
+    inputs: Vec<InputArg>,
+
+    /// A file the job will create, relative to its working directory, to be
+    /// collected afterwards with `meld fetch`. Repeat for several.
+    #[arg(long = "output", value_name = "PATH")]
+    outputs: Vec<String>,
+
     /// Program and arguments. Place these after `--`.
     #[arg(required = true, num_args = 1.., trailing_var_arg = true)]
     command: Vec<String>,
 }
 
 impl RunArgs {
-    fn into_job_spec(self) -> JobSpec {
+    /// Splits the arguments into the job to submit and the local files to send.
+    fn into_parts(self) -> (JobSpec, Vec<InputArg>) {
         let mut command = self.command.into_iter();
         let program = command
             .next()
             .expect("clap requires at least one command argument");
-        JobSpec {
+        let spec = JobSpec {
             program,
             args: command.collect(),
             requirements: ResourceRequirements {
@@ -88,8 +108,16 @@ impl RunArgs {
                 architecture: self.architecture,
                 capabilities: self.capabilities,
             },
-            data: DataSpec::default(),
-        }
+            data: DataSpec {
+                inputs: Vec::new(),
+                outputs: self
+                    .outputs
+                    .into_iter()
+                    .map(|path| OutputSpec { path })
+                    .collect(),
+            },
+        };
+        (spec, self.inputs)
     }
 }
 
@@ -103,6 +131,19 @@ enum Commands {
 
     /// Print captured stdout and stderr for one job.
     Logs { job_id: JobId },
+
+    /// Download the files a job created with `--output`.
+    Fetch {
+        job_id: JobId,
+
+        /// Directory to write the files into.
+        #[arg(long, default_value = ".")]
+        out_dir: PathBuf,
+
+        /// Replace files that already exist.
+        #[arg(long)]
+        force: bool,
+    },
 
     /// Request cancellation of one job.
     Cancel { job_id: JobId },
@@ -118,14 +159,33 @@ enum Commands {
 }
 
 #[tokio::main]
-async fn main() -> Result<(), Box<dyn Error>> {
+async fn main() -> ExitCode {
+    // Returning the error from `main` would print its debug form.
+    match run().await {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(error) => {
+            eprintln!("error: {error}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+async fn run() -> Result<(), Box<dyn Error>> {
     let cli = Cli::parse();
     let client = ControllerClient::new(&cli.controller)?;
 
     match cli.command {
-        Commands::Run(args) => submit_job(&client, &args.into_job_spec()).await?,
+        Commands::Run(args) => {
+            let (spec, inputs) = args.into_parts();
+            submit_job(&client, spec, &inputs).await?;
+        }
         Commands::Status { job_id } => show_status(&client, job_id).await?,
         Commands::Logs { job_id } => show_logs(&client, job_id).await?,
+        Commands::Fetch {
+            job_id,
+            out_dir,
+            force,
+        } => fetch_job_outputs(&client, job_id, FetchOptions { out_dir, force }).await?,
         Commands::Cancel { job_id } => cancel_job(&client, job_id).await?,
         Commands::Nodes => show_nodes(&client).await?,
         Commands::Drain { node_id } => print_node_state(client.drain(node_id).await?),
@@ -135,11 +195,68 @@ async fn main() -> Result<(), Box<dyn Error>> {
     Ok(())
 }
 
-async fn submit_job(client: &ControllerClient, spec: &JobSpec) -> Result<(), Box<dyn Error>> {
-    let response = client.submit(spec).await?;
+async fn submit_job(
+    client: &ControllerClient,
+    spec: JobSpec,
+    inputs: &[InputArg],
+) -> Result<(), Box<dyn Error>> {
+    let staged: Vec<StagedInput> = hash_inputs(plan_inputs(inputs)?).await?;
+    let (response, summary) = submit_with_inputs(client, spec, &staged, &|input| {
+        eprintln!(
+            "uploading {} ({} bytes)",
+            input.file.path, input.file.size_bytes
+        );
+    })
+    .await?;
 
+    if !staged.is_empty() {
+        eprintln!(
+            "sent {} file(s), {} bytes; {} already on the controller",
+            summary.uploaded_files, summary.uploaded_bytes, summary.reused_files
+        );
+    }
     println!("job_id: {}", response.job_id);
     println!("state: {}", job_state_name(response.state));
+    Ok(())
+}
+
+async fn fetch_job_outputs(
+    client: &ControllerClient,
+    job_id: JobId,
+    options: FetchOptions,
+) -> Result<(), Box<dyn Error>> {
+    let status = client.status(job_id).await?;
+    if status.outputs.is_empty() {
+        return Err(if status.spec.data.outputs.is_empty() {
+            "this job did not declare any outputs".to_owned()
+        } else if status.state == JobState::Succeeded {
+            "the job succeeded but no outputs were recorded".to_owned()
+        } else {
+            format!(
+                "the job is {}; outputs are collected only when it succeeds",
+                job_state_name(status.state)
+            )
+        }
+        .into());
+    }
+
+    let mut failed = 0;
+    for (path, result) in fetch_outputs(client, &status.outputs, &options).await {
+        match result {
+            Ok(destination) => println!("{path} -> {}", destination.display()),
+            Err(error) => {
+                eprintln!("{path}: {error}");
+                failed += 1;
+            }
+        }
+    }
+    if failed > 0 {
+        return Err(format!(
+            "{failed} of {} outputs could not be fetched",
+            status.outputs.len()
+        )
+        .into());
+    }
     Ok(())
 }
 
@@ -149,6 +266,35 @@ async fn show_status(client: &ControllerClient, job_id: JobId) -> Result<(), Box
     println!("job_id: {}", response.job_id);
     println!("state: {}", job_state_name(response.state));
     println!("program: {}", response.spec.program);
+    let data = &response.spec.data;
+    if !data.inputs.is_empty() {
+        println!(
+            "inputs: {} file(s), {} bytes",
+            data.inputs.len(),
+            data.total_input_bytes()
+        );
+    }
+    if !response.outputs.is_empty() {
+        println!("outputs:");
+        for output in &response.outputs {
+            println!(
+                "  {}  {} bytes  sha256:{}",
+                output.path,
+                output.size_bytes,
+                &output.sha256.as_str()[..12]
+            );
+        }
+    } else if !data.outputs.is_empty() {
+        let expected: Vec<&str> = data
+            .outputs
+            .iter()
+            .map(|output| output.path.as_str())
+            .collect();
+        println!("expected_outputs: {}", expected.join(", "));
+    }
+    if let Some(failure) = &response.data_failure {
+        println!("data_failure: {failure}");
+    }
     let constraints = &response.spec.constraints;
     if let Some(operating_system) = &constraints.operating_system {
         println!("require_os: {operating_system}");
@@ -413,7 +559,7 @@ mod tests {
         let Commands::Run(args) = cli.command else {
             panic!("run subcommand should be selected");
         };
-        let spec = args.into_job_spec();
+        let spec = args.into_parts().0;
         assert_eq!(spec.requirements.logical_cpus, 4);
         assert_eq!(spec.requirements.memory_bytes, 2 * 1_073_741_824);
         assert_eq!(spec.execution_timeout_secs, Some(60));
@@ -421,6 +567,51 @@ mod tests {
         assert_eq!(spec.program, "cargo");
         assert_eq!(spec.args, ["build", "--release"]);
         assert!(spec.constraints.is_empty());
+    }
+
+    #[test]
+    fn run_collects_inputs_and_outputs() {
+        let cli = Cli::try_parse_from([
+            "meld",
+            "run",
+            "--input",
+            "data.csv",
+            "--input",
+            "./scripts=tools",
+            "--output",
+            "out/result.json",
+            "--",
+            "python3",
+            "tools/analyze.py",
+        ])
+        .expect("valid run command should parse");
+
+        let Commands::Run(args) = cli.command else {
+            panic!("run subcommand should be selected");
+        };
+        let (spec, inputs) = args.into_parts();
+
+        assert_eq!(inputs.len(), 2);
+        assert_eq!(inputs[0].source, PathBuf::from("data.csv"));
+        assert_eq!(inputs[0].destination, None);
+        assert_eq!(inputs[1].source, PathBuf::from("./scripts"));
+        assert_eq!(inputs[1].destination.as_deref(), Some("tools"));
+        assert_eq!(spec.data.outputs[0].path, "out/result.json");
+        assert!(spec.data.inputs.is_empty(), "inputs are added once hashed");
+        assert_eq!(spec.program, "python3");
+    }
+
+    #[test]
+    fn fetch_defaults_to_the_current_directory_without_overwriting() {
+        let job_id = JobId::generate();
+        let cli = Cli::try_parse_from(["meld", "fetch", &job_id.to_string()])
+            .expect("fetch should parse");
+
+        let Commands::Fetch { out_dir, force, .. } = cli.command else {
+            panic!("fetch subcommand should be selected");
+        };
+        assert_eq!(out_dir, PathBuf::from("."));
+        assert!(!force);
     }
 
     #[test]
@@ -444,7 +635,7 @@ mod tests {
         let Commands::Run(args) = cli.command else {
             panic!("run subcommand should be selected");
         };
-        let constraints = args.into_job_spec().constraints;
+        let constraints = args.into_parts().0.constraints;
         assert_eq!(constraints.operating_system.as_deref(), Some("linux"));
         assert_eq!(constraints.architecture.as_deref(), Some("aarch64"));
         assert_eq!(constraints.capabilities, ["gpu", "docker"]);

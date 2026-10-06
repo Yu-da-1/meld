@@ -47,6 +47,7 @@ pub const CANCEL_JOB_PATH: &str = "/v1/jobs/{job_id}/cancel";
 pub const BLOB_PATH: &str = "/v1/blobs/{sha256}";
 pub const POLL_NODE_COMMAND_PATH: &str = "/v1/nodes/commands/poll";
 pub const REPORT_EXECUTION_EVENT_PATH: &str = "/v1/nodes/executions/events";
+pub const DEFAULT_OUTPUT_RETENTION: Duration = Duration::from_secs(24 * 60 * 60);
 const COMMAND_LONG_POLL_TIMEOUT: Duration = Duration::from_secs(25);
 
 /// Shared controller state exposed to HTTP handlers.
@@ -56,6 +57,8 @@ pub struct ControllerState {
     jobs: Arc<RwLock<JobManager>>,
     /// Absent until configured; blob routes and file inputs then report 503.
     blobs: Option<Arc<BlobStore>>,
+    /// How long outputs are protected from eviction after a job finishes.
+    output_retention: Duration,
     command_updates: watch::Sender<u64>,
 }
 
@@ -66,6 +69,7 @@ impl Default for ControllerState {
             registry: Arc::default(),
             jobs: Arc::default(),
             blobs: None,
+            output_retention: DEFAULT_OUTPUT_RETENTION,
             command_updates,
         }
     }
@@ -74,6 +78,13 @@ impl Default for ControllerState {
 impl ControllerState {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Sets how long finished jobs' outputs are guaranteed to stay available.
+    #[must_use]
+    pub fn with_output_retention(mut self, output_retention: Duration) -> Self {
+        self.output_retention = output_retention;
+        self
     }
 
     /// Enables storage of job input and output files.
@@ -855,7 +866,7 @@ async fn put_blob(
     }
 
     let pinned = match state.jobs.read() {
-        Ok(jobs) => jobs.pinned_input_digests(),
+        Ok(jobs) => jobs.pinned_digests(Instant::now(), state.output_retention),
         Err(error) => {
             tracing::error!(%error, "job manager lock is poisoned");
             return api_error(
@@ -2879,7 +2890,7 @@ mod tests {
                     .jobs
                     .read()
                     .expect("job manager lock should be available")
-                    .pinned_input_digests()
+                    .pinned_digests(Instant::now(), DEFAULT_OUTPUT_RETENTION)
                     .is_empty(),
                 "a rejected job must not be queued"
             );
@@ -3167,6 +3178,67 @@ mod tests {
             let job = get_job_status(state, job_id).await;
             assert_eq!(job.state, JobState::Failed);
             assert_eq!(job.data_failure, Some(failure));
+        }
+
+        /// Finishes a job that left `{}` as its output, in a store that holds 8 bytes.
+        async fn state_holding_a_finished_output(
+            retention: Duration,
+        ) -> (ControllerState, TempDir) {
+            let directory = TempDir::new().expect("temp dir");
+            let state = state_with_blobs(
+                &directory,
+                BlobLimits {
+                    quota_bytes: 8,
+                    ..limits()
+                },
+            )
+            .with_output_retention(retention);
+            upload(&state, b"{}").await;
+            let (node_id, _, execution_id) =
+                running_execution(&state, spec_with_output("result.json")).await;
+            report_event(
+                state.clone(),
+                node_id,
+                execution_id,
+                finished(0, vec![output_file("result.json", b"{}")]),
+            )
+            .await;
+            (state, directory)
+        }
+
+        async fn is_stored(state: &ControllerState, data: &[u8]) -> bool {
+            send(
+                state,
+                blob_http_request("GET", digest_of(data).as_str(), b""),
+            )
+            .await
+            .status()
+                == StatusCode::OK
+        }
+
+        #[tokio::test]
+        async fn recent_outputs_survive_eviction_pressure() {
+            let (state, _directory) =
+                state_holding_a_finished_output(Duration::from_secs(3600)).await;
+            upload(&state, b"aaaa").await;
+
+            // 2 + 4 + 4 bytes do not fit in 8: only the unprotected blob can go.
+            assert_eq!(upload(&state, b"bbbb").await, StatusCode::CREATED);
+
+            assert!(is_stored(&state, b"{}").await, "the output must be kept");
+            assert!(!is_stored(&state, b"aaaa").await);
+        }
+
+        #[tokio::test]
+        async fn outputs_past_retention_can_be_evicted() {
+            let (state, _directory) = state_holding_a_finished_output(Duration::ZERO).await;
+            upload(&state, b"aaaa").await;
+            is_stored(&state, b"aaaa").await;
+
+            // `{}` is now the least recently used and unprotected.
+            assert_eq!(upload(&state, b"bbbbbb").await, StatusCode::CREATED);
+
+            assert!(!is_stored(&state, b"{}").await);
         }
 
         #[tokio::test]
