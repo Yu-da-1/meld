@@ -4,12 +4,15 @@ version.workspace = true
 edition.workspace = true
 
 [dependencies]
+bytes = "1"
 directories = "6"
+futures-util = "0.3"
 hostname = "0.4"
 meld-core = { path = "../meld-core" }
-reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "stream"] }
+sha2 = "0.10"
 sysinfo = "0.37"
-tokio = { version = "1", features = ["io-util", "macros", "process", "rt-multi-thread", "signal", "sync", "time"] }
+tokio = { version = "1", features = ["fs", "io-util", "macros", "process", "rt-multi-thread", "signal", "sync", "time"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
@@ -17,4 +20,7 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 libc = "0.2"
 
 [dev-dependencies]
+axum = "0.8"
+meld-controller = { path = "../meld-controller" }
 tempfile = "3"
+tokio = { version = "1", features = ["net"] }

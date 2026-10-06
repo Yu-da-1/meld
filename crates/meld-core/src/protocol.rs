@@ -3,8 +3,8 @@
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    ExecutionId, ExecutionOutput, ExecutionResult, JobId, JobSpec, MessageId, NodeDescriptor,
-    NodeId, ResourceSnapshot,
+    DataFailure, ExecutionId, ExecutionOutput, ExecutionResult, JobId, JobSpec, MessageId,
+    NodeDescriptor, NodeId, ResourceSnapshot,
 };
 
 /// Protocol version implemented by this build.
@@ -171,6 +171,10 @@ pub enum ExecutionEvent {
     StartFailed {
         reason: String,
     },
+    /// The node could not move the job's data, so the process never started.
+    DataFailed {
+        failure: DataFailure,
+    },
     Rejected {
         reason: String,
     },
@@ -244,6 +248,29 @@ mod tests {
 
         assert_eq!(response.metadata.in_reply_to, request.message_id);
         assert_json_round_trip(&response);
+    }
+
+    #[test]
+    fn data_failure_event_round_trips_through_json() {
+        let request = ReportExecutionEventRequest {
+            metadata: RequestMetadata::new(),
+            node_id: NodeId::generate(),
+            execution_id: ExecutionId::generate(),
+            event: ExecutionEvent::DataFailed {
+                failure: DataFailure::ChecksumMismatch {
+                    path: "data.csv".to_owned(),
+                },
+            },
+        };
+
+        let json = serde_json::to_string(&request).expect("event should serialize");
+
+        assert!(json.contains(r#""type":"data_failed""#));
+        assert_eq!(
+            serde_json::from_str::<ReportExecutionEventRequest>(&json)
+                .expect("event should deserialize"),
+            request
+        );
     }
 
     #[test]

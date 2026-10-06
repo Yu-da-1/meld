@@ -220,49 +220,60 @@ async fn report_execution_event(
     }
 
     let job_timeout_requested = jobs.job_timeout_applies(request.execution_id);
-    let transition = match request.event {
-        ExecutionEvent::Accepted => jobs.accept_execution(request.execution_id),
-        ExecutionEvent::Running => jobs.start_execution(request.execution_id),
-        ExecutionEvent::Finished { output, .. } if job_timeout_requested => {
-            jobs.confirm_job_timeout_with_output(request.execution_id, output)
-        }
-        ExecutionEvent::Finished { result, output } => {
-            jobs.finish_execution_with_output(request.execution_id, result, output)
-        }
-        ExecutionEvent::StartFailed { .. } if job_timeout_requested => {
-            jobs.confirm_job_timeout_with_output(request.execution_id, ExecutionOutput::default())
-        }
-        ExecutionEvent::StartFailed { reason } => {
-            tracing::warn!(
-                node_id = %request.node_id,
-                execution_id = %request.execution_id,
-                %reason,
-                "execution process failed to start"
-            );
-            jobs.fail_execution_start(request.execution_id)
-        }
-        ExecutionEvent::Rejected { reason } => {
-            tracing::warn!(
-                node_id = %request.node_id,
-                execution_id = %request.execution_id,
-                %reason,
-                "node rejected execution assignment"
-            );
-            jobs.reject_execution(request.execution_id)
-        }
-        ExecutionEvent::Cancelled { output } if job_timeout_requested => {
-            jobs.confirm_job_timeout_with_output(request.execution_id, output)
-        }
-        ExecutionEvent::Cancelled { output } => {
-            jobs.confirm_execution_cancellation_with_output(request.execution_id, output)
-        }
-        ExecutionEvent::TimedOut { output } if job_timeout_requested => {
-            jobs.confirm_job_timeout_with_output(request.execution_id, output)
-        }
-        ExecutionEvent::TimedOut { output } => {
-            jobs.mark_execution_timed_out(request.execution_id, output)
-        }
-    };
+    let transition =
+        match request.event {
+            ExecutionEvent::Accepted => jobs.accept_execution(request.execution_id),
+            ExecutionEvent::Running => jobs.start_execution(request.execution_id),
+            ExecutionEvent::Finished { output, .. } if job_timeout_requested => {
+                jobs.confirm_job_timeout_with_output(request.execution_id, output)
+            }
+            ExecutionEvent::Finished { result, output } => {
+                jobs.finish_execution_with_output(request.execution_id, result, output)
+            }
+            ExecutionEvent::StartFailed { .. } if job_timeout_requested => jobs
+                .confirm_job_timeout_with_output(request.execution_id, ExecutionOutput::default()),
+            ExecutionEvent::StartFailed { reason } => {
+                tracing::warn!(
+                    node_id = %request.node_id,
+                    execution_id = %request.execution_id,
+                    %reason,
+                    "execution process failed to start"
+                );
+                jobs.fail_execution_start(request.execution_id)
+            }
+            ExecutionEvent::DataFailed { .. } if job_timeout_requested => jobs
+                .confirm_job_timeout_with_output(request.execution_id, ExecutionOutput::default()),
+            ExecutionEvent::DataFailed { failure } => {
+                tracing::warn!(
+                    node_id = %request.node_id,
+                    execution_id = %request.execution_id,
+                    %failure,
+                    "execution data could not be moved"
+                );
+                jobs.fail_execution_start(request.execution_id)
+            }
+            ExecutionEvent::Rejected { reason } => {
+                tracing::warn!(
+                    node_id = %request.node_id,
+                    execution_id = %request.execution_id,
+                    %reason,
+                    "node rejected execution assignment"
+                );
+                jobs.reject_execution(request.execution_id)
+            }
+            ExecutionEvent::Cancelled { output } if job_timeout_requested => {
+                jobs.confirm_job_timeout_with_output(request.execution_id, output)
+            }
+            ExecutionEvent::Cancelled { output } => {
+                jobs.confirm_execution_cancellation_with_output(request.execution_id, output)
+            }
+            ExecutionEvent::TimedOut { output } if job_timeout_requested => {
+                jobs.confirm_job_timeout_with_output(request.execution_id, output)
+            }
+            ExecutionEvent::TimedOut { output } => {
+                jobs.mark_execution_timed_out(request.execution_id, output)
+            }
+        };
 
     if let Err(error) = transition {
         return (
@@ -2036,6 +2047,46 @@ mod tests {
             execution_id,
             ExecutionEvent::StartFailed {
                 reason: "program was not found".to_owned(),
+            },
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::OK);
+        let jobs = state
+            .jobs
+            .read()
+            .expect("job manager lock should be available");
+        assert_eq!(
+            jobs.execution(execution_id).map(Execution::state),
+            Some(ExecutionState::Failed)
+        );
+        assert_eq!(jobs.job(job_id).map(Job::state), Some(JobState::Failed));
+    }
+
+    #[tokio::test]
+    async fn data_failed_event_fails_an_accepted_execution_and_its_job() {
+        let state = ControllerState::new();
+        let node_id = NodeId::generate();
+        let (job_id, execution_id) = assigned_execution(&state, node_id);
+        assert_eq!(
+            report_event(
+                state.clone(),
+                node_id,
+                execution_id,
+                ExecutionEvent::Accepted
+            )
+            .await,
+            StatusCode::OK
+        );
+
+        let status = report_event(
+            state.clone(),
+            node_id,
+            execution_id,
+            ExecutionEvent::DataFailed {
+                failure: meld_core::DataFailure::ChecksumMismatch {
+                    path: "data.csv".to_owned(),
+                },
             },
         )
         .await;

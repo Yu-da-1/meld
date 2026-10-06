@@ -1,7 +1,9 @@
 //! HTTP client boundary for controller-node protocol requests.
 
-use std::{error::Error, fmt, time::Duration};
+use std::{error::Error, fmt, io, time::Duration};
 
+use futures_util::StreamExt;
+use meld_core::Sha256Digest;
 use meld_core::{
     Acknowledgement, CURRENT_PROTOCOL_VERSION, ExecutionEvent, ExecutionId, HeartbeatRequest,
     NodeCommand, NodeDescriptor, NodeId, PollNodeCommandRequest, PollNodeCommandResponse,
@@ -10,16 +12,24 @@ use meld_core::{
 };
 use reqwest::{Client, Response, StatusCode};
 
+use crate::staging::{BlobSource, BlobStream, DownloadError};
+
 const REGISTER_NODE_PATH: &str = "/v1/nodes/register";
 const HEARTBEAT_PATH: &str = "/v1/nodes/heartbeat";
 const POLL_NODE_COMMAND_PATH: &str = "/v1/nodes/commands/poll";
 const REPORT_EXECUTION_EVENT_PATH: &str = "/v1/nodes/executions/events";
+const BLOBS_PATH: &str = "/v1/blobs";
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
+const BLOB_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+/// Longest a transfer may stall; its total duration is deliberately unbounded.
+const BLOB_READ_TIMEOUT: Duration = Duration::from_secs(30);
 const COMMAND_POLL_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 
 #[derive(Clone)]
 pub struct ControllerClient {
     http: Client,
+    /// Without a total timeout, so large files can transfer.
+    blob_http: Client,
     controller_url: String,
 }
 
@@ -27,6 +37,10 @@ impl ControllerClient {
     pub fn new(controller_url: &str) -> Result<Self, reqwest::Error> {
         Ok(Self {
             http: Client::builder().timeout(REQUEST_TIMEOUT).build()?,
+            blob_http: Client::builder()
+                .connect_timeout(BLOB_CONNECT_TIMEOUT)
+                .read_timeout(BLOB_READ_TIMEOUT)
+                .build()?,
             controller_url: controller_url.trim_end_matches('/').to_owned(),
         })
     }
@@ -169,6 +183,27 @@ impl ControllerClient {
     }
 }
 
+impl BlobSource for ControllerClient {
+    async fn open(&self, digest: &Sha256Digest) -> Result<BlobStream, DownloadError> {
+        let response = self
+            .blob_http
+            .get(format!("{}{BLOBS_PATH}/{digest}", self.controller_url))
+            .send()
+            .await
+            .map_err(|error| DownloadError::Unavailable(error.to_string()))?;
+
+        match response.status() {
+            StatusCode::NOT_FOUND => Err(DownloadError::NotFound),
+            status if status.is_success() => Ok(Box::pin(
+                response
+                    .bytes_stream()
+                    .map(|chunk| chunk.map_err(io::Error::other)),
+            )),
+            status => Err(DownloadError::Unavailable(format!("HTTP {status}"))),
+        }
+    }
+}
+
 #[derive(Debug)]
 pub enum ControllerClientError {
     Unavailable(reqwest::Error),
@@ -285,6 +320,50 @@ mod tests {
     };
 
     use super::*;
+
+    #[tokio::test]
+    async fn blob_source_streams_content_from_a_real_controller() {
+        use std::sync::Arc;
+
+        use meld_controller::{
+            api::{ControllerState, router},
+            blob_store::{BlobLimits, BlobStore},
+        };
+        use sha2::{Digest, Sha256};
+
+        let directory = tempfile::tempdir().expect("temp dir");
+        let store = BlobStore::new(directory.path(), BlobLimits::default()).expect("blob store");
+        let state = ControllerState::new().with_blob_store(Arc::new(store));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind an ephemeral port");
+        let address = listener.local_addr().expect("local address");
+        tokio::spawn(async move { axum::serve(listener, router(state)).await });
+        let content = vec![42u8; 300_000];
+        let digest = Sha256Digest::from_bytes(Sha256::digest(&content).into());
+        reqwest::Client::new()
+            .put(format!("http://{address}/v1/blobs/{digest}"))
+            .body(content.clone())
+            .send()
+            .await
+            .expect("upload should be sent")
+            .error_for_status()
+            .expect("upload should be accepted");
+        let client = ControllerClient::new(&format!("http://{address}")).expect("client");
+
+        let mut stream = client.open(&digest).await.expect("blob should open");
+        let mut received = Vec::new();
+        while let Some(chunk) = stream.next().await {
+            received.extend_from_slice(&chunk.expect("chunk should arrive"));
+        }
+        let absent = Sha256Digest::from_bytes(Sha256::digest(b"absent").into());
+
+        assert_eq!(received, content);
+        assert!(matches!(
+            client.open(&absent).await,
+            Err(DownloadError::NotFound)
+        ));
+    }
 
     #[test]
     fn unavailable_and_server_errors_are_retryable() {

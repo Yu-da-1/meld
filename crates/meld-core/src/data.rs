@@ -290,6 +290,14 @@ impl Error for DataSpecError {}
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum DataFailure {
+    /// A declared path is unsafe; the controller normally rejects these first.
+    InvalidPath {
+        path: String,
+    },
+    /// The node could not store the file in its cache or workspace.
+    LocalStorage {
+        path: String,
+    },
     /// The content could not be fetched from the controller.
     InputUnavailable {
         path: String,
@@ -320,6 +328,10 @@ pub enum DataFailure {
 impl fmt::Display for DataFailure {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::InvalidPath { path } => write!(formatter, "path `{path}` is not allowed"),
+            Self::LocalStorage { path } => {
+                write!(formatter, "node could not store `{path}` locally")
+            }
             Self::InputUnavailable { path } => {
                 write!(formatter, "input `{path}` could not be fetched")
             }

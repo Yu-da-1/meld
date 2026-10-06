@@ -2,6 +2,7 @@ mod controller_client;
 mod executor;
 mod identity;
 mod resource_reporter;
+mod staging;
 
 use std::{
     collections::{BTreeMap, BTreeSet},
@@ -28,12 +29,14 @@ use crate::{
     executor::{CompletedExecution, ControlledExecutionOutcome, NativeExecutor},
     identity::{load_or_create_node_id, state_directory},
     resource_reporter::ResourceReporter,
+    staging::{DEFAULT_CACHE_MAX_BYTES, InputCache, stage_inputs},
 };
 
 const HEARTBEAT_INTERVAL_ENV: &str = "MELD_HEARTBEAT_INTERVAL_SECS";
 const DEFAULT_HEARTBEAT_INTERVAL_SECS: u64 = 5;
 const MAX_CONCURRENT_EXECUTIONS_ENV: &str = "MELD_MAX_CONCURRENT_EXECUTIONS";
 const CAPABILITIES_ENV: &str = "MELD_CAPABILITIES";
+const CACHE_MAX_BYTES_ENV: &str = "MELD_CACHE_MAX_BYTES";
 const COMMAND_POLL_RETRY_DELAY: Duration = Duration::from_secs(1);
 const INITIAL_RECONNECT_DELAY: Duration = Duration::from_secs(1);
 const MAX_RECONNECT_DELAY: Duration = Duration::from_secs(30);
@@ -53,11 +56,14 @@ async fn main() -> Result<(), Box<dyn Error>> {
     let descriptor = local_node_descriptor(&resource_reporter)?;
     let node_id = descriptor.id;
     let client = ControllerClient::new(&controller_url)?;
-    let executor = NativeExecutor::new(&state_directory()?);
+    let state_directory = state_directory()?;
+    let executor = NativeExecutor::new(&state_directory);
+    let cache = InputCache::new(&state_directory, cache_max_bytes_from_env()?)?;
 
     run_node(
         &client,
         &executor,
+        &cache,
         descriptor,
         heartbeat_interval,
         &mut resource_reporter,
@@ -147,6 +153,7 @@ impl ActiveExecutions {
 async fn run_node(
     client: &ControllerClient,
     executor: &NativeExecutor,
+    cache: &InputCache,
     descriptor: NodeDescriptor,
     heartbeat_interval: Duration,
     resource_reporter: &mut ResourceReporter,
@@ -244,6 +251,7 @@ async fn run_node(
                             );
                             let client = client.clone();
                             let executor = executor.clone();
+                            let cache = cache.clone();
                             let execution_id = assignment.execution_id;
                             let (cancellation, cancellation_receiver) = oneshot::channel();
                             let spawned = active_executions.spawn(
@@ -253,6 +261,7 @@ async fn run_node(
                                     run_assignment(
                                         &client,
                                         &executor,
+                                        &cache,
                                         assignment,
                                         cancellation_receiver,
                                     )
@@ -304,6 +313,7 @@ async fn run_node(
 async fn run_assignment(
     client: &ControllerClient,
     executor: &NativeExecutor,
+    cache: &InputCache,
     assignment: ExecutionAssignment,
     mut cancellation: oneshot::Receiver<()>,
 ) {
@@ -335,22 +345,62 @@ async fn run_assignment(
         return;
     }
 
-    let execution = match executor.start(&assignment) {
-        Ok(execution) => execution,
+    let workspace = match executor.prepare(&assignment) {
+        Ok(workspace) => workspace,
         Err(error) => {
-            tracing::warn!(%node_id, %execution_id, %error, "execution process failed to start");
-            if let Err(report_error) = report_event_with_retry(
+            tracing::warn!(%node_id, %execution_id, %error, "execution workspace could not be created");
+            report_start_failure(client, node_id, execution_id, error.to_string()).await;
+            return;
+        }
+    };
+
+    // Staging counts against the job timeout but not the execution timeout,
+    // and a cancellation must not have to wait for a transfer to finish.
+    let staged = tokio::select! {
+        biased;
+        _ = &mut cancellation => None,
+        result = stage_inputs(cache, client, &assignment.spec.data, workspace.path()) => {
+            Some(result)
+        }
+    };
+    match staged {
+        None => {
+            if let Err(error) = report_event_with_retry(
                 client,
                 node_id,
                 execution_id,
-                ExecutionEvent::StartFailed {
-                    reason: error.to_string(),
+                ExecutionEvent::Cancelled {
+                    output: ExecutionOutput::default(),
                 },
             )
             .await
             {
-                tracing::error!(%node_id, %execution_id, %report_error, "failed to report rejected execution");
+                tracing::error!(%node_id, %execution_id, %error, "failed to report cancellation during staging");
             }
+            return;
+        }
+        Some(Err(failure)) => {
+            tracing::warn!(%node_id, %execution_id, %failure, "execution inputs could not be staged");
+            if let Err(error) = report_event_with_retry(
+                client,
+                node_id,
+                execution_id,
+                ExecutionEvent::DataFailed { failure },
+            )
+            .await
+            {
+                tracing::error!(%node_id, %execution_id, %error, "failed to report data failure");
+            }
+            return;
+        }
+        Some(Ok(())) => {}
+    }
+
+    let execution = match executor.start(workspace, &assignment) {
+        Ok(execution) => execution,
+        Err(error) => {
+            tracing::warn!(%node_id, %execution_id, %error, "execution process failed to start");
+            report_start_failure(client, node_id, execution_id, error.to_string()).await;
             return;
         }
     };
@@ -362,7 +412,10 @@ async fn run_assignment(
     }
 
     let outcome = match execution.wait_controlled(cancellation, timeout).await {
-        Ok(outcome) => outcome,
+        Ok((outcome, workspace)) => {
+            drop(workspace);
+            outcome
+        }
         Err(error) => {
             tracing::error!(%node_id, %execution_id, %error, "failed to wait for execution process");
             ControlledExecutionOutcome::Finished(CompletedExecution {
@@ -397,6 +450,24 @@ async fn run_assignment(
         exit_code = ?result.and_then(|result| result.exit_code),
         "execution finished"
     );
+}
+
+async fn report_start_failure(
+    client: &ControllerClient,
+    node_id: meld_core::NodeId,
+    execution_id: ExecutionId,
+    reason: String,
+) {
+    if let Err(error) = report_event_with_retry(
+        client,
+        node_id,
+        execution_id,
+        ExecutionEvent::StartFailed { reason },
+    )
+    .await
+    {
+        tracing::error!(%node_id, %execution_id, %error, "failed to report rejected execution");
+    }
 }
 
 async fn report_event_with_retry(
@@ -502,6 +573,30 @@ fn capabilities_from_env() -> io::Result<Vec<String>> {
 }
 
 /// Splits a comma-separated label list into sorted, lowercase, unique labels.
+fn cache_max_bytes_from_env() -> io::Result<u64> {
+    match env::var(CACHE_MAX_BYTES_ENV) {
+        Ok(value) => parse_cache_max_bytes(&value),
+        Err(env::VarError::NotPresent) => Ok(DEFAULT_CACHE_MAX_BYTES),
+        Err(env::VarError::NotUnicode(_)) => Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("{CACHE_MAX_BYTES_ENV} must contain valid Unicode"),
+        )),
+    }
+}
+
+fn parse_cache_max_bytes(value: &str) -> io::Result<u64> {
+    value
+        .parse::<u64>()
+        .ok()
+        .filter(|bytes| *bytes > 0)
+        .ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("{CACHE_MAX_BYTES_ENV} must be a positive integer"),
+            )
+        })
+}
+
 fn parse_capabilities(value: &str) -> Vec<String> {
     value
         .split(',')

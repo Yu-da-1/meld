@@ -32,17 +32,28 @@ impl NativeExecutor {
         }
     }
 
-    pub fn start(&self, assignment: &ExecutionAssignment) -> io::Result<NativeExecution> {
+    /// Creates the empty directory the process will run in.
+    pub fn prepare(&self, assignment: &ExecutionAssignment) -> io::Result<Workspace> {
         fs::create_dir_all(&self.executions_directory)?;
-        let workspace = self
+        let path = self
             .executions_directory
             .join(assignment.execution_id.to_string());
-        fs::create_dir(&workspace)?;
+        fs::create_dir(&path)?;
+        Ok(Workspace { path })
+    }
 
+    /// Starts the process in `workspace`, which the execution then owns.
+    ///
+    /// A process that fails to start takes the workspace with it.
+    pub fn start(
+        &self,
+        workspace: Workspace,
+        assignment: &ExecutionAssignment,
+    ) -> io::Result<NativeExecution> {
         let mut command = Command::new(&assignment.spec.program);
         command
             .args(&assignment.spec.args)
-            .current_dir(&workspace)
+            .current_dir(workspace.path())
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
@@ -53,33 +64,48 @@ impl NativeExecutor {
             command.as_std_mut().process_group(0);
         }
 
-        match command.spawn() {
-            Ok(mut child) => {
-                let stdout = child
-                    .stdout
-                    .take()
-                    .expect("piped stdout should be available");
-                let stderr = child
-                    .stderr
-                    .take()
-                    .expect("piped stderr should be available");
-                Ok(NativeExecution {
-                    child,
-                    stdout: Some(stdout),
-                    stderr: Some(stderr),
-                    workspace,
-                })
-            }
-            Err(error) => {
-                if let Err(cleanup_error) = fs::remove_dir_all(&workspace) {
-                    tracing::warn!(
-                        path = %workspace.display(),
-                        %cleanup_error,
-                        "failed to clean workspace after process start failure"
-                    );
-                }
-                Err(error)
-            }
+        let mut child = command.spawn()?;
+        let stdout = child
+            .stdout
+            .take()
+            .expect("piped stdout should be available");
+        let stderr = child
+            .stderr
+            .take()
+            .expect("piped stderr should be available");
+        Ok(NativeExecution {
+            child,
+            stdout: Some(stdout),
+            stderr: Some(stderr),
+            workspace: Some(workspace),
+        })
+    }
+}
+
+/// The directory an execution runs in, removed when dropped.
+///
+/// It outlives the process so that results can be read from it first.
+#[derive(Debug)]
+pub struct Workspace {
+    path: PathBuf,
+}
+
+impl Workspace {
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+}
+
+impl Drop for Workspace {
+    fn drop(&mut self) {
+        if self.path.exists()
+            && let Err(error) = fs::remove_dir_all(&self.path)
+        {
+            tracing::warn!(
+                path = %self.path.display(),
+                %error,
+                "failed to clean execution workspace"
+            );
         }
     }
 }
@@ -89,7 +115,7 @@ pub struct NativeExecution {
     child: Child,
     stdout: Option<ChildStdout>,
     stderr: Option<ChildStderr>,
-    workspace: PathBuf,
+    workspace: Option<Workspace>,
 }
 
 impl NativeExecution {
@@ -98,7 +124,7 @@ impl NativeExecution {
         let (sender, receiver) = oneshot::channel();
         let outcome = self.wait_controlled(receiver, None).await;
         drop(sender);
-        match outcome? {
+        match outcome?.0 {
             ControlledExecutionOutcome::Finished(completed) => Ok(completed),
             ControlledExecutionOutcome::Cancelled { .. }
             | ControlledExecutionOutcome::TimedOut { .. } => {
@@ -111,7 +137,7 @@ impl NativeExecution {
         mut self,
         mut cancellation: oneshot::Receiver<()>,
         timeout: Option<Duration>,
-    ) -> io::Result<ControlledExecutionOutcome> {
+    ) -> io::Result<(ControlledExecutionOutcome, Workspace)> {
         let stdout = self
             .stdout
             .take()
@@ -155,26 +181,26 @@ impl NativeExecution {
             .map_err(|error| io::Error::other(format!("stderr capture task failed: {error}")))??;
         let output = ExecutionOutput { stdout, stderr };
 
-        if let Err(error) = fs::remove_dir_all(&self.workspace) {
-            tracing::warn!(
-                path = %self.workspace.display(),
-                %error,
-                "failed to clean execution workspace"
-            );
-        }
-
-        Ok(match termination {
+        let outcome = match termination {
             Termination::Finished(result) => {
                 ControlledExecutionOutcome::Finished(CompletedExecution { result, output })
             }
             Termination::Cancelled => ControlledExecutionOutcome::Cancelled { output },
             Termination::TimedOut => ControlledExecutionOutcome::TimedOut { output },
-        })
+        };
+        let workspace = self
+            .workspace
+            .take()
+            .expect("workspace should only be taken once");
+        Ok((outcome, workspace))
     }
 
     #[cfg(test)]
     fn workspace(&self) -> &Path {
-        &self.workspace
+        self.workspace
+            .as_ref()
+            .expect("workspace is held until the execution ends")
+            .path()
     }
 }
 
@@ -221,18 +247,10 @@ async fn capture_stream(mut stream: impl AsyncRead + Unpin) -> io::Result<Captur
 
 impl Drop for NativeExecution {
     fn drop(&mut self) {
+        // The workspace field is dropped after this, once the process is gone.
         #[cfg(unix)]
         let _ = signal_process_group(&self.child);
         let _ = self.child.start_kill();
-        if self.workspace.exists()
-            && let Err(error) = fs::remove_dir_all(&self.workspace)
-        {
-            tracing::warn!(
-                path = %self.workspace.display(),
-                %error,
-                "failed to clean dropped execution workspace"
-            );
-        }
     }
 }
 
@@ -280,8 +298,7 @@ mod tests {
         let executor = NativeExecutor::new(state_directory.path());
         let assignment = assignment("rustc", vec!["--version"]);
 
-        let execution = executor
-            .start(&assignment)
+        let execution = start_in_new_workspace(&executor, &assignment)
             .expect("installed Rust compiler should start");
         let workspace = execution.workspace().to_owned();
         assert!(workspace.is_dir());
@@ -305,8 +322,7 @@ mod tests {
             .join("executions")
             .join(assignment.execution_id.to_string());
 
-        executor
-            .start(&assignment)
+        start_in_new_workspace(&executor, &assignment)
             .expect_err("missing executable must fail to start");
 
         assert!(!workspace.exists());
@@ -353,16 +369,15 @@ mod tests {
                 "executor::tests::long_running_child",
             ],
         );
-        let execution = executor
-            .start(&assignment)
-            .expect("test child should start");
+        let execution =
+            start_in_new_workspace(&executor, &assignment).expect("test child should start");
         let workspace = execution.workspace().to_owned();
         let (cancel, cancellation) = oneshot::channel();
         cancel
             .send(())
             .expect("cancellation receiver should be open");
 
-        let outcome = execution
+        let (outcome, held) = execution
             .wait_controlled(cancellation, None)
             .await
             .expect("cancelled process should be reaped");
@@ -371,6 +386,8 @@ mod tests {
             outcome,
             ControlledExecutionOutcome::Cancelled { .. }
         ));
+        assert!(workspace.exists(), "the caller still owns the workspace");
+        drop(held);
         assert!(!workspace.exists());
     }
 
@@ -389,13 +406,12 @@ mod tests {
                 "executor::tests::long_running_child",
             ],
         );
-        let execution = executor
-            .start(&assignment)
-            .expect("test child should start");
+        let execution =
+            start_in_new_workspace(&executor, &assignment).expect("test child should start");
         let workspace = execution.workspace().to_owned();
         let (_cancel, cancellation) = oneshot::channel();
 
-        let outcome = execution
+        let (outcome, held) = execution
             .wait_controlled(cancellation, Some(Duration::from_millis(10)))
             .await
             .expect("timed out process should be reaped");
@@ -404,6 +420,7 @@ mod tests {
             outcome,
             ControlledExecutionOutcome::TimedOut { .. }
         ));
+        drop(held);
         assert!(!workspace.exists());
     }
 
@@ -413,11 +430,11 @@ mod tests {
         let state_directory = tempdir().expect("temporary state directory should be created");
         let executor = NativeExecutor::new(state_directory.path());
         let assignment = assignment("/bin/sh", vec!["-c", "sleep 10"]);
-        let execution = executor.start(&assignment).expect("shell should start");
+        let execution = start_in_new_workspace(&executor, &assignment).expect("shell should start");
         let (_cancel, cancellation) = oneshot::channel();
         let started = std::time::Instant::now();
 
-        let outcome = execution
+        let (outcome, _held) = execution
             .wait_controlled(cancellation, Some(Duration::from_millis(10)))
             .await
             .expect("process group should be stopped");
@@ -433,6 +450,52 @@ mod tests {
     #[ignore = "spawned explicitly by cancellation and timeout tests"]
     fn long_running_child() {
         std::thread::sleep(Duration::from_secs(30));
+    }
+
+    fn start_in_new_workspace(
+        executor: &NativeExecutor,
+        assignment: &ExecutionAssignment,
+    ) -> io::Result<NativeExecution> {
+        let workspace = executor.prepare(assignment)?;
+        executor.start(workspace, assignment)
+    }
+
+    #[tokio::test]
+    async fn process_runs_with_staged_files_in_its_working_directory() {
+        let state_directory = tempdir().expect("temporary state directory should be created");
+        let executor = NativeExecutor::new(state_directory.path());
+        let assignment = assignment("rustc", vec!["--version"]);
+        let workspace = executor.prepare(&assignment).expect("workspace");
+        fs::write(workspace.path().join("input.txt"), b"staged").expect("stage file");
+        let marker = workspace.path().join("input.txt");
+
+        let execution = executor
+            .start(workspace, &assignment)
+            .expect("process should start");
+
+        assert_eq!(fs::read(&marker).expect("staged file"), b"staged");
+        let (_cancel, cancellation) = oneshot::channel();
+        let (_, held) = execution
+            .wait_controlled(cancellation, None)
+            .await
+            .expect("wait");
+        assert_eq!(fs::read(&marker).expect("kept until dropped"), b"staged");
+        drop(held);
+        assert!(!marker.exists());
+    }
+
+    #[test]
+    fn dropping_an_unstarted_workspace_removes_it() {
+        let state_directory = tempdir().expect("temporary state directory should be created");
+        let executor = NativeExecutor::new(state_directory.path());
+        let assignment = assignment("rustc", Vec::new());
+
+        let workspace = executor.prepare(&assignment).expect("workspace");
+        let path = workspace.path().to_owned();
+        assert!(path.is_dir());
+        drop(workspace);
+
+        assert!(!path.exists());
     }
 
     fn assignment(program: &str, args: Vec<&str>) -> ExecutionAssignment {
