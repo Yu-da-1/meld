@@ -12,6 +12,7 @@ use meld_controller::{
     api::{ControllerState, ControllerStateError, DEFAULT_OUTPUT_RETENTION, router},
     blob_store::{BlobLimits, BlobStore},
     failure_detector::FailureDetector,
+    store::StateStore,
 };
 use tokio::net::TcpListener;
 use tokio::time::{MissedTickBehavior, interval};
@@ -20,6 +21,7 @@ use tracing_subscriber::EnvFilter;
 const HEARTBEAT_TIMEOUT_ENV: &str = "MELD_HEARTBEAT_TIMEOUT_SECS";
 const DEFAULT_HEARTBEAT_TIMEOUT_SECS: u64 = 15;
 const LIVENESS_CHECK_INTERVAL: Duration = Duration::from_secs(1);
+const STATE_DB_FILE: &str = "state.db";
 const STATE_DIR_ENV: &str = "MELD_CONTROLLER_STATE_DIR";
 const MAX_BLOB_BYTES_ENV: &str = "MELD_MAX_BLOB_BYTES";
 const BLOB_QUOTA_BYTES_ENV: &str = "MELD_BLOB_QUOTA_BYTES";
@@ -45,9 +47,11 @@ async fn main() -> Result<(), Box<dyn Error>> {
         OUTPUT_RETENTION_ENV,
         DEFAULT_OUTPUT_RETENTION.as_secs(),
     )?);
+    let store = StateStore::open(&state_directory.join(STATE_DB_FILE))?;
     let state = ControllerState::new()
         .with_blob_store(Arc::new(blobs))
-        .with_output_retention(output_retention);
+        .with_output_retention(output_retention)
+        .with_store(Arc::new(store))?;
     let listener = TcpListener::bind(&bind_address).await?;
     tracing::info!(
         address = %listener.local_addr()?,

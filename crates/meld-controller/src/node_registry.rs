@@ -1,8 +1,16 @@
 //! In-memory source of truth for registered nodes.
 
-use std::{collections::BTreeMap, error::Error, fmt, time::Instant};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    error::Error,
+    fmt,
+    time::Instant,
+};
 
 use meld_core::{NodeDescriptor, NodeId, NodeState, ResourceSnapshot};
+use serde::{Deserialize, Serialize};
+
+use crate::store::{Change, Kind, Persist, StateStore, StoreError, decode, encode};
 
 /// Controller-owned view of one registered node.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -47,11 +55,75 @@ impl RegisteredNode {
 #[derive(Debug, Default)]
 pub struct NodeRegistry {
     nodes: BTreeMap<NodeId, RegisteredNode>,
+    /// Nodes whose persisted fields changed since the last flush.
+    dirty: BTreeSet<NodeId>,
+}
+
+/// What survives a controller restart. Liveness and usage do not: they are
+/// observations, and are rebuilt from the next heartbeat.
+#[derive(Debug, Serialize, Deserialize)]
+struct StoredNode {
+    descriptor: NodeDescriptor,
+    draining: bool,
 }
 
 impl NodeRegistry {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Rebuilds the registry from the store.
+    ///
+    /// Restored nodes are `Unreachable` until they report in again: the
+    /// controller has not observed them since it started.
+    pub fn restore(store: &StateStore) -> Result<Self, StoreError> {
+        let mut registry = Self::default();
+        for row in store.load(Kind::Node)? {
+            let stored: StoredNode = decode(Kind::Node, &row.id, &row.body)?;
+            if stored.descriptor.id.to_string() != row.id {
+                return Err(StoreError::Corrupt(format!(
+                    "node row {} holds a record with id {}",
+                    row.id, stored.descriptor.id
+                )));
+            }
+            registry.nodes.insert(
+                stored.descriptor.id,
+                RegisteredNode {
+                    descriptor: stored.descriptor,
+                    state: NodeState::Unreachable,
+                    draining: stored.draining,
+                    snapshot: None,
+                    last_heartbeat_at: None,
+                },
+            );
+        }
+        Ok(registry)
+    }
+
+    /// Writes nodes changed since the last flush; on failure they stay unsaved.
+    pub fn flush(&mut self, store: &StateStore) -> Result<(), StoreError> {
+        let changes = self
+            .dirty
+            .iter()
+            .filter_map(|node_id| self.nodes.get(node_id))
+            .map(|node| {
+                Change::put(
+                    Kind::Node,
+                    node.descriptor.id,
+                    encode(&StoredNode {
+                        descriptor: node.descriptor.clone(),
+                        draining: node.draining,
+                    }),
+                )
+            })
+            .collect::<Vec<_>>();
+        store.apply(&changes)?;
+        self.dirty.clear();
+        Ok(())
+    }
+
+    pub fn has_unsaved_changes(&self) -> bool {
+        !self.dirty.is_empty()
     }
 
     /// Registers a node as joining, replacing stale data for the same identity.
@@ -63,6 +135,7 @@ impl NodeRegistry {
             .nodes
             .get(&descriptor.id)
             .is_some_and(|node| node.draining);
+        self.dirty.insert(descriptor.id);
         self.nodes.insert(
             descriptor.id,
             RegisteredNode {
@@ -86,7 +159,9 @@ impl NodeRegistry {
             .get_mut(&node_id)
             .ok_or(NodeRegistryError::NodeNotFound(node_id))?;
         node.draining = draining;
-        Ok(node.state())
+        let state = node.state();
+        self.dirty.insert(node_id);
+        Ok(state)
     }
 
     /// Records a heartbeat and makes the node available for scheduling.
@@ -126,6 +201,12 @@ impl NodeRegistry {
 
     pub(crate) fn nodes_mut(&mut self) -> impl Iterator<Item = &mut RegisteredNode> {
         self.nodes.values_mut()
+    }
+}
+
+impl Persist for NodeRegistry {
+    fn save(&mut self, store: &StateStore) -> Result<(), StoreError> {
+        self.flush(store)
     }
 }
 

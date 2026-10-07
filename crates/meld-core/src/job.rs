@@ -151,7 +151,7 @@ impl From<DataSpecError> for JobSpecValidationError {
 impl Error for JobSpecValidationError {}
 
 /// A logical unit of work managed by the controller.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Job {
     id: JobId,
     spec: JobSpec,

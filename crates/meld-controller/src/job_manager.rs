@@ -16,27 +16,42 @@ use meld_core::{
 use crate::{
     node_registry::NodeRegistry,
     scheduler::{NodeAllocation, Scheduler, SchedulingFailure},
+    tracked::Tracked,
 };
+
+mod persistence;
 
 /// Owns controller-authoritative Job and Execution records.
 #[derive(Debug, Default)]
 pub struct JobManager {
-    jobs: BTreeMap<JobId, Job>,
-    executions: BTreeMap<ExecutionId, Execution>,
+    jobs: Tracked<JobId, Job>,
+    executions: Tracked<ExecutionId, Execution>,
+    /// Attempts of each job, oldest first. Derived from `executions`.
     execution_ids_by_job: BTreeMap<JobId, Vec<ExecutionId>>,
-    outputs: BTreeMap<ExecutionId, ExecutionOutput>,
+    outputs: Tracked<ExecutionId, ExecutionOutput>,
     /// Why an execution failed to move its job's data.
-    data_failures: BTreeMap<ExecutionId, DataFailure>,
+    data_failures: Tracked<ExecutionId, DataFailure>,
     /// Files each execution left behind for collection.
-    output_files: BTreeMap<ExecutionId, Vec<OutputFile>>,
+    output_files: Tracked<ExecutionId, Vec<OutputFile>>,
     /// When each execution's outputs were recorded, to bound how long they are kept.
-    outputs_recorded_at: BTreeMap<ExecutionId, Instant>,
-    cancellation_requests: BTreeSet<ExecutionId>,
-    job_timeout_requests: BTreeSet<ExecutionId>,
-    job_submitted_at: BTreeMap<JobId, Instant>,
+    outputs_recorded_at: Tracked<ExecutionId, Instant>,
+    cancellation_requests: Tracked<ExecutionId, ()>,
+    job_timeout_requests: Tracked<ExecutionId, ()>,
+    job_submitted_at: Tracked<JobId, Instant>,
     pending_jobs: VecDeque<JobId>,
+    /// Whether `pending_jobs` changed since it was last written.
+    queue_dirty: bool,
     /// The scheduler's verdict on every node at the latest placement of each job.
-    placements: BTreeMap<JobId, Vec<NodeAssessment>>,
+    placements: Tracked<JobId, Vec<NodeAssessment>>,
+    /// Executions restored from the store that were past acknowledgement, and
+    /// whose node has not yet confirmed that it still runs them. Never saved:
+    /// it describes what this controller process has not yet observed.
+    unconfirmed: BTreeSet<ExecutionId>,
+    /// Creation order of executions. Ids are random, so this is the only
+    /// record of which attempt came first; the store keeps rows in write order
+    /// and relies on this to write them in the right one.
+    execution_order: BTreeMap<ExecutionId, u64>,
+    next_execution_order: u64,
 }
 
 impl JobManager {
@@ -60,6 +75,7 @@ impl JobManager {
         let job_id = job.id();
         self.jobs.insert(job_id, job);
         self.pending_jobs.push_back(job_id);
+        self.queue_dirty = true;
         if has_job_timeout {
             self.job_submitted_at.insert(job_id, submitted_at);
         }
@@ -167,6 +183,9 @@ impl JobManager {
             .assign()
             .map_err(JobManagerError::InvalidJobState)?;
         self.executions.insert(execution_id, execution);
+        self.execution_order
+            .insert(execution_id, self.next_execution_order);
+        self.next_execution_order += 1;
         self.execution_ids_by_job
             .entry(job_id)
             .or_default()
@@ -322,13 +341,13 @@ impl JobManager {
             .expect("job was verified above")
             .request_cancellation()
             .map_err(JobManagerError::InvalidJobState)?;
-        self.cancellation_requests.insert(execution_id);
+        self.cancellation_requests.insert(execution_id, ());
         self.job_submitted_at.remove(&job_id);
         Ok(Some(execution_id))
     }
 
     pub fn cancellation_requested(&self, execution_id: ExecutionId, node_id: NodeId) -> bool {
-        self.cancellation_requests.contains(&execution_id)
+        self.cancellation_requests.contains_key(&execution_id)
             && self
                 .executions
                 .get(&execution_id)
@@ -336,7 +355,7 @@ impl JobManager {
     }
 
     pub fn job_timeout_requested(&self, execution_id: ExecutionId) -> bool {
-        self.job_timeout_requests.contains(&execution_id)
+        self.job_timeout_requests.contains_key(&execution_id)
     }
 
     pub fn job_timeout_applies(&self, execution_id: ExecutionId) -> bool {
@@ -439,8 +458,8 @@ impl JobManager {
             .expect("linked job was verified above")
             .request_timeout()
             .expect("job transition was preflighted");
-        self.cancellation_requests.insert(execution_id);
-        self.job_timeout_requests.insert(execution_id);
+        self.cancellation_requests.insert(execution_id, ());
+        self.job_timeout_requests.insert(execution_id, ());
         Ok(())
     }
 
@@ -542,6 +561,7 @@ impl JobManager {
             .expect("job transition was preflighted");
         if !self.pending_jobs.contains(&job_id) {
             self.pending_jobs.push_front(job_id);
+            self.queue_dirty = true;
         }
 
         Ok(())
@@ -693,9 +713,55 @@ impl JobManager {
             .expect("linked job was verified above")
             .mark_lost()
             .expect("job transition was preflighted");
+        self.cancellation_requests.remove(&execution_id);
+        self.job_timeout_requests.remove(&execution_id);
         self.job_submitted_at.remove(&job_id);
 
         Ok(())
+    }
+
+    /// Settles restored executions of one node against what the node reports running.
+    ///
+    /// After a restart the controller knows what it last recorded, not what
+    /// happened since. The first time a node polls, its list of running
+    /// executions is the truth: a restored execution on the list is confirmed,
+    /// and one missing from it has no process and no pending result, so it is
+    /// marked lost. Only restored executions are judged. During normal
+    /// operation a poll can carry a list older than an execution it races
+    /// with, so absence there proves nothing.
+    ///
+    /// Returns the executions marked lost.
+    pub fn reconcile_node(
+        &mut self,
+        node_id: NodeId,
+        running: &[ExecutionId],
+    ) -> Result<Vec<ExecutionId>, JobManagerError> {
+        let candidates = self
+            .unconfirmed
+            .iter()
+            .copied()
+            .filter(|execution_id| {
+                self.executions
+                    .get(execution_id)
+                    .is_none_or(|execution| execution.node_id() == node_id)
+            })
+            .collect::<Vec<_>>();
+
+        let mut lost = Vec::new();
+        for execution_id in candidates {
+            self.unconfirmed.remove(&execution_id);
+            let still_open = self.executions.get(&execution_id).is_some_and(|execution| {
+                matches!(
+                    execution.state(),
+                    ExecutionState::Accepted | ExecutionState::Running | ExecutionState::Cancelling
+                )
+            });
+            if still_open && !running.contains(&execution_id) {
+                self.mark_execution_lost(execution_id)?;
+                lost.push(execution_id);
+            }
+        }
+        Ok(lost)
     }
 
     /// Records process completion and updates the linked logical job.
@@ -876,6 +942,7 @@ impl JobManager {
             .position(|queued| *queued == job_id)
         {
             self.pending_jobs.remove(index);
+            self.queue_dirty = true;
         }
     }
 

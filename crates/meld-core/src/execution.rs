@@ -7,7 +7,7 @@ use serde::{Deserialize, Serialize};
 use crate::{ExecutionId, InvalidStateTransition, JobId, NodeId};
 
 /// One physical attempt to run a job on a selected node.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Execution {
     id: ExecutionId,
     job_id: JobId,

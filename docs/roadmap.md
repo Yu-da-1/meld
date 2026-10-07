@@ -278,6 +278,22 @@ processやnetworkの障害を状態として扱い、controller再起動後に�
 - 非冪等jobを無条件に自動再実行しない。
 - 障害注入testで切断、timeout、重複messageを検証できる。
 
+### 現在地
+
+進行中です。次のスライスを実装済みで、残りは未着手です。
+
+- 永続化(完了): controllerの状態をローカルのSQLite(`<state dir>/state.db`)へ保存し、起動時に復元します。保存するのはjobとexecution(attemptの順序を含む)、stdout/stderr、データ失敗の理由、出力file、cancelとjob timeoutの要求、キューの順序、配置の判定、nodeのdescriptorとdrainの意図です。attempt一覧や資源の予約のように導出できるものは保存せず、復元時に組み直します。変更はロックを保持したまま保存してから応答します。job投入だけは、保存に失敗すると500を返します。
+- job timeout: deadlineは壁時計時刻で保存するので、controllerの停止中も進みます。
+- 復元後のnode: heartbeatが届くまで`Unreachable`です。drainの意図は保たれます。
+- startup reconciliation(完了): 復元した、確認応答以降のexecution(`Accepted` / `Running` / `Cancelling`)は、そのnodeの最初のpollで確認します。nodeの実行中一覧にあれば継続し、なければprocessも未送信の結果も存在しないので`Lost`にします。通常運用中のpollは古い一覧を持ち得るため、この判定は復元されたexecutionに限ります。`Assigned`は再送されるので対象外です。
+- 未実装: node切断時の`Lost` / `Unknown`、手動retryとattempt履歴の操作、条件付きの自動retry、障害注入test。
+
+### 既知の制約
+
+- 保存の失敗は、job投入を除き、ログに残して次の保存で再試行するだけです。
+- 復元後に一度もpollしないnodeのexecutionは、`Running`のまま残ります。node切断時の処理で扱います。
+- DBは平文です。認証と暗号化はPhase 7で扱います。
+
 ## 9. Phase 7 — Security and Execution Isolation
 
 ### 目的

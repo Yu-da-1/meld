@@ -3,7 +3,8 @@
 use std::{
     error::Error,
     fmt,
-    sync::{Arc, RwLock},
+    ops::{Deref, DerefMut},
+    sync::{Arc, RwLock, RwLockWriteGuard},
     time::{Duration, Instant},
 };
 
@@ -33,6 +34,7 @@ use crate::{
     job_manager::{JobManager, JobManagerError},
     node_registry::{NodeRegistry, NodeRegistryError},
     scheduler::{Scheduler, SchedulingFailure},
+    store::{Persist, StateStore, StoreError},
 };
 
 pub const REGISTER_NODE_PATH: &str = "/v1/nodes/register";
@@ -57,6 +59,8 @@ pub struct ControllerState {
     jobs: Arc<RwLock<JobManager>>,
     /// Absent until configured; blob routes and file inputs then report 503.
     blobs: Option<Arc<BlobStore>>,
+    /// Absent for a controller that keeps its state in memory only.
+    store: Option<Arc<StateStore>>,
     /// How long outputs are protected from eviction after a job finishes.
     output_retention: Duration,
     command_updates: watch::Sender<u64>,
@@ -69,6 +73,7 @@ impl Default for ControllerState {
             registry: Arc::default(),
             jobs: Arc::default(),
             blobs: None,
+            store: None,
             output_retention: DEFAULT_OUTPUT_RETENTION,
             command_updates,
         }
@@ -94,6 +99,37 @@ impl ControllerState {
         self
     }
 
+    /// Makes controller state durable, first restoring whatever the store holds.
+    ///
+    /// From then on every change to nodes and jobs is written before the
+    /// request that made it is answered.
+    pub fn with_store(mut self, store: Arc<StateStore>) -> Result<Self, StoreError> {
+        self.registry = Arc::new(RwLock::new(NodeRegistry::restore(&store)?));
+        self.jobs = Arc::new(RwLock::new(JobManager::restore(&store)?));
+        self.store = Some(store);
+        Ok(self)
+    }
+
+    /// Locks the node registry for writing; changes are saved when the guard is released.
+    fn registry_mut(&self) -> Result<WriteGuard<'_, NodeRegistry>, ControllerStateError> {
+        self.write_guard(&self.registry)
+    }
+
+    /// Locks the job manager for writing; changes are saved when the guard is released.
+    fn jobs_mut(&self) -> Result<WriteGuard<'_, JobManager>, ControllerStateError> {
+        self.write_guard(&self.jobs)
+    }
+
+    fn write_guard<'a, T: Persist>(
+        &'a self,
+        lock: &'a RwLock<T>,
+    ) -> Result<WriteGuard<'a, T>, ControllerStateError> {
+        Ok(WriteGuard {
+            guard: lock.write().map_err(|_| ControllerStateError)?,
+            store: self.store.as_deref(),
+        })
+    }
+
     pub fn detect_unreachable_nodes(
         &self,
         detector: &FailureDetector,
@@ -104,7 +140,7 @@ impl ControllerState {
     }
 
     pub fn expire_jobs(&self, now: Instant) -> Result<Vec<JobId>, ControllerStateError> {
-        let mut jobs = self.jobs.write().map_err(|_| ControllerStateError)?;
+        let mut jobs = self.jobs_mut()?;
         let timed_out = jobs.expire_jobs_at(now).map_err(|error| {
             tracing::error!(%error, "job timeout processing failed");
             ControllerStateError
@@ -135,6 +171,48 @@ impl ControllerState {
                 }),
             })
             .collect())
+    }
+}
+
+/// A write lock that saves what changed under it when released.
+///
+/// The save happens while the lock is still held, so no other request can
+/// observe, or act on, a change that is not yet durable. Call
+/// [`WriteGuard::commit`] to learn whether the save worked; releasing the
+/// guard saves too but can only log a failure.
+struct WriteGuard<'a, T: Persist> {
+    guard: RwLockWriteGuard<'a, T>,
+    store: Option<&'a StateStore>,
+}
+
+impl<T: Persist> WriteGuard<'_, T> {
+    fn commit(&mut self) -> Result<(), StoreError> {
+        match self.store {
+            Some(store) => self.guard.save(store),
+            None => Ok(()),
+        }
+    }
+}
+
+impl<T: Persist> Deref for WriteGuard<'_, T> {
+    type Target = T;
+
+    fn deref(&self) -> &T {
+        &self.guard
+    }
+}
+
+impl<T: Persist> DerefMut for WriteGuard<'_, T> {
+    fn deref_mut(&mut self) -> &mut T {
+        &mut self.guard
+    }
+}
+
+impl<T: Persist> Drop for WriteGuard<'_, T> {
+    fn drop(&mut self) {
+        if let Err(error) = self.commit() {
+            tracing::error!(%error, "controller state could not be saved; it will be retried");
+        }
     }
 }
 
@@ -200,7 +278,7 @@ async fn report_execution_event(
     }
     drop(registry);
 
-    let mut jobs = match state.jobs.write() {
+    let mut jobs = match state.jobs_mut() {
         Ok(jobs) => jobs,
         Err(error) => {
             tracing::error!(node_id = %request.node_id, %error, "job manager lock is poisoned");
@@ -410,7 +488,7 @@ fn command_for_node(
         ));
     };
 
-    let mut jobs = match state.jobs.write() {
+    let mut jobs = match state.jobs_mut() {
         Ok(jobs) => jobs,
         Err(error) => {
             tracing::error!(node_id = %request.node_id, %error, "job manager lock is poisoned");
@@ -445,6 +523,24 @@ fn command_for_node(
                     }),
                 )
                     .into_response(),
+            ));
+        }
+    }
+
+    match jobs.reconcile_node(request.node_id, &request.active_execution_ids) {
+        Ok(lost) => {
+            for execution_id in lost {
+                tracing::warn!(
+                    node_id = %request.node_id,
+                    %execution_id,
+                    "execution is not running on its node after a controller restart; marked lost"
+                );
+            }
+        }
+        Err(error) => {
+            tracing::error!(node_id = %request.node_id, %error, "reconciliation failed");
+            return Err(Box::new(
+                (StatusCode::INTERNAL_SERVER_ERROR, "reconciliation failed").into_response(),
             ));
         }
     }
@@ -512,7 +608,7 @@ fn command_for_node(
 }
 
 async fn cancel_job(State(state): State<ControllerState>, Path(job_id): Path<JobId>) -> Response {
-    let mut jobs = match state.jobs.write() {
+    let mut jobs = match state.jobs_mut() {
         Ok(jobs) => jobs,
         Err(error) => {
             tracing::error!(%job_id, %error, "job manager lock is poisoned");
@@ -704,7 +800,7 @@ async fn job_logs(State(state): State<ControllerState>, Path(job_id): Path<JobId
 }
 
 async fn submit_job(State(state): State<ControllerState>, Json(spec): Json<JobSpec>) -> Response {
-    let mut jobs = match state.jobs.write() {
+    let mut jobs = match state.jobs_mut() {
         Ok(jobs) => jobs,
         Err(error) => {
             tracing::error!(%error, "job manager lock is poisoned");
@@ -726,6 +822,14 @@ async fn submit_job(State(state): State<ControllerState>, Json(spec): Json<JobSp
 
     match jobs.submit(spec) {
         Ok(job_id) => {
+            // Accepting a job is a promise to run it, so it must be durable first.
+            if let Err(error) = jobs.commit() {
+                tracing::error!(%error, "submitted job could not be saved");
+                return api_error(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "job could not be saved; retry the submission",
+                );
+            }
             drop(jobs);
             state.notify_command_update();
             (
@@ -979,7 +1083,7 @@ async fn resume_node(
 
 /// Stops or resumes new placements on a node; both directions are idempotent.
 fn set_node_draining(state: ControllerState, node_id: NodeId, draining: bool) -> Response {
-    let mut registry = match state.registry.write() {
+    let mut registry = match state.registry_mut() {
         Ok(registry) => registry,
         Err(error) => {
             tracing::error!(%node_id, %error, "node registry lock is poisoned");
@@ -1026,7 +1130,7 @@ async fn register_node(
     }
 
     let node_id = request.node.id;
-    let mut registry = match state.registry.write() {
+    let mut registry = match state.registry_mut() {
         Ok(registry) => registry,
         Err(error) => {
             tracing::error!(%node_id, %error, "node registry lock is poisoned");
@@ -1058,7 +1162,7 @@ async fn record_heartbeat(
         return response;
     }
 
-    let mut registry = match state.registry.write() {
+    let mut registry = match state.registry_mut() {
         Ok(registry) => registry,
         Err(error) => {
             tracing::error!(node_id = %request.node_id, %error, "node registry lock is poisoned");
@@ -2669,6 +2773,192 @@ mod tests {
             .expect("queued job should be schedulable")
             .expect("one job should be queued");
         (job_id, execution_id)
+    }
+
+    mod restart {
+        use meld_core::ExecutionOutput;
+        use tempfile::TempDir;
+
+        use super::*;
+
+        fn state_over(directory: &TempDir) -> ControllerState {
+            let store = StateStore::open(&directory.path().join("state.db"))
+                .expect("state database should open");
+            ControllerState::new()
+                .with_store(Arc::new(store))
+                .expect("stored state should restore")
+        }
+
+        async fn submit(state: &ControllerState) -> JobId {
+            let mut spec = job_spec();
+            spec.requirements.memory_bytes = 8_000;
+            let response = router(state.clone())
+                .oneshot(submit_job_json_request(spec))
+                .await
+                .expect("job submission should be handled");
+            assert_eq!(response.status(), StatusCode::ACCEPTED);
+            let body = to_bytes(response.into_body(), usize::MAX)
+                .await
+                .expect("response body should be readable");
+            serde_json::from_slice::<SubmitJobResponse>(&body)
+                .expect("response should contain submitted job JSON")
+                .job_id
+        }
+
+        #[tokio::test]
+        async fn jobs_nodes_and_drain_intent_survive_a_controller_restart() {
+            let directory = tempfile::tempdir().expect("temp dir");
+            let node_id = NodeId::generate();
+            let before = state_over(&directory);
+            {
+                let mut registry = before.registry_mut().expect("registry lock");
+                registry.register(descriptor(node_id));
+                registry
+                    .record_heartbeat(node_id, snapshot())
+                    .expect("registered node should accept heartbeat");
+            }
+            let running_job = submit(&before).await;
+            let queued_job = submit(&before).await;
+            let Some(NodeCommand::Start { assignment }) =
+                poll_for_command(&before, node_id, vec![]).await
+            else {
+                panic!("the first job should be assigned");
+            };
+            let execution_id = assignment.execution_id;
+            for event in [ExecutionEvent::Accepted, ExecutionEvent::Running] {
+                assert_eq!(
+                    report_event(before.clone(), node_id, execution_id, event).await,
+                    StatusCode::OK
+                );
+            }
+            assert_eq!(drain(&before, node_id).await.status(), StatusCode::OK);
+            drop(before);
+
+            let after = state_over(&directory);
+
+            let running = get_job_status(after.clone(), running_job).await;
+            assert_eq!(running.state, JobState::Running);
+            let queued = get_job_status(after.clone(), queued_job).await;
+            assert_eq!(queued.state, JobState::Queued);
+            // The node was last seen before the restart, so it is not yet Ready.
+            let nodes = after.node_views_at(Instant::now()).expect("node views");
+            assert_eq!(nodes.len(), 1);
+            assert_eq!(nodes[0].state, NodeState::Unreachable);
+            // Its drain intent was kept: reporting in again does not make it schedulable.
+            let heartbeat = router(after.clone())
+                .oneshot(heartbeat_json_request(HeartbeatRequest {
+                    metadata: RequestMetadata::new(),
+                    node_id,
+                    snapshot: snapshot(),
+                }))
+                .await
+                .expect("heartbeat should be handled");
+            assert_eq!(heartbeat.status(), StatusCode::OK);
+            let nodes = after.node_views_at(Instant::now()).expect("node views");
+            assert_eq!(nodes[0].state, NodeState::Draining);
+
+            // The restored execution carries on where it left off.
+            assert_eq!(
+                report_event(
+                    after.clone(),
+                    node_id,
+                    execution_id,
+                    ExecutionEvent::Finished {
+                        result: ExecutionResult { exit_code: Some(0) },
+                        output: ExecutionOutput::default(),
+                        outputs: vec![],
+                    },
+                )
+                .await,
+                StatusCode::OK
+            );
+            assert_eq!(
+                get_job_status(after.clone(), running_job).await.state,
+                JobState::Succeeded
+            );
+            assert_eq!(poll_for_command(&after, node_id, vec![]).await, None);
+            assert_eq!(resume(&after, node_id).await.status(), StatusCode::OK);
+            assert!(matches!(
+                poll_for_command(&after, node_id, vec![]).await,
+                Some(NodeCommand::Start { .. })
+            ));
+        }
+
+        #[tokio::test]
+        async fn execution_that_vanished_while_the_controller_was_down_is_marked_lost() {
+            let directory = tempfile::tempdir().expect("temp dir");
+            let node_id = NodeId::generate();
+            let before = state_over(&directory);
+            {
+                let mut registry = before.registry_mut().expect("registry lock");
+                registry.register(descriptor(node_id));
+                registry
+                    .record_heartbeat(node_id, snapshot())
+                    .expect("registered node should accept heartbeat");
+            }
+            let job_id = submit(&before).await;
+            let Some(NodeCommand::Start { assignment }) =
+                poll_for_command(&before, node_id, vec![]).await
+            else {
+                panic!("the job should be assigned");
+            };
+            for event in [ExecutionEvent::Accepted, ExecutionEvent::Running] {
+                assert_eq!(
+                    report_event(before.clone(), node_id, assignment.execution_id, event).await,
+                    StatusCode::OK
+                );
+            }
+            drop(before);
+
+            // The node restarted meanwhile and runs nothing.
+            let after = state_over(&directory);
+            assert_eq!(poll_for_command(&after, node_id, vec![]).await, None);
+
+            assert_eq!(
+                get_job_status(after.clone(), job_id).await.state,
+                JobState::Lost
+            );
+            drop(after);
+            // The verdict is durable.
+            let again = state_over(&directory);
+            assert_eq!(get_job_status(again, job_id).await.state, JobState::Lost);
+        }
+
+        #[tokio::test]
+        async fn results_reported_after_a_restart_are_durable_too() {
+            let directory = tempfile::tempdir().expect("temp dir");
+            let node_id = NodeId::generate();
+            let first = state_over(&directory);
+            let (job_id, execution_id) = {
+                {
+                    let mut registry = first.registry_mut().expect("registry lock");
+                    registry.register(descriptor(node_id));
+                    registry
+                        .record_heartbeat(node_id, snapshot())
+                        .expect("registered node should accept heartbeat");
+                }
+                let job_id = submit(&first).await;
+                let Some(NodeCommand::Start { assignment }) =
+                    poll_for_command(&first, node_id, vec![]).await
+                else {
+                    panic!("the job should be assigned");
+                };
+                (job_id, assignment.execution_id)
+            };
+            drop(first);
+
+            let second = state_over(&directory);
+            for event in [ExecutionEvent::Accepted, ExecutionEvent::Running] {
+                assert_eq!(
+                    report_event(second.clone(), node_id, execution_id, event).await,
+                    StatusCode::OK
+                );
+            }
+            drop(second);
+
+            let third = state_over(&directory);
+            assert_eq!(get_job_status(third, job_id).await.state, JobState::Running);
+        }
     }
 
     mod blobs {
