@@ -24,7 +24,7 @@ use meld_core::{
     MissingInputsResponse, NodeCommand, NodeId, NodeState, NodeStateResponse, NodeView, OutputFile,
     PollNodeCommandRequest, PollNodeCommandResponse, ProtocolError, ProtocolErrorResponse,
     QueueReason, RegisterNodeRequest, RegisterNodeResponse, ReportExecutionEventRequest,
-    ResponseMetadata, Sha256Digest, SubmitJobResponse,
+    ResponseMetadata, RetryJobRequest, RetryJobResponse, Sha256Digest, SubmitJobResponse,
 };
 use tokio::{sync::watch, time::timeout};
 use tokio_util::io::ReaderStream;
@@ -47,6 +47,7 @@ pub const SUBMIT_JOB_PATH: &str = "/v1/jobs";
 pub const JOB_STATUS_PATH: &str = "/v1/jobs/{job_id}";
 pub const JOB_LOGS_PATH: &str = "/v1/jobs/{job_id}/logs";
 pub const CANCEL_JOB_PATH: &str = "/v1/jobs/{job_id}/cancel";
+pub const RETRY_JOB_PATH: &str = "/v1/jobs/{job_id}/retry";
 pub const BLOB_PATH: &str = "/v1/blobs/{sha256}";
 pub const POLL_NODE_COMMAND_PATH: &str = "/v1/nodes/commands/poll";
 pub const REPORT_EXECUTION_EVENT_PATH: &str = "/v1/nodes/executions/events";
@@ -280,6 +281,7 @@ pub fn router(state: ControllerState) -> Router {
         .route(JOB_STATUS_PATH, get(job_status))
         .route(JOB_LOGS_PATH, get(job_logs))
         .route(CANCEL_JOB_PATH, post(cancel_job))
+        .route(RETRY_JOB_PATH, post(retry_job))
         .route(POLL_NODE_COMMAND_PATH, post(poll_node_command))
         .route(REPORT_EXECUTION_EVENT_PATH, post(report_execution_event))
         .with_state(state)
@@ -693,6 +695,56 @@ async fn cancel_job(State(state): State<ControllerState>, Path(job_id): Path<Job
         .into_response()
 }
 
+async fn retry_job(
+    State(state): State<ControllerState>,
+    Path(job_id): Path<JobId>,
+    Json(request): Json<RetryJobRequest>,
+) -> Response {
+    let mut jobs = match state.jobs_mut() {
+        Ok(jobs) => jobs,
+        Err(error) => {
+            tracing::error!(%job_id, %error, "job manager lock is poisoned");
+            return api_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "controller state is unavailable",
+            );
+        }
+    };
+    let Some(job) = jobs.job(job_id) else {
+        return api_error(StatusCode::NOT_FOUND, format!("job {job_id} was not found"));
+    };
+    // The inputs were pinned only while the job was unfinished; they may be gone.
+    if let Some(rejection) = check_inputs_are_stored(&state, job.spec()) {
+        return rejection;
+    }
+
+    let previous_attempts = match jobs.retry_job(job_id, request.allow_duplicate_run) {
+        Ok(attempts) => attempts,
+        Err(error) => {
+            return api_error(StatusCode::CONFLICT, error.to_string());
+        }
+    };
+    if let Err(error) = jobs.commit() {
+        tracing::error!(%job_id, %error, "retried job could not be saved");
+        return api_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "job could not be saved; retry the request",
+        );
+    }
+    drop(jobs);
+    state.notify_command_update();
+
+    (
+        StatusCode::ACCEPTED,
+        Json(RetryJobResponse {
+            job_id,
+            state: JobState::Queued,
+            previous_attempts,
+        }),
+    )
+        .into_response()
+}
+
 async fn job_status(State(state): State<ControllerState>, Path(job_id): Path<JobId>) -> Response {
     let registry = match state.registry.read() {
         Ok(registry) => registry,
@@ -737,6 +789,16 @@ async fn job_status(State(state): State<ControllerState>, Path(job_id): Path<Job
             state: execution.state(),
             result: execution.result(),
         });
+    let attempts = jobs
+        .attempts(job_id)
+        .into_iter()
+        .map(|execution| ExecutionView {
+            execution_id: execution.id(),
+            node_id: execution.node_id(),
+            state: execution.state(),
+            result: execution.result(),
+        })
+        .collect();
     let latest_execution_id = execution.map(|view| view.execution_id);
     let data_failure = latest_execution_id.and_then(|id| jobs.data_failure(id).cloned());
     let outputs = latest_execution_id
@@ -783,6 +845,7 @@ async fn job_status(State(state): State<ControllerState>, Path(job_id): Path<Job
         state: job.state(),
         queue_reason,
         execution,
+        attempts,
         data_failure,
         outputs,
         placement,
@@ -2814,6 +2877,184 @@ mod tests {
             .expect("queued job should be schedulable")
             .expect("one job should be queued");
         (job_id, execution_id)
+    }
+
+    mod retry {
+        use meld_core::{ExecutionOutput, Sha256Digest};
+
+        use super::*;
+
+        async fn json<T: serde::de::DeserializeOwned>(response: Response) -> T {
+            let body = to_bytes(response.into_body(), usize::MAX)
+                .await
+                .expect("response body should be readable");
+            serde_json::from_slice(&body).expect("response should contain JSON")
+        }
+
+        fn retry_request(job_id: JobId, allow_duplicate_run: bool) -> Request<Body> {
+            Request::builder()
+                .method("POST")
+                .uri(format!("/v1/jobs/{job_id}/retry"))
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    serde_json::to_vec(&RetryJobRequest {
+                        allow_duplicate_run,
+                    })
+                    .expect("request should serialize"),
+                ))
+                .expect("HTTP request should be valid")
+        }
+
+        async fn retry(state: &ControllerState, job_id: JobId, force: bool) -> Response {
+            router(state.clone())
+                .oneshot(retry_request(job_id, force))
+                .await
+                .expect("retry should be handled")
+        }
+
+        async fn fail(state: &ControllerState, node_id: NodeId, execution_id: ExecutionId) {
+            for event in [
+                ExecutionEvent::Accepted,
+                ExecutionEvent::Running,
+                ExecutionEvent::Finished {
+                    result: ExecutionResult { exit_code: Some(2) },
+                    output: ExecutionOutput::default(),
+                    outputs: vec![],
+                },
+            ] {
+                assert_eq!(
+                    report_event(state.clone(), node_id, execution_id, event).await,
+                    StatusCode::OK
+                );
+            }
+        }
+
+        #[tokio::test]
+        async fn failed_job_is_retried_as_a_second_attempt_on_the_same_job() {
+            let state = ControllerState::new();
+            let node_id = NodeId::generate();
+            let (job_id, first) = assigned_execution(&state, node_id);
+            fail(&state, node_id, first).await;
+            assert_eq!(
+                get_job_status(state.clone(), job_id).await.state,
+                JobState::Failed
+            );
+
+            let response = retry(&state, job_id, false).await;
+
+            assert_eq!(response.status(), StatusCode::ACCEPTED);
+            let body: RetryJobResponse = json(response).await;
+            assert_eq!(body.state, JobState::Queued);
+            assert_eq!(body.previous_attempts, 1);
+            let Some(NodeCommand::Start { assignment }) =
+                poll_for_command(&state, node_id, vec![]).await
+            else {
+                panic!("the retried job should be assigned");
+            };
+            assert_eq!(assignment.job_id, job_id);
+            assert_ne!(assignment.execution_id, first);
+            let status = get_job_status(state.clone(), job_id).await;
+            assert_eq!(
+                status
+                    .attempts
+                    .iter()
+                    .map(|attempt| attempt.execution_id)
+                    .collect::<Vec<_>>(),
+                vec![first, assignment.execution_id]
+            );
+            assert_eq!(status.attempts[0].state, ExecutionState::Failed);
+        }
+
+        #[tokio::test]
+        async fn lost_job_is_retried_only_with_explicit_consent() {
+            let state = ControllerState::new();
+            let node_id = NodeId::generate();
+            let (job_id, execution_id) = assigned_execution(&state, node_id);
+            for event in [ExecutionEvent::Accepted, ExecutionEvent::Running] {
+                report_event(state.clone(), node_id, execution_id, event).await;
+            }
+            state
+                .jobs_mut()
+                .expect("job lock")
+                .mark_execution_lost(execution_id)
+                .expect("lost");
+
+            let refused = retry(&state, job_id, false).await;
+            assert_eq!(refused.status(), StatusCode::CONFLICT);
+            let message: ApiErrorResponse = json(refused).await;
+            assert!(
+                message.error.contains("may still be running"),
+                "{}",
+                message.error
+            );
+            assert_eq!(
+                get_job_status(state.clone(), job_id).await.state,
+                JobState::Lost
+            );
+
+            let accepted = retry(&state, job_id, true).await;
+            assert_eq!(accepted.status(), StatusCode::ACCEPTED);
+            assert_eq!(
+                get_job_status(state.clone(), job_id).await.state,
+                JobState::Queued
+            );
+        }
+
+        #[tokio::test]
+        async fn running_and_unknown_jobs_cannot_be_retried() {
+            let state = ControllerState::new();
+            let node_id = NodeId::generate();
+            let (job_id, _) = assigned_execution(&state, node_id);
+
+            assert_eq!(
+                retry(&state, job_id, true).await.status(),
+                StatusCode::CONFLICT
+            );
+            assert_eq!(
+                retry(&state, JobId::generate(), true).await.status(),
+                StatusCode::NOT_FOUND
+            );
+        }
+
+        #[tokio::test]
+        async fn retry_is_refused_when_the_job_inputs_are_no_longer_stored() {
+            let directory = tempfile::tempdir().expect("temp dir");
+            let blobs = crate::blob_store::BlobStore::new(
+                directory.path(),
+                crate::blob_store::BlobLimits::default(),
+            )
+            .expect("blob store");
+            let state = ControllerState::new().with_blob_store(Arc::new(blobs));
+            let node_id = NodeId::generate();
+            register_ready_node(&state, node_id);
+            let mut spec = job_spec();
+            spec.requirements.memory_bytes = 8_000;
+            spec.data.inputs.push(meld_core::InputFile {
+                path: "in.txt".to_owned(),
+                sha256: Sha256Digest::from_bytes([9; 32]),
+                size_bytes: 3,
+                executable: false,
+            });
+            // Put the job straight into a failed state; its input was never stored.
+            let job_id = {
+                let mut jobs = state.jobs_mut().expect("job lock");
+                let job_id = jobs.submit(spec).expect("submit");
+                let registry = state.registry.read().expect("registry lock");
+                let execution = jobs
+                    .schedule(job_id, &Scheduler::new(), &registry)
+                    .expect("schedule");
+                jobs.fail_execution_start(execution).expect("fail");
+                job_id
+            };
+
+            let response = retry(&state, job_id, false).await;
+
+            assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
+            assert_eq!(
+                get_job_status(state.clone(), job_id).await.state,
+                JobState::Failed
+            );
+        }
     }
 
     mod silent_nodes {

@@ -288,7 +288,12 @@ processやnetworkの障害を状態として扱い、controller再起動後に�
 - startup reconciliation(完了): 復元した、確認応答以降のexecution(`Accepted` / `Running` / `Cancelling`)は、そのnodeの最初のpollで確認します。nodeの実行中一覧にあれば継続し、なければprocessも未送信の結果も存在しないので`Lost`にします。通常運用中のpollは古い一覧を持ち得るため、この判定は復元されたexecutionに限ります。`Assigned`は再送されるので対象外です。
 - node切断(完了): nodeが`Unreachable`のまま`MELD_HEARTBEAT_TIMEOUT_SECS`に`MELD_LOST_GRACE_SECS`(既定30秒)を足した時間を超えると、そのnodeのexecutionを整理します。確認応答前の`Assigned`はprocessが起動していないので、jobをキューの先頭へ戻して別のnodeへ配置します。確認応答済みのexecutionは、processが生きている可能性があるので`Lost`にします。復元直後でheartbeatの記録がないnodeは、controllerの起動時刻から数えます。
 - `Lost`は最終状態ではありません: 通信断はprocessの停止を意味しないので、nodeが戻って終了(成功、失敗、cancel、timeout)を報告したら、その結果が`Lost`を置き換えます。`Lost`から`Accepted`や`Running`などの前の段階へは戻りません。
-- 未実装: 手動retryとattempt履歴の操作、条件付きの自動retry、障害注入test。
+- 手動retry(完了): `meld retry <job>`が、`Failed` / `TimedOut` / `Cancelled` / `Lost`のjobを同じjob IDのまま`Queued`に戻し、次の配置で新しいexecutionを作ります。以前のattemptの記録はそのまま残り、`meld status`が全attemptを古い順に表示します。キューでは、すでに待っているjobの後ろに並びます。`Succeeded`や未完了のjobは対象外です。job timeoutは新しいattemptごとに数え直します。
+  - 同じ効果は`POST /v1/jobs/{id}/retry`で得られます。retryは通常の状態遷移の表には入れず、`Job::retry`だけが行います。nodeの報告が完了済みのjobをキューに戻すことはありません。
+  - `Lost`のjobは元のprocessがまだ動いている可能性があり、二重に実行し得ます。そのため`--allow-duplicate-run`を付けない限り拒否します。
+  - retryで置き換えられた古いattemptが後から結果を報告しても、jobには反映しません(409)。新しいattemptが走っているjobを、古い結果で完了させないためです。
+  - 入力fileの保持はjobが未完了の間だけなので、retry時に入力がcontrollerから消えていれば422で拒否します。その場合は`meld run`で投入し直します。
+- 未実装: 条件付きの自動retryとbackoff、障害注入test。
 
 ### 既知の制約
 

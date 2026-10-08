@@ -740,4 +740,40 @@ mod tests {
                 .is_some()
         );
     }
+
+    #[test]
+    fn a_retry_and_its_attempt_history_survive_a_restart() {
+        let store = StateStore::open_in_memory().expect("store");
+        let registry = registry(1);
+        let scheduler = Scheduler::new();
+        let mut manager = JobManager::new();
+        let job = manager.submit(spec()).expect("submit");
+        let first = manager
+            .schedule(job, &scheduler, &registry)
+            .expect("schedule");
+        manager.accept_execution(first).expect("accept");
+        manager.start_execution(first).expect("start");
+        manager
+            .finish_execution(first, ExecutionResult { exit_code: Some(1) })
+            .expect("finish");
+        manager.retry_job(job, false).expect("retry");
+        let other = manager.submit(spec()).expect("submit");
+
+        let mut after = restored(&mut manager, &store);
+
+        assert_eq!(after.job(job).map(|j| j.state()), Some(JobState::Queued));
+        assert_eq!(after.pending_position(job), Some(0));
+        assert_eq!(after.pending_position(other), Some(1));
+        let second = after
+            .schedule(job, &scheduler, &registry)
+            .expect("schedule");
+        assert_eq!(
+            after
+                .attempts(job)
+                .iter()
+                .map(|e| e.id())
+                .collect::<Vec<_>>(),
+            vec![first, second]
+        );
+    }
 }

@@ -720,6 +720,51 @@ impl JobManager {
         Ok(())
     }
 
+    /// Queues a new attempt of a job that ended unsuccessfully.
+    ///
+    /// The earlier attempts stay as they are; the next placement adds a new
+    /// execution beside them. A lost job's process may still be running, so
+    /// retrying it can run the work twice, and that must be asked for.
+    ///
+    /// Returns how many attempts the job had made.
+    pub fn retry_job(
+        &mut self,
+        job_id: JobId,
+        allow_duplicate_run: bool,
+    ) -> Result<u32, JobManagerError> {
+        let job = self
+            .jobs
+            .get(&job_id)
+            .ok_or(JobManagerError::JobNotFound(job_id))?;
+        if job.state() == JobState::Lost && !allow_duplicate_run {
+            return Err(JobManagerError::RetryMayDuplicate(job_id));
+        }
+        let has_job_timeout = job.spec().job_timeout_secs.is_some();
+
+        self.jobs
+            .get_mut(&job_id)
+            .expect("job was verified above")
+            .retry()
+            .map_err(JobManagerError::InvalidJobState)?;
+        self.pending_jobs.push_back(job_id);
+        self.queue_dirty = true;
+        if has_job_timeout {
+            // The deadline bounds one run of the job, so a new attempt gets a fresh one.
+            self.job_submitted_at.insert(job_id, Instant::now());
+        }
+        Ok(self.attempts(job_id).len() as u32)
+    }
+
+    /// Every attempt of a job, oldest first.
+    pub fn attempts(&self, job_id: JobId) -> Vec<&Execution> {
+        self.execution_ids_by_job
+            .get(&job_id)
+            .into_iter()
+            .flatten()
+            .filter_map(|execution_id| self.executions.get(execution_id))
+            .collect()
+    }
+
     /// Settles restored executions of one node against what the node reports running.
     ///
     /// After a restart the controller knows what it last recorded, not what
@@ -958,6 +1003,14 @@ impl JobManager {
             .executions
             .get(&execution_id)
             .ok_or(JobManagerError::ExecutionNotFound(execution_id))?;
+        // An attempt that a retry replaced must not drive the job any more:
+        // its late result would otherwise complete the job under the new attempt.
+        if self
+            .latest_execution_for_job(execution.job_id())
+            .is_some_and(|latest| latest.id() != execution_id)
+        {
+            return Err(JobManagerError::SupersededExecution(execution_id));
+        }
         if !execution.state().can_transition_to(execution_target) {
             return Err(JobManagerError::InvalidExecutionState(
                 InvalidStateTransition::new(execution.state(), execution_target),
@@ -1018,12 +1071,19 @@ pub enum JobManagerError {
     JobNotFound(JobId),
     JobHasNoExecution(JobId),
     ExecutionNotFound(ExecutionId),
-    JobNotQueued { job_id: JobId, state: JobState },
+    JobNotQueued {
+        job_id: JobId,
+        state: JobState,
+    },
     InvalidJobState(InvalidStateTransition<JobState>),
     InvalidExecutionState(InvalidStateTransition<ExecutionState>),
     ExecutionCompletion(ExecutionCompletionError),
     ConflictingExecutionOutput(ExecutionId),
     Scheduling(SchedulingFailure),
+    /// The job is lost and may still be running; retrying needs explicit consent.
+    RetryMayDuplicate(JobId),
+    /// A retry gave the job a newer attempt, so this one no longer counts.
+    SupersededExecution(ExecutionId),
 }
 
 impl fmt::Display for JobManagerError {
@@ -1053,6 +1113,15 @@ impl fmt::Display for JobManagerError {
                 )
             }
             Self::Scheduling(error) => error.fmt(formatter),
+            Self::RetryMayDuplicate(job_id) => write!(
+                formatter,
+                "job {job_id} is lost: its process may still be running on the node, \
+                 so retrying could run it twice; confirm to retry anyway"
+            ),
+            Self::SupersededExecution(execution_id) => write!(
+                formatter,
+                "execution {execution_id} was replaced by a later attempt of its job"
+            ),
         }
     }
 }
@@ -1731,6 +1800,162 @@ mod tests {
         assert_eq!(
             manager.execution(execution_id).map(Execution::state),
             Some(ExecutionState::Succeeded)
+        );
+    }
+
+    fn run_to_failure(
+        manager: &mut JobManager,
+        job_id: JobId,
+        registry: &NodeRegistry,
+    ) -> ExecutionId {
+        let execution_id = manager
+            .schedule(job_id, &Scheduler::new(), registry)
+            .expect("schedule");
+        manager.accept_execution(execution_id).expect("accept");
+        manager.start_execution(execution_id).expect("start");
+        manager
+            .finish_execution(execution_id, ExecutionResult { exit_code: Some(1) })
+            .expect("finish");
+        execution_id
+    }
+
+    #[test]
+    fn retrying_a_failed_job_adds_a_new_attempt_beside_the_old_one() {
+        let (registry, _) = ready_registry();
+        let mut manager = JobManager::new();
+        let job_id = manager.submit(spec()).expect("submit");
+        let first = run_to_failure(&mut manager, job_id, &registry);
+
+        let previous = manager.retry_job(job_id, false).expect("retry");
+        let second = manager
+            .schedule(job_id, &Scheduler::new(), &registry)
+            .expect("the retried job is placed again");
+
+        assert_eq!(previous, 1);
+        assert_ne!(first, second);
+        assert_eq!(
+            manager.job(job_id).map(Job::state),
+            Some(JobState::Assigned)
+        );
+        assert_eq!(
+            manager
+                .attempts(job_id)
+                .iter()
+                .map(|e| e.id())
+                .collect::<Vec<_>>(),
+            vec![first, second]
+        );
+        assert_eq!(
+            manager.execution(first).map(Execution::state),
+            Some(ExecutionState::Failed),
+            "the earlier attempt keeps its record"
+        );
+    }
+
+    #[test]
+    fn a_retried_job_waits_behind_jobs_already_queued() {
+        let (registry, _) = ready_registry();
+        let mut manager = JobManager::new();
+        let failed = manager.submit(spec()).expect("submit");
+        run_to_failure(&mut manager, failed, &registry);
+        let waiting = manager.submit(spec()).expect("submit");
+
+        manager.retry_job(failed, false).expect("retry");
+
+        assert_eq!(manager.pending_position(waiting), Some(0));
+        assert_eq!(manager.pending_position(failed), Some(1));
+    }
+
+    #[test]
+    fn only_unsuccessful_jobs_can_be_retried() {
+        let (registry, _) = ready_registry();
+        let mut manager = JobManager::new();
+        let queued = manager.submit(spec()).expect("submit");
+        assert!(matches!(
+            manager.retry_job(queued, false),
+            Err(JobManagerError::InvalidJobState(_))
+        ));
+
+        let succeeded = manager.submit(spec()).expect("submit");
+        let execution = manager
+            .schedule(succeeded, &Scheduler::new(), &registry)
+            .expect("schedule");
+        manager.accept_execution(execution).expect("accept");
+        manager.start_execution(execution).expect("start");
+        manager
+            .finish_execution(execution, ExecutionResult { exit_code: Some(0) })
+            .expect("finish");
+        assert!(matches!(
+            manager.retry_job(succeeded, true),
+            Err(JobManagerError::InvalidJobState(_))
+        ));
+        assert_eq!(
+            manager.job(succeeded).map(Job::state),
+            Some(JobState::Succeeded)
+        );
+        assert!(matches!(
+            manager.retry_job(JobId::generate(), false),
+            Err(JobManagerError::JobNotFound(_))
+        ));
+    }
+
+    #[test]
+    fn retrying_a_lost_job_needs_consent_because_it_may_run_twice() {
+        let (mut manager, job_id, execution_id) = assigned_job();
+        let node_id = manager.execution(execution_id).expect("stored").node_id();
+        manager.accept_execution(execution_id).expect("accept");
+        manager.start_execution(execution_id).expect("start");
+        manager
+            .give_up_on_nodes(&BTreeSet::from([node_id]))
+            .expect("lost");
+
+        assert_eq!(
+            manager.retry_job(job_id, false),
+            Err(JobManagerError::RetryMayDuplicate(job_id))
+        );
+        assert_eq!(manager.job(job_id).map(Job::state), Some(JobState::Lost));
+
+        manager.retry_job(job_id, true).expect("consented retry");
+        assert_eq!(manager.job(job_id).map(Job::state), Some(JobState::Queued));
+    }
+
+    #[test]
+    fn late_result_of_a_replaced_attempt_does_not_complete_the_job() {
+        let (registry, node_id) = ready_registry_with_limit(2);
+        let mut manager = JobManager::new();
+        let job_id = manager.submit(spec()).expect("submit");
+        let first = manager
+            .schedule(job_id, &Scheduler::new(), &registry)
+            .expect("schedule");
+        manager.accept_execution(first).expect("accept");
+        manager.start_execution(first).expect("start");
+        manager
+            .give_up_on_nodes(&BTreeSet::from([node_id]))
+            .expect("lost");
+        manager.retry_job(job_id, true).expect("retry");
+        let second = manager
+            .schedule(job_id, &Scheduler::new(), &registry)
+            .expect("schedule");
+        manager.accept_execution(second).expect("accept");
+        manager.start_execution(second).expect("start");
+
+        // The first process turns out to have finished after all.
+        let error = manager
+            .finish_execution(first, ExecutionResult { exit_code: Some(0) })
+            .expect_err("a replaced attempt must not drive the job");
+
+        assert_eq!(error, JobManagerError::SupersededExecution(first));
+        assert_eq!(manager.job(job_id).map(Job::state), Some(JobState::Running));
+        assert_eq!(
+            manager.execution(first).map(Execution::state),
+            Some(ExecutionState::Lost)
+        );
+        manager
+            .finish_execution(second, ExecutionResult { exit_code: Some(0) })
+            .expect("the current attempt still completes the job");
+        assert_eq!(
+            manager.job(job_id).map(Job::state),
+            Some(JobState::Succeeded)
         );
     }
 

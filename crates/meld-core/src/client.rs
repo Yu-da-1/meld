@@ -75,6 +75,22 @@ pub struct SubmitJobResponse {
     pub state: JobState,
 }
 
+/// Asks for a new attempt of a job that ended unsuccessfully.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RetryJobRequest {
+    /// Retry a lost job even though its first process may still be running.
+    #[serde(default)]
+    pub allow_duplicate_run: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RetryJobResponse {
+    pub job_id: JobId,
+    pub state: JobState,
+    /// Attempts made before this retry.
+    pub previous_attempts: u32,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CancelJobResponse {
     pub job_id: JobId,
@@ -88,6 +104,9 @@ pub struct JobStatusResponse {
     pub state: JobState,
     pub queue_reason: Option<QueueReason>,
     pub execution: Option<ExecutionView>,
+    /// Every attempt so far, oldest first. `execution` is the last of them.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub attempts: Vec<ExecutionView>,
     /// Why the latest execution failed to move the job's data, if it did.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub data_failure: Option<DataFailure>,

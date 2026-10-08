@@ -212,6 +212,21 @@ impl Job {
         self.state.transition_to(JobState::Cancelled)
     }
 
+    /// Returns a job that ended unsuccessfully to the queue for a new attempt.
+    ///
+    /// This is deliberately not part of [`JobState::can_transition_to`]: that
+    /// table also validates events reported by nodes, and a stray report must
+    /// never be able to requeue a finished job. Only an explicit retry can.
+    pub fn retry(&mut self) -> Result<(), InvalidStateTransition<JobState>> {
+        match self.state {
+            JobState::Failed | JobState::TimedOut | JobState::Cancelled | JobState::Lost => {
+                self.state = JobState::Queued;
+                Ok(())
+            }
+            state => Err(InvalidStateTransition::new(state, JobState::Queued)),
+        }
+    }
+
     pub fn mark_succeeded(&mut self) -> Result<(), InvalidStateTransition<JobState>> {
         self.state.transition_to(JobState::Succeeded)
     }
@@ -525,6 +540,58 @@ mod tests {
         assert_eq!(state, JobState::Succeeded);
         assert!(JobState::Lost.transition_to(JobState::Running).is_err());
         assert!(JobState::Lost.transition_to(JobState::Queued).is_err());
+    }
+
+    #[test]
+    fn only_an_unsuccessful_job_can_be_retried() {
+        for state in [
+            JobState::Failed,
+            JobState::TimedOut,
+            JobState::Cancelled,
+            JobState::Lost,
+        ] {
+            let mut job = job_in(state);
+            job.retry().expect("an unsuccessful job can be retried");
+            assert_eq!(job.state(), JobState::Queued);
+        }
+        for state in [
+            JobState::Submitted,
+            JobState::Queued,
+            JobState::Assigned,
+            JobState::Running,
+            JobState::Cancelling,
+            JobState::TimingOut,
+            JobState::Succeeded,
+        ] {
+            let mut job = job_in(state);
+            assert!(job.retry().is_err(), "{state:?} must not be retryable");
+            assert_eq!(job.state(), state);
+        }
+    }
+
+    #[test]
+    fn a_reported_event_cannot_requeue_a_finished_job() {
+        for state in [JobState::Failed, JobState::TimedOut, JobState::Cancelled] {
+            assert!(!state.can_transition_to(JobState::Queued));
+        }
+    }
+
+    fn job_in(state: JobState) -> Job {
+        let mut job = Job::new(JobSpec {
+            program: "true".to_owned(),
+            args: vec![],
+            requirements: ResourceRequirements {
+                logical_cpus: 1,
+                memory_bytes: 1,
+            },
+            job_timeout_secs: None,
+            execution_timeout_secs: None,
+            constraints: PlacementConstraints::default(),
+            data: DataSpec::default(),
+        })
+        .expect("valid spec");
+        job.state = state;
+        job
     }
 
     #[test]

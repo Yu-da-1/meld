@@ -148,6 +148,17 @@ enum Commands {
     /// Request cancellation of one job.
     Cancel { job_id: JobId },
 
+    /// Run a job again as a new attempt, after it failed, timed out, was
+    /// cancelled, or was lost.
+    Retry {
+        job_id: JobId,
+
+        /// Retry a lost job even though its first process may still be
+        /// running on the node, which could run the work twice.
+        #[arg(long)]
+        allow_duplicate_run: bool,
+    },
+
     /// List nodes with their state, capacity, and latest usage.
     Nodes,
 
@@ -187,6 +198,10 @@ async fn run() -> Result<(), Box<dyn Error>> {
             force,
         } => fetch_job_outputs(&client, job_id, FetchOptions { out_dir, force }).await?,
         Commands::Cancel { job_id } => cancel_job(&client, job_id).await?,
+        Commands::Retry {
+            job_id,
+            allow_duplicate_run,
+        } => retry_job(&client, job_id, allow_duplicate_run).await?,
         Commands::Nodes => show_nodes(&client).await?,
         Commands::Drain { node_id } => print_node_state(client.drain(node_id).await?),
         Commands::Resume { node_id } => print_node_state(client.resume(node_id).await?),
@@ -322,6 +337,18 @@ async fn show_status(client: &ControllerClient, job_id: JobId) -> Result<(), Box
             );
         }
     }
+    if response.attempts.len() > 1 {
+        println!("attempts:");
+        for (index, attempt) in response.attempts.iter().enumerate() {
+            println!(
+                "  {}: {} on {} ({})",
+                index + 1,
+                attempt.execution_id,
+                attempt.node_id,
+                execution_state_name(attempt.state)
+            );
+        }
+    }
     if let Some(execution) = response.execution {
         println!("execution_id: {}", execution.execution_id);
         println!("node_id: {}", execution.node_id);
@@ -363,6 +390,19 @@ async fn cancel_job(client: &ControllerClient, job_id: JobId) -> Result<(), Box<
 
     println!("job_id: {}", response.job_id);
     println!("state: {}", job_state_name(response.state));
+    Ok(())
+}
+
+async fn retry_job(
+    client: &ControllerClient,
+    job_id: JobId,
+    allow_duplicate_run: bool,
+) -> Result<(), Box<dyn Error>> {
+    let response = client.retry(job_id, allow_duplicate_run).await?;
+
+    println!("job_id: {}", response.job_id);
+    println!("state: {}", job_state_name(response.state));
+    println!("attempt: {}", response.previous_attempts + 1);
     Ok(())
 }
 

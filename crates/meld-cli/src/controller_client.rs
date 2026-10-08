@@ -3,7 +3,7 @@ use std::{error::Error, fmt, path::Path, time::Duration};
 use meld_core::{
     ApiErrorResponse, BlobResponse, CancelJobResponse, JobId, JobLogsResponse, JobSpec,
     JobStatusResponse, ListNodesResponse, MissingInputsResponse, NodeId, NodeStateResponse,
-    Sha256Digest, SubmitJobResponse,
+    RetryJobRequest, RetryJobResponse, Sha256Digest, SubmitJobResponse,
 };
 use reqwest::{Body, Client, Response, StatusCode, Url, header::CONTENT_LENGTH};
 use serde::de::DeserializeOwned;
@@ -149,6 +149,24 @@ impl ControllerClient {
         let response = self
             .http
             .post(self.endpoint(&format!("v1/jobs/{job_id}/cancel")))
+            .send()
+            .await
+            .map_err(ControllerClientError::Request)?;
+        decode_response(response).await
+    }
+
+    /// Queues a new attempt of a job that ended unsuccessfully.
+    pub async fn retry(
+        &self,
+        job_id: JobId,
+        allow_duplicate_run: bool,
+    ) -> Result<RetryJobResponse, ControllerClientError> {
+        let response = self
+            .http
+            .post(self.endpoint(&format!("v1/jobs/{job_id}/retry")))
+            .json(&RetryJobRequest {
+                allow_duplicate_run,
+            })
             .send()
             .await
             .map_err(ControllerClientError::Request)?;

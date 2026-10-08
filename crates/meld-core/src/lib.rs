@@ -13,7 +13,8 @@ mod transition;
 pub use client::{
     ApiErrorResponse, BlobResponse, CancelJobResponse, ExecutionView, JobLogsResponse,
     JobStatusResponse, LimitedResource, ListNodesResponse, MissingInputsResponse, NodeAssessment,
-    NodeStateResponse, NodeVerdict, NodeView, QueueReason, SubmitJobResponse,
+    NodeStateResponse, NodeVerdict, NodeView, QueueReason, RetryJobRequest, RetryJobResponse,
+    SubmitJobResponse,
 };
 pub use data::{
     DataFailure, DataSpec, DataSpecError, InputFile, InvalidDigest, InvalidPath, MAX_FILE_BYTES,
