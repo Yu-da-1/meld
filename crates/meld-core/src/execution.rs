@@ -118,6 +118,8 @@ pub enum ExecutionState {
     TimedOut,
     Rejected,
     /// The controller can no longer determine whether the process is running.
+    ///
+    /// Not final: a later report of how the process ended replaces it.
     Lost,
 }
 
@@ -147,6 +149,11 @@ impl ExecutionState {
                 ) | (
                     Self::Cancelling,
                     Self::Succeeded | Self::Failed | Self::Cancelled | Self::TimedOut | Self::Lost
+                ) | (
+                    // Losing contact does not stop the process. If the node
+                    // returns with how it ended, that outcome is the truth.
+                    Self::Lost,
+                    Self::Succeeded | Self::Failed | Self::Cancelled | Self::TimedOut
                 )
             )
     }
@@ -259,6 +266,36 @@ mod tests {
             .expect("process may finish before cancellation");
 
         assert_eq!(state, ExecutionState::Succeeded);
+    }
+
+    #[test]
+    fn lost_execution_takes_the_outcome_a_returning_node_reports() {
+        for outcome in [
+            ExecutionState::Succeeded,
+            ExecutionState::Failed,
+            ExecutionState::Cancelled,
+            ExecutionState::TimedOut,
+        ] {
+            let mut state = ExecutionState::Lost;
+            state
+                .transition_to(outcome)
+                .expect("a reported outcome replaces Lost");
+            assert_eq!(state, outcome);
+        }
+    }
+
+    #[test]
+    fn lost_execution_does_not_go_back_to_earlier_stages() {
+        for earlier in [
+            ExecutionState::Assigned,
+            ExecutionState::Accepted,
+            ExecutionState::Running,
+            ExecutionState::Rejected,
+        ] {
+            let mut state = ExecutionState::Lost;
+            assert!(state.transition_to(earlier).is_err());
+            assert_eq!(state, ExecutionState::Lost);
+        }
     }
 
     #[test]

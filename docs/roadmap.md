@@ -286,12 +286,14 @@ processやnetworkの障害を状態として扱い、controller再起動後に�
 - job timeout: deadlineは壁時計時刻で保存するので、controllerの停止中も進みます。
 - 復元後のnode: heartbeatが届くまで`Unreachable`です。drainの意図は保たれます。
 - startup reconciliation(完了): 復元した、確認応答以降のexecution(`Accepted` / `Running` / `Cancelling`)は、そのnodeの最初のpollで確認します。nodeの実行中一覧にあれば継続し、なければprocessも未送信の結果も存在しないので`Lost`にします。通常運用中のpollは古い一覧を持ち得るため、この判定は復元されたexecutionに限ります。`Assigned`は再送されるので対象外です。
-- 未実装: node切断時の`Lost` / `Unknown`、手動retryとattempt履歴の操作、条件付きの自動retry、障害注入test。
+- node切断(完了): nodeが`Unreachable`のまま`MELD_HEARTBEAT_TIMEOUT_SECS`に`MELD_LOST_GRACE_SECS`(既定30秒)を足した時間を超えると、そのnodeのexecutionを整理します。確認応答前の`Assigned`はprocessが起動していないので、jobをキューの先頭へ戻して別のnodeへ配置します。確認応答済みのexecutionは、processが生きている可能性があるので`Lost`にします。復元直後でheartbeatの記録がないnodeは、controllerの起動時刻から数えます。
+- `Lost`は最終状態ではありません: 通信断はprocessの停止を意味しないので、nodeが戻って終了(成功、失敗、cancel、timeout)を報告したら、その結果が`Lost`を置き換えます。`Lost`から`Accepted`や`Running`などの前の段階へは戻りません。
+- 未実装: 手動retryとattempt履歴の操作、条件付きの自動retry、障害注入test。
 
 ### 既知の制約
 
 - 保存の失敗は、job投入を除き、ログに残して次の保存で再試行するだけです。
-- 復元後に一度もpollしないnodeのexecutionは、`Running`のまま残ります。node切断時の処理で扱います。
+- `Lost`にした後もprocessが動き続けている場合、controllerの帳簿上は資源が空いたことになり、そのnodeへ過剰に配置し得ます。nodeが戻って結果を報告するまでの間です。
 - DBは平文です。認証と暗号化はPhase 7で扱います。
 
 ## 9. Phase 7 — Security and Execution Isolation

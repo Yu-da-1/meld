@@ -20,6 +20,9 @@ use tracing_subscriber::EnvFilter;
 
 const HEARTBEAT_TIMEOUT_ENV: &str = "MELD_HEARTBEAT_TIMEOUT_SECS";
 const DEFAULT_HEARTBEAT_TIMEOUT_SECS: u64 = 15;
+/// How long an unreachable node may stay silent before its executions are given up on.
+const LOST_GRACE_ENV: &str = "MELD_LOST_GRACE_SECS";
+const DEFAULT_LOST_GRACE_SECS: u64 = 30;
 const LIVENESS_CHECK_INTERVAL: Duration = Duration::from_secs(1);
 const STATE_DB_FILE: &str = "state.db";
 const STATE_DIR_ENV: &str = "MELD_CONTROLLER_STATE_DIR";
@@ -40,6 +43,10 @@ async fn main() -> Result<(), Box<dyn Error>> {
     let bind_address =
         env::var("MELD_CONTROLLER_ADDR").unwrap_or_else(|_| "127.0.0.1:3000".to_owned());
     let heartbeat_timeout = heartbeat_timeout_from_env()?;
+    let lost_grace = Duration::from_secs(positive_u64_from_env(
+        LOST_GRACE_ENV,
+        DEFAULT_LOST_GRACE_SECS,
+    )?);
     let blob_limits = blob_limits_from_env()?;
     let state_directory = state_directory()?;
     let blobs = BlobStore::new(&state_directory, blob_limits)?;
@@ -56,6 +63,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
     tracing::info!(
         address = %listener.local_addr()?,
         heartbeat_timeout_secs = heartbeat_timeout.as_secs(),
+        lost_grace_secs = lost_grace.as_secs(),
         state_directory = %state_directory.display(),
         max_blob_bytes = blob_limits.max_blob_bytes,
         blob_quota_bytes = blob_limits.quota_bytes,
@@ -65,7 +73,11 @@ async fn main() -> Result<(), Box<dyn Error>> {
 
     tokio::select! {
         result = axum::serve(listener, router(state.clone())) => result?,
-        result = monitor_liveness(state.clone(), FailureDetector::new(heartbeat_timeout)) => result?,
+        result = monitor_liveness(
+            state.clone(),
+            FailureDetector::new(heartbeat_timeout),
+            heartbeat_timeout + lost_grace,
+        ) => result?,
         result = monitor_job_timeouts(state) => result?,
     }
     Ok(())
@@ -86,6 +98,7 @@ async fn monitor_job_timeouts(state: ControllerState) -> Result<(), ControllerSt
 async fn monitor_liveness(
     state: ControllerState,
     detector: FailureDetector,
+    lost_after: Duration,
 ) -> Result<(), ControllerStateError> {
     let mut ticker = interval(LIVENESS_CHECK_INTERVAL);
     ticker.set_missed_tick_behavior(MissedTickBehavior::Skip);
@@ -94,6 +107,13 @@ async fn monitor_liveness(
         ticker.tick().await;
         for node_id in state.detect_unreachable_nodes(&detector, Instant::now())? {
             tracing::warn!(%node_id, "node became unreachable");
+        }
+        let (lost, requeued) = state.give_up_on_silent_nodes(Instant::now(), lost_after)?;
+        for execution_id in lost {
+            tracing::warn!(%execution_id, "node stayed silent; execution marked lost");
+        }
+        for execution_id in requeued {
+            tracing::warn!(%execution_id, "node stayed silent; unacknowledged execution requeued");
         }
     }
 }

@@ -248,6 +248,8 @@ pub enum JobState {
     Cancelled,
     TimedOut,
     /// The controller can no longer determine whether the process is running.
+    ///
+    /// Not final: a later report of how the process ended replaces it.
     Lost,
 }
 
@@ -286,6 +288,11 @@ impl JobState {
                     )
                     | (Self::Submitted | Self::Queued, Self::TimedOut)
                     | (Self::TimingOut, Self::TimedOut | Self::Lost)
+                    // See `ExecutionState::Lost`: a late report of the real outcome wins.
+                    | (
+                        Self::Lost,
+                        Self::Succeeded | Self::Failed | Self::Cancelled | Self::TimedOut
+                    )
             )
     }
 
@@ -506,6 +513,18 @@ mod tests {
             error,
             InvalidStateTransition::new(JobState::Submitted, JobState::Running)
         );
+    }
+
+    #[test]
+    fn lost_job_takes_the_outcome_a_returning_node_reports() {
+        let mut state = JobState::Lost;
+
+        state
+            .transition_to(JobState::Succeeded)
+            .expect("a reported outcome replaces Lost");
+        assert_eq!(state, JobState::Succeeded);
+        assert!(JobState::Lost.transition_to(JobState::Running).is_err());
+        assert!(JobState::Lost.transition_to(JobState::Queued).is_err());
     }
 
     #[test]

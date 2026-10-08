@@ -1,6 +1,7 @@
 //! HTTP boundary for controller-node protocol messages.
 
 use std::{
+    collections::BTreeSet,
     error::Error,
     fmt,
     ops::{Deref, DerefMut},
@@ -64,6 +65,9 @@ pub struct ControllerState {
     /// How long outputs are protected from eviction after a job finishes.
     output_retention: Duration,
     command_updates: watch::Sender<u64>,
+    /// When this controller process started. A node restored from the store
+    /// has no heartbeat to measure silence from, so silence counts from here.
+    started_at: Instant,
 }
 
 impl Default for ControllerState {
@@ -76,6 +80,7 @@ impl Default for ControllerState {
             store: None,
             output_retention: DEFAULT_OUTPUT_RETENTION,
             command_updates,
+            started_at: Instant::now(),
         }
     }
 }
@@ -137,6 +142,42 @@ impl ControllerState {
     ) -> Result<Vec<NodeId>, ControllerStateError> {
         let mut registry = self.registry.write().map_err(|_| ControllerStateError)?;
         Ok(detector.detect(&mut registry, now))
+    }
+
+    /// Gives up on executions of nodes that have been unreachable for `silent_for`.
+    ///
+    /// Returns the executions marked lost and the ones sent back to the queue.
+    pub fn give_up_on_silent_nodes(
+        &self,
+        now: Instant,
+        silent_for: Duration,
+    ) -> Result<(Vec<ExecutionId>, Vec<ExecutionId>), ControllerStateError> {
+        let silent_nodes = {
+            let registry = self.registry.read().map_err(|_| ControllerStateError)?;
+            registry
+                .nodes()
+                .filter(|node| node.state() == NodeState::Unreachable)
+                .filter(|node| {
+                    let last_seen = node.last_heartbeat_at().unwrap_or(self.started_at);
+                    now.saturating_duration_since(last_seen) >= silent_for
+                })
+                .map(|node| node.descriptor().id)
+                .collect::<BTreeSet<_>>()
+        };
+        if silent_nodes.is_empty() {
+            return Ok((Vec::new(), Vec::new()));
+        }
+
+        let mut jobs = self.jobs_mut()?;
+        let (lost, requeued) = jobs.give_up_on_nodes(&silent_nodes).map_err(|error| {
+            tracing::error!(%error, "giving up on silent nodes failed");
+            ControllerStateError
+        })?;
+        drop(jobs);
+        if !requeued.is_empty() {
+            self.notify_command_update();
+        }
+        Ok((lost, requeued))
     }
 
     pub fn expire_jobs(&self, now: Instant) -> Result<Vec<JobId>, ControllerStateError> {
@@ -2773,6 +2814,117 @@ mod tests {
             .expect("queued job should be schedulable")
             .expect("one job should be queued");
         (job_id, execution_id)
+    }
+
+    mod silent_nodes {
+        use meld_core::ExecutionOutput;
+
+        use super::*;
+
+        const TIMEOUT: Duration = Duration::from_secs(15);
+        const SILENT_FOR: Duration = Duration::from_secs(45);
+
+        #[tokio::test]
+        async fn node_that_stays_silent_loses_its_execution_and_a_late_result_still_counts() {
+            let state = ControllerState::new();
+            let node_id = NodeId::generate();
+            let (job_id, execution_id) = assigned_execution(&state, node_id);
+            for event in [ExecutionEvent::Accepted, ExecutionEvent::Running] {
+                assert_eq!(
+                    report_event(state.clone(), node_id, execution_id, event).await,
+                    StatusCode::OK
+                );
+            }
+            let last_heartbeat = state
+                .registry
+                .read()
+                .expect("registry lock")
+                .get(node_id)
+                .and_then(|node| node.last_heartbeat_at())
+                .expect("node has heartbeated");
+            let detector = FailureDetector::new(TIMEOUT);
+
+            // Unreachable, but still within the grace period: nothing is decided.
+            let unreachable = state
+                .detect_unreachable_nodes(&detector, last_heartbeat + TIMEOUT)
+                .expect("detection");
+            assert_eq!(unreachable, vec![node_id]);
+            let (lost, _) = state
+                .give_up_on_silent_nodes(
+                    last_heartbeat + SILENT_FOR - Duration::from_secs(1),
+                    SILENT_FOR,
+                )
+                .expect("giving up");
+            assert!(lost.is_empty());
+            assert_eq!(
+                get_job_status(state.clone(), job_id).await.state,
+                JobState::Running
+            );
+
+            let (lost, requeued) = state
+                .give_up_on_silent_nodes(last_heartbeat + SILENT_FOR, SILENT_FOR)
+                .expect("giving up");
+            assert_eq!(lost, vec![execution_id]);
+            assert!(requeued.is_empty());
+            assert_eq!(
+                get_job_status(state.clone(), job_id).await.state,
+                JobState::Lost
+            );
+
+            // The process was never dead, only unreachable. Its result still counts.
+            assert_eq!(
+                report_event(
+                    state.clone(),
+                    node_id,
+                    execution_id,
+                    ExecutionEvent::Finished {
+                        result: ExecutionResult { exit_code: Some(0) },
+                        output: ExecutionOutput::default(),
+                        outputs: vec![],
+                    },
+                )
+                .await,
+                StatusCode::OK
+            );
+            assert_eq!(
+                get_job_status(state.clone(), job_id).await.state,
+                JobState::Succeeded
+            );
+        }
+
+        #[tokio::test]
+        async fn unacknowledged_assignment_of_a_silent_node_goes_to_another_node() {
+            let state = ControllerState::new();
+            let silent = NodeId::generate();
+            let (job_id, _) = assigned_execution(&state, silent);
+            let last_heartbeat = state
+                .registry
+                .read()
+                .expect("registry lock")
+                .get(silent)
+                .and_then(|node| node.last_heartbeat_at())
+                .expect("node has heartbeated");
+            state
+                .detect_unreachable_nodes(&FailureDetector::new(TIMEOUT), last_heartbeat + TIMEOUT)
+                .expect("detection");
+
+            let (lost, requeued) = state
+                .give_up_on_silent_nodes(last_heartbeat + SILENT_FOR, SILENT_FOR)
+                .expect("giving up");
+            assert!(lost.is_empty());
+            assert_eq!(requeued.len(), 1);
+            assert_eq!(
+                get_job_status(state.clone(), job_id).await.state,
+                JobState::Queued
+            );
+
+            let other = NodeId::generate();
+            register_ready_node(&state, other);
+            assert!(matches!(
+                poll_for_command(&state, other, vec![]).await,
+                Some(NodeCommand::Start { .. })
+            ));
+        }
     }
 
     mod restart {

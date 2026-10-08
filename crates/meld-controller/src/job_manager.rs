@@ -764,6 +764,49 @@ impl JobManager {
         Ok(lost)
     }
 
+    /// Settles the executions of nodes that have been silent for too long.
+    ///
+    /// An execution the node never acknowledged cannot have started its
+    /// process (the node reports acceptance first), so its job goes back to
+    /// the queue. One that was acknowledged may still be running, so it is
+    /// marked lost rather than assumed dead; if the node returns and reports
+    /// how it ended, that outcome replaces `Lost`.
+    ///
+    /// Returns `(lost, requeued)`.
+    pub fn give_up_on_nodes(
+        &mut self,
+        nodes: &BTreeSet<NodeId>,
+    ) -> Result<(Vec<ExecutionId>, Vec<ExecutionId>), JobManagerError> {
+        let affected = self
+            .executions
+            .values()
+            .filter(|execution| nodes.contains(&execution.node_id()))
+            .map(|execution| (execution.id(), execution.state()))
+            .collect::<Vec<_>>();
+
+        let (mut lost, mut requeued) = (Vec::new(), Vec::new());
+        for (execution_id, state) in affected {
+            match state {
+                ExecutionState::Assigned => {
+                    self.reject_execution(execution_id)?;
+                    requeued.push(execution_id);
+                }
+                ExecutionState::Accepted | ExecutionState::Running | ExecutionState::Cancelling => {
+                    self.mark_execution_lost(execution_id)?;
+                    self.unconfirmed.remove(&execution_id);
+                    lost.push(execution_id);
+                }
+                ExecutionState::Succeeded
+                | ExecutionState::Failed
+                | ExecutionState::Cancelled
+                | ExecutionState::TimedOut
+                | ExecutionState::Rejected
+                | ExecutionState::Lost => {}
+            }
+        }
+        Ok((lost, requeued))
+    }
+
     /// Records process completion and updates the linked logical job.
     pub fn finish_execution(
         &mut self,
@@ -1614,6 +1657,81 @@ mod tests {
             Some(ExecutionState::Lost)
         );
         assert_eq!(manager.job(job_id).map(Job::state), Some(JobState::Lost));
+    }
+
+    #[test]
+    fn silent_node_loses_acknowledged_executions_and_returns_unacknowledged_jobs_to_the_queue() {
+        let (registry, node_id) = ready_registry_with_limit(2);
+        let scheduler = Scheduler::new();
+        let mut manager = JobManager::new();
+        let running_job = manager.submit(spec()).expect("valid job should be queued");
+        let running = manager
+            .schedule(running_job, &scheduler, &registry)
+            .expect("schedule");
+        manager.accept_execution(running).expect("accept");
+        manager.start_execution(running).expect("start");
+        let waiting_job = manager.submit(spec()).expect("valid job should be queued");
+        let waiting = manager
+            .schedule(waiting_job, &scheduler, &registry)
+            .expect("schedule");
+
+        let (lost, requeued) = manager
+            .give_up_on_nodes(&BTreeSet::from([node_id]))
+            .expect("giving up should succeed");
+
+        assert_eq!(lost, vec![running]);
+        assert_eq!(requeued, vec![waiting]);
+        assert_eq!(
+            manager.job(running_job).map(Job::state),
+            Some(JobState::Lost)
+        );
+        assert_eq!(
+            manager.execution(running).map(Execution::state),
+            Some(ExecutionState::Lost)
+        );
+        assert_eq!(
+            manager.job(waiting_job).map(Job::state),
+            Some(JobState::Queued)
+        );
+        assert_eq!(manager.pending_position(waiting_job), Some(0));
+    }
+
+    #[test]
+    fn executions_of_other_nodes_are_left_alone() {
+        let (mut manager, job_id, execution_id) = assigned_job();
+        manager.accept_execution(execution_id).expect("accept");
+        manager.start_execution(execution_id).expect("start");
+
+        let (lost, requeued) = manager
+            .give_up_on_nodes(&BTreeSet::from([NodeId::generate()]))
+            .expect("giving up should succeed");
+
+        assert!(lost.is_empty() && requeued.is_empty());
+        assert_eq!(manager.job(job_id).map(Job::state), Some(JobState::Running));
+    }
+
+    #[test]
+    fn result_reported_after_the_execution_was_lost_replaces_lost() {
+        let (mut manager, job_id, execution_id) = assigned_job();
+        let node_id = manager.execution(execution_id).expect("stored").node_id();
+        manager.accept_execution(execution_id).expect("accept");
+        manager.start_execution(execution_id).expect("start");
+        manager
+            .give_up_on_nodes(&BTreeSet::from([node_id]))
+            .expect("giving up should succeed");
+
+        manager
+            .finish_execution(execution_id, ExecutionResult { exit_code: Some(0) })
+            .expect("a returning node's result should be accepted");
+
+        assert_eq!(
+            manager.job(job_id).map(Job::state),
+            Some(JobState::Succeeded)
+        );
+        assert_eq!(
+            manager.execution(execution_id).map(Execution::state),
+            Some(ExecutionState::Succeeded)
+        );
     }
 
     fn assigned_job() -> (JobManager, JobId, ExecutionId) {
