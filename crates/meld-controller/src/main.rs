@@ -89,8 +89,12 @@ async fn monitor_job_timeouts(state: ControllerState) -> Result<(), ControllerSt
 
     loop {
         ticker.tick().await;
-        for job_id in state.expire_jobs(Instant::now())? {
+        let now = Instant::now();
+        for job_id in state.expire_jobs(now)? {
             tracing::warn!(%job_id, "job timeout elapsed");
+        }
+        for job_id in state.release_due_retries(now)? {
+            tracing::info!(%job_id, "automatic retry is due");
         }
     }
 }

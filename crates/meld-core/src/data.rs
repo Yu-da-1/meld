@@ -289,6 +289,24 @@ impl fmt::Display for DataSpecError {
 
 impl Error for DataSpecError {}
 
+impl DataFailure {
+    /// Whether another attempt, possibly on another node, could succeed.
+    ///
+    /// A full disk, an unreachable controller or a failed upload say something
+    /// about one node or one moment. A bad path, a size limit, a checksum
+    /// mismatch or a missing output say something about the job and come back
+    /// every time.
+    pub const fn is_transient(&self) -> bool {
+        matches!(
+            self,
+            Self::LocalStorage { .. }
+                | Self::InputUnavailable { .. }
+                | Self::InsufficientDisk { .. }
+                | Self::OutputUploadFailed { .. }
+        )
+    }
+}
+
 /// Why a node or the controller could not move a job's data.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
@@ -624,5 +642,29 @@ mod tests {
             serde_json::from_str::<DataFailure>(&json).expect("deserializes"),
             failure
         );
+    }
+
+    #[test]
+    fn only_failures_that_may_pass_are_transient() {
+        let path = || "p".to_owned();
+        assert!(DataFailure::LocalStorage { path: path() }.is_transient());
+        assert!(DataFailure::InputUnavailable { path: path() }.is_transient());
+        assert!(
+            DataFailure::InsufficientDisk {
+                needed_bytes: 2,
+                available_bytes: 1
+            }
+            .is_transient()
+        );
+        assert!(!DataFailure::InvalidPath { path: path() }.is_transient());
+        assert!(!DataFailure::ChecksumMismatch { path: path() }.is_transient());
+        assert!(
+            !DataFailure::TooLarge {
+                path: path(),
+                limit_bytes: 1
+            }
+            .is_transient()
+        );
+        assert!(!DataFailure::OutputMissing { path: path() }.is_transient());
     }
 }

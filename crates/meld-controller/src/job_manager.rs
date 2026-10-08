@@ -10,7 +10,7 @@ use std::{
 use meld_core::{
     DataFailure, Execution, ExecutionAssignment, ExecutionCompletionError, ExecutionId,
     ExecutionOutput, ExecutionResult, ExecutionState, InvalidStateTransition, Job, JobId, JobSpec,
-    JobSpecValidationError, JobState, NodeAssessment, NodeId, OutputFile, Sha256Digest,
+    JobSpecValidationError, JobState, NodeAssessment, NodeId, OutputFile, RetryCause, Sha256Digest,
 };
 
 use crate::{
@@ -20,6 +20,36 @@ use crate::{
 };
 
 mod persistence;
+
+/// Delay before the first automatic retry; it doubles with each further one.
+const DEFAULT_RETRY_BACKOFF_INITIAL: Duration = Duration::from_secs(5);
+const DEFAULT_RETRY_BACKOFF_MAX: Duration = Duration::from_secs(300);
+
+/// How long an automatic retry waits, growing exponentially up to a cap.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RetryBackoff {
+    pub initial: Duration,
+    pub max: Duration,
+}
+
+impl Default for RetryBackoff {
+    fn default() -> Self {
+        Self {
+            initial: DEFAULT_RETRY_BACKOFF_INITIAL,
+            max: DEFAULT_RETRY_BACKOFF_MAX,
+        }
+    }
+}
+
+impl RetryBackoff {
+    /// Delay before the retry that follows `earlier_retries` automatic retries.
+    pub fn delay_after(&self, earlier_retries: u32) -> Duration {
+        let factor = 1u32
+            .checked_shl(earlier_retries.min(24))
+            .unwrap_or(u32::MAX);
+        self.initial.saturating_mul(factor).min(self.max)
+    }
+}
 
 /// Owns controller-authoritative Job and Execution records.
 #[derive(Debug, Default)]
@@ -52,11 +82,24 @@ pub struct JobManager {
     /// and relies on this to write them in the right one.
     execution_order: BTreeMap<ExecutionId, u64>,
     next_execution_order: u64,
+    /// Automatic retries made in the current run of each job. A manual retry
+    /// starts a new run, so it starts the count again.
+    auto_retries: Tracked<JobId, u32>,
+    /// Earliest time a job waiting for an automatic retry may be placed again.
+    retry_not_before: Tracked<JobId, Instant>,
+    backoff: RetryBackoff,
 }
 
 impl JobManager {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Replaces the delay between automatic retries.
+    #[must_use]
+    pub fn with_retry_backoff(mut self, backoff: RetryBackoff) -> Self {
+        self.backoff = backoff;
+        self
     }
 
     /// Validates and queues a newly submitted job.
@@ -96,8 +139,24 @@ impl JobManager {
         scheduler: &Scheduler,
         registry: &NodeRegistry,
     ) -> Result<Option<ExecutionId>, JobManagerError> {
+        self.schedule_next_at(scheduler, registry, Instant::now())
+    }
+
+    /// [`Self::schedule_next`] at a given time.
+    ///
+    /// A job waiting out a retry delay is passed over, like one no node can
+    /// take: the delay is its own, so it must not hold up the jobs behind it.
+    pub fn schedule_next_at(
+        &mut self,
+        scheduler: &Scheduler,
+        registry: &NodeRegistry,
+        now: Instant,
+    ) -> Result<Option<ExecutionId>, JobManagerError> {
         let mut first_overtaken = None;
         for job_id in self.pending_jobs.clone() {
+            if self.retry_wait(job_id, now).is_some() {
+                continue;
+            }
             match self.schedule(job_id, scheduler, registry) {
                 Ok(execution_id) => return Ok(Some(execution_id)),
                 Err(JobManagerError::Scheduling(failure)) if failure.can_be_overtaken() => {
@@ -120,11 +179,15 @@ impl JobManager {
         scheduler: &Scheduler,
         registry: &NodeRegistry,
     ) -> Result<bool, JobManagerError> {
+        let now = Instant::now();
         for &earlier in self
             .pending_jobs
             .iter()
             .take_while(|queued| **queued != job_id)
         {
+            if self.retry_wait(earlier, now).is_some() {
+                continue;
+            }
             let overtakable = self
                 .scheduling_failure_for(earlier, scheduler, registry)?
                 .is_some_and(SchedulingFailure::can_be_overtaken);
@@ -748,11 +811,110 @@ impl JobManager {
             .map_err(JobManagerError::InvalidJobState)?;
         self.pending_jobs.push_back(job_id);
         self.queue_dirty = true;
+        // A manual retry is a new run: it gets its own automatic-retry budget.
+        self.auto_retries.remove(&job_id);
+        self.retry_not_before.remove(&job_id);
         if has_job_timeout {
             // The deadline bounds one run of the job, so a new attempt gets a fresh one.
             self.job_submitted_at.insert(job_id, Instant::now());
         }
         Ok(self.attempts(job_id).len() as u32)
+    }
+
+    /// How long the job must still wait before an automatic retry may be placed.
+    pub fn retry_wait(&self, job_id: JobId, now: Instant) -> Option<Duration> {
+        let not_before = *self.retry_not_before.get(&job_id)?;
+        (not_before > now).then(|| not_before - now)
+    }
+
+    /// Automatic retries made so far in the current run of the job.
+    pub fn automatic_retries(&self, job_id: JobId) -> u32 {
+        self.auto_retries.get(&job_id).copied().unwrap_or(0)
+    }
+
+    /// The reason the latest attempt ended in a way that is retried automatically.
+    pub fn retry_cause(&self, job_id: JobId) -> Option<RetryCause> {
+        let latest = self.latest_execution_for_job(job_id)?;
+        Some(if latest.state() == ExecutionState::Lost {
+            RetryCause::NodeLost
+        } else if self.data_failures.contains_key(&latest.id()) {
+            RetryCause::DataTransfer
+        } else {
+            RetryCause::StartFailed
+        })
+    }
+
+    /// Forgets retry delays that have passed and returns the jobs they held back.
+    ///
+    /// Placement already ignores a passed delay; this lets the caller wake
+    /// nodes that are waiting for work.
+    pub fn release_due_retries(&mut self, now: Instant) -> Vec<JobId> {
+        let due = self
+            .retry_not_before
+            .iter()
+            .filter(|(_, not_before)| **not_before <= now)
+            .map(|(job_id, _)| *job_id)
+            .collect::<Vec<_>>();
+        for job_id in &due {
+            self.retry_not_before.remove(job_id);
+        }
+        due
+    }
+
+    /// What a failure needs to remember to decide on a retry afterwards: the
+    /// job, and its deadline, which finishing the job would otherwise discard.
+    ///
+    /// `None` when the user is already ending the job, which must stay ended.
+    fn retry_context(&self, execution_id: ExecutionId) -> Option<(JobId, Option<Instant>)> {
+        let job_id = self.executions.get(&execution_id)?.job_id();
+        let job = self.jobs.get(&job_id)?;
+        if matches!(job.state(), JobState::Cancelling | JobState::TimingOut) {
+            return None;
+        }
+        Some((job_id, self.job_submitted_at.get(&job_id).copied()))
+    }
+
+    /// Queues another attempt when the job's policy allows one.
+    ///
+    /// The job timeout keeps counting from the original submission, so retries
+    /// cannot extend it; a job that outlasts it is timed out while it waits.
+    fn auto_retry(&mut self, job_id: JobId, deadline: Option<Instant>, now: Instant) -> bool {
+        let Some(job) = self.jobs.get(&job_id) else {
+            return false;
+        };
+        let policy = job.spec().retry;
+        let earlier = self.automatic_retries(job_id);
+        if !policy.allows_automatic_retry()
+            || earlier + 1 >= policy.max_attempts
+            || !matches!(job.state(), JobState::Failed | JobState::Lost)
+        {
+            return false;
+        }
+
+        self.jobs
+            .get_mut(&job_id)
+            .expect("job was verified above")
+            .retry()
+            .expect("a failed or lost job can be retried");
+        self.pending_jobs.push_back(job_id);
+        self.queue_dirty = true;
+        self.auto_retries.insert(job_id, earlier + 1);
+        self.retry_not_before
+            .insert(job_id, now + self.backoff.delay_after(earlier));
+        if let Some(deadline) = deadline {
+            self.job_submitted_at.insert(job_id, deadline);
+        }
+        true
+    }
+
+    /// Marks an execution lost, then retries its job if its policy allows.
+    fn lose_execution(&mut self, execution_id: ExecutionId) -> Result<(), JobManagerError> {
+        let context = self.retry_context(execution_id);
+        self.mark_execution_lost(execution_id)?;
+        if let Some((job_id, deadline)) = context {
+            self.auto_retry(job_id, deadline, Instant::now());
+        }
+        Ok(())
     }
 
     /// Every attempt of a job, oldest first.
@@ -802,7 +964,7 @@ impl JobManager {
                 )
             });
             if still_open && !running.contains(&execution_id) {
-                self.mark_execution_lost(execution_id)?;
+                self.lose_execution(execution_id)?;
                 lost.push(execution_id);
             }
         }
@@ -837,7 +999,7 @@ impl JobManager {
                     requeued.push(execution_id);
                 }
                 ExecutionState::Accepted | ExecutionState::Running | ExecutionState::Cancelling => {
-                    self.mark_execution_lost(execution_id)?;
+                    self.lose_execution(execution_id)?;
                     self.unconfirmed.remove(&execution_id);
                     lost.push(execution_id);
                 }
@@ -942,8 +1104,13 @@ impl JobManager {
         execution_id: ExecutionId,
         failure: DataFailure,
     ) -> Result<(), JobManagerError> {
-        self.fail_execution_start(execution_id)?;
+        let context = self.retry_context(execution_id);
+        self.fail_start(execution_id)?;
+        let transient = failure.is_transient();
         self.data_failures.entry(execution_id).or_insert(failure);
+        if let (true, Some((job_id, deadline))) = (transient, context) {
+            self.auto_retry(job_id, deadline, Instant::now());
+        }
         Ok(())
     }
 
@@ -972,6 +1139,15 @@ impl JobManager {
         &mut self,
         execution_id: ExecutionId,
     ) -> Result<(), JobManagerError> {
+        let context = self.retry_context(execution_id);
+        self.fail_start(execution_id)?;
+        if let Some((job_id, deadline)) = context {
+            self.auto_retry(job_id, deadline, Instant::now());
+        }
+        Ok(())
+    }
+
+    fn fail_start(&mut self, execution_id: ExecutionId) -> Result<(), JobManagerError> {
         let job_id = self.preflight_linked_transition(
             execution_id,
             ExecutionState::Failed,
@@ -1040,6 +1216,7 @@ impl JobManager {
             self.pending_jobs.remove(index);
             self.queue_dirty = true;
         }
+        self.retry_not_before.remove(&job_id);
     }
 
     /// Sums the requirements of every execution still holding node resources.
@@ -1959,6 +2136,341 @@ mod tests {
         );
     }
 
+    mod auto_retry {
+        use meld_core::RetryPolicy;
+
+        use super::*;
+
+        const INITIAL: Duration = Duration::from_secs(10);
+        const MAX: Duration = Duration::from_secs(40);
+
+        fn manager() -> JobManager {
+            JobManager::new().with_retry_backoff(RetryBackoff {
+                initial: INITIAL,
+                max: MAX,
+            })
+        }
+
+        fn retrying(max_attempts: u32) -> JobSpec {
+            let mut spec = spec();
+            spec.retry = RetryPolicy {
+                max_attempts,
+                idempotent: true,
+            };
+            spec
+        }
+
+        /// Places the job and brings its attempt to `Running`.
+        fn run(
+            manager: &mut JobManager,
+            registry: &NodeRegistry,
+            job_id: JobId,
+            now: Instant,
+        ) -> ExecutionId {
+            let execution_id = manager
+                .schedule_next_at(&Scheduler::new(), registry, now)
+                .expect("scheduling should work")
+                .unwrap_or_else(|| panic!("job {job_id} should have been placed"));
+            manager.accept_execution(execution_id).expect("accept");
+            manager.start_execution(execution_id).expect("start");
+            execution_id
+        }
+
+        fn lose(manager: &mut JobManager, node_id: NodeId) {
+            manager
+                .give_up_on_nodes(&BTreeSet::from([node_id]))
+                .expect("giving up should work");
+        }
+
+        #[test]
+        fn backoff_doubles_and_stops_at_its_cap() {
+            let backoff = RetryBackoff {
+                initial: INITIAL,
+                max: MAX,
+            };
+
+            assert_eq!(backoff.delay_after(0), Duration::from_secs(10));
+            assert_eq!(backoff.delay_after(1), Duration::from_secs(20));
+            assert_eq!(backoff.delay_after(2), MAX);
+            assert_eq!(backoff.delay_after(3), MAX);
+            assert_eq!(backoff.delay_after(u32::MAX), MAX);
+        }
+
+        #[test]
+        fn lost_attempt_of_an_idempotent_job_is_retried_after_the_backoff() {
+            let (registry, node_id) = ready_registry();
+            let mut manager = manager();
+            let job_id = manager.submit(retrying(3)).expect("submit");
+            let first = run(&mut manager, &registry, job_id, Instant::now());
+
+            lose(&mut manager, node_id);
+
+            assert_eq!(manager.job(job_id).map(Job::state), Some(JobState::Queued));
+            assert_eq!(manager.automatic_retries(job_id), 1);
+            assert_eq!(manager.retry_cause(job_id), Some(RetryCause::NodeLost));
+            let now = Instant::now();
+            assert!(manager.retry_wait(job_id, now).is_some());
+            assert_eq!(
+                manager
+                    .schedule_next_at(&Scheduler::new(), &registry, now)
+                    .expect("scheduling should work"),
+                None,
+                "the job is held back until its delay has passed"
+            );
+
+            let second = run(
+                &mut manager,
+                &registry,
+                job_id,
+                now + INITIAL + Duration::from_secs(1),
+            );
+            assert_ne!(first, second);
+            assert_eq!(manager.attempts(job_id).len(), 2);
+        }
+
+        #[test]
+        fn retries_stop_when_the_attempts_are_used_up() {
+            let (registry, node_id) = ready_registry();
+            let mut manager = manager();
+            let job_id = manager.submit(retrying(2)).expect("submit");
+            let mut now = Instant::now();
+            run(&mut manager, &registry, job_id, now);
+            lose(&mut manager, node_id);
+            now += MAX;
+            run(&mut manager, &registry, job_id, now);
+
+            lose(&mut manager, node_id);
+
+            assert_eq!(manager.job(job_id).map(Job::state), Some(JobState::Lost));
+            assert_eq!(manager.attempts(job_id).len(), 2);
+        }
+
+        #[test]
+        fn a_job_without_a_policy_is_never_retried_by_the_controller() {
+            let (registry, node_id) = ready_registry();
+            let mut manager = manager();
+            let job_id = manager.submit(spec()).expect("submit");
+            run(&mut manager, &registry, job_id, Instant::now());
+
+            lose(&mut manager, node_id);
+
+            assert_eq!(manager.job(job_id).map(Job::state), Some(JobState::Lost));
+            assert_eq!(manager.automatic_retries(job_id), 0);
+        }
+
+        #[test]
+        fn a_process_that_exits_with_an_error_is_not_rerun() {
+            let (registry, _) = ready_registry();
+            let mut manager = manager();
+            let job_id = manager.submit(retrying(3)).expect("submit");
+            let execution = run(&mut manager, &registry, job_id, Instant::now());
+
+            manager
+                .finish_execution(execution, ExecutionResult { exit_code: Some(1) })
+                .expect("finish");
+
+            assert_eq!(manager.job(job_id).map(Job::state), Some(JobState::Failed));
+        }
+
+        #[test]
+        fn only_transient_data_failures_are_retried() {
+            for (failure, retried) in [
+                (
+                    DataFailure::InputUnavailable {
+                        path: "a".to_owned(),
+                    },
+                    true,
+                ),
+                (
+                    DataFailure::LocalStorage {
+                        path: "a".to_owned(),
+                    },
+                    true,
+                ),
+                (
+                    DataFailure::OutputUploadFailed {
+                        path: "a".to_owned(),
+                    },
+                    true,
+                ),
+                (
+                    DataFailure::ChecksumMismatch {
+                        path: "a".to_owned(),
+                    },
+                    false,
+                ),
+                (
+                    DataFailure::OutputMissing {
+                        path: "a".to_owned(),
+                    },
+                    false,
+                ),
+            ] {
+                let (registry, _) = ready_registry();
+                let mut manager = manager();
+                let job_id = manager.submit(retrying(3)).expect("submit");
+                let execution = manager
+                    .schedule(job_id, &Scheduler::new(), &registry)
+                    .expect("schedule");
+                manager.accept_execution(execution).expect("accept");
+
+                manager
+                    .fail_execution_data(execution, failure.clone())
+                    .expect("data failure");
+
+                let expected = if retried {
+                    JobState::Queued
+                } else {
+                    JobState::Failed
+                };
+                assert_eq!(
+                    manager.job(job_id).map(Job::state),
+                    Some(expected),
+                    "{failure:?}"
+                );
+                if retried {
+                    assert_eq!(manager.retry_cause(job_id), Some(RetryCause::DataTransfer));
+                }
+            }
+        }
+
+        #[test]
+        fn a_process_that_could_not_start_is_retried() {
+            let (registry, _) = ready_registry();
+            let mut manager = manager();
+            let job_id = manager.submit(retrying(2)).expect("submit");
+            let execution = manager
+                .schedule(job_id, &Scheduler::new(), &registry)
+                .expect("schedule");
+            manager.accept_execution(execution).expect("accept");
+
+            manager
+                .fail_execution_start(execution)
+                .expect("start failure");
+
+            assert_eq!(manager.job(job_id).map(Job::state), Some(JobState::Queued));
+            assert_eq!(manager.retry_cause(job_id), Some(RetryCause::StartFailed));
+        }
+
+        #[test]
+        fn a_job_the_user_is_cancelling_is_not_retried_when_it_is_lost() {
+            let (registry, node_id) = ready_registry();
+            let mut manager = manager();
+            let job_id = manager.submit(retrying(3)).expect("submit");
+            run(&mut manager, &registry, job_id, Instant::now());
+            manager.request_job_cancellation(job_id).expect("cancel");
+
+            lose(&mut manager, node_id);
+
+            assert_eq!(manager.job(job_id).map(Job::state), Some(JobState::Lost));
+        }
+
+        #[test]
+        fn a_job_waiting_out_its_delay_does_not_hold_up_later_jobs() {
+            let (registry, node_id) = ready_registry();
+            let mut manager = manager();
+            let retried = manager.submit(retrying(3)).expect("submit");
+            let now = Instant::now();
+            run(&mut manager, &registry, retried, now);
+            lose(&mut manager, node_id);
+            let later = manager.submit(spec()).expect("submit");
+
+            let placed = manager
+                .schedule_next_at(&Scheduler::new(), &registry, now)
+                .expect("scheduling should work")
+                .expect("the later job is placed");
+
+            assert_eq!(
+                manager.execution(placed).map(Execution::job_id),
+                Some(later)
+            );
+            assert!(
+                !manager
+                    .is_behind_earlier_job(later, &Scheduler::new(), &registry)
+                    .expect("diagnosis")
+            );
+        }
+
+        #[test]
+        fn retries_do_not_extend_the_job_timeout() {
+            let (registry, node_id) = ready_registry();
+            let mut manager = manager();
+            let mut spec = retrying(3);
+            spec.job_timeout_secs = Some(60);
+            let job_id = manager
+                .submit_at(spec, Instant::now() - Duration::from_secs(55))
+                .expect("submit");
+            run(&mut manager, &registry, job_id, Instant::now());
+
+            lose(&mut manager, node_id);
+            assert_eq!(manager.job(job_id).map(Job::state), Some(JobState::Queued));
+
+            // Counted from the first submission, not from the retry.
+            let expired = manager
+                .expire_jobs_at(Instant::now() + Duration::from_secs(6))
+                .expect("expire");
+            assert_eq!(expired, vec![job_id]);
+            assert_eq!(
+                manager.job(job_id).map(Job::state),
+                Some(JobState::TimedOut)
+            );
+        }
+
+        #[test]
+        fn a_manual_retry_starts_a_new_run_with_a_fresh_budget() {
+            let (registry, node_id) = ready_registry();
+            let mut manager = manager();
+            let job_id = manager.submit(retrying(2)).expect("submit");
+            let mut now = Instant::now();
+            run(&mut manager, &registry, job_id, now);
+            lose(&mut manager, node_id);
+            now += MAX;
+            run(&mut manager, &registry, job_id, now);
+            lose(&mut manager, node_id);
+            assert_eq!(manager.job(job_id).map(Job::state), Some(JobState::Lost));
+
+            manager.retry_job(job_id, true).expect("manual retry");
+
+            assert_eq!(manager.automatic_retries(job_id), 0);
+            now += MAX;
+            run(&mut manager, &registry, job_id, now);
+            lose(&mut manager, node_id);
+            assert_eq!(manager.job(job_id).map(Job::state), Some(JobState::Queued));
+        }
+
+        #[test]
+        fn cancelling_a_job_that_waits_to_retry_ends_it() {
+            let (registry, node_id) = ready_registry();
+            let mut manager = manager();
+            let job_id = manager.submit(retrying(3)).expect("submit");
+            run(&mut manager, &registry, job_id, Instant::now());
+            lose(&mut manager, node_id);
+
+            manager.request_job_cancellation(job_id).expect("cancel");
+
+            assert_eq!(
+                manager.job(job_id).map(Job::state),
+                Some(JobState::Cancelled)
+            );
+            assert_eq!(manager.pending_position(job_id), None);
+            assert_eq!(manager.retry_wait(job_id, Instant::now()), None);
+        }
+
+        #[test]
+        fn passed_delays_are_released_once() {
+            let (registry, node_id) = ready_registry();
+            let mut manager = manager();
+            let job_id = manager.submit(retrying(3)).expect("submit");
+            run(&mut manager, &registry, job_id, Instant::now());
+            lose(&mut manager, node_id);
+
+            assert!(manager.release_due_retries(Instant::now()).is_empty());
+            let later = Instant::now() + INITIAL + Duration::from_secs(1);
+            assert_eq!(manager.release_due_retries(later), vec![job_id]);
+            assert!(manager.release_due_retries(later).is_empty());
+        }
+    }
+
     fn assigned_job() -> (JobManager, JobId, ExecutionId) {
         let mut manager = JobManager::new();
         let job_id = manager.submit(spec()).expect("valid job should be queued");
@@ -2047,6 +2559,7 @@ mod tests {
             execution_timeout_secs: None,
             constraints: meld_core::PlacementConstraints::default(),
             data: meld_core::DataSpec::default(),
+            retry: Default::default(),
         }
     }
 

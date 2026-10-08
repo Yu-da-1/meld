@@ -31,6 +31,58 @@ pub struct JobSpec {
     /// Files moved to the node before the run and collected after it.
     #[serde(default, skip_serializing_if = "DataSpec::is_empty")]
     pub data: DataSpec,
+    /// Whether, and how often, the controller may run the job again by itself.
+    #[serde(default, skip_serializing_if = "RetryPolicy::is_default")]
+    pub retry: RetryPolicy,
+}
+
+/// When the controller may rerun a job without being asked.
+///
+/// By default it never does. A rerun can repeat side effects, so automatic
+/// retry needs the submitter to declare the job idempotent, and a number of
+/// attempts alone is not accepted as that declaration.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RetryPolicy {
+    /// Attempts per run of the job, the first one included.
+    #[serde(default = "RetryPolicy::one_attempt")]
+    pub max_attempts: u32,
+    /// The submitter states that running the job again is safe.
+    #[serde(default)]
+    pub idempotent: bool,
+}
+
+impl Default for RetryPolicy {
+    fn default() -> Self {
+        Self {
+            max_attempts: 1,
+            idempotent: false,
+        }
+    }
+}
+
+impl RetryPolicy {
+    const fn one_attempt() -> u32 {
+        1
+    }
+
+    pub fn is_default(&self) -> bool {
+        *self == Self::default()
+    }
+
+    /// Whether the controller may start another attempt on its own.
+    pub const fn allows_automatic_retry(&self) -> bool {
+        self.idempotent && self.max_attempts > 1
+    }
+
+    pub fn validate(&self) -> Result<(), JobSpecValidationError> {
+        if self.max_attempts == 0 {
+            return Err(JobSpecValidationError::ZeroMaxAttempts);
+        }
+        if self.max_attempts > 1 && !self.idempotent {
+            return Err(JobSpecValidationError::RetryNeedsIdempotent);
+        }
+        Ok(())
+    }
 }
 
 /// Node properties a job requires beyond CPU and memory.
@@ -107,6 +159,7 @@ impl JobSpec {
         }
         self.constraints.validate()?;
         self.data.validate()?;
+        self.retry.validate()?;
         Ok(())
     }
 }
@@ -120,6 +173,8 @@ pub enum JobSpecValidationError {
     ZeroJobTimeout,
     ZeroExecutionTimeout,
     BlankConstraint,
+    ZeroMaxAttempts,
+    RetryNeedsIdempotent,
 }
 
 impl fmt::Display for JobSpecValidationError {
@@ -138,6 +193,11 @@ impl fmt::Display for JobSpecValidationError {
             Self::BlankConstraint => {
                 formatter.write_str("placement constraints must not contain blank values")
             }
+            Self::ZeroMaxAttempts => formatter.write_str("maximum attempts must be at least one"),
+            Self::RetryNeedsIdempotent => formatter.write_str(
+                "more than one attempt is allowed only for a job declared idempotent, \
+                 because running it again can repeat its side effects",
+            ),
         }
     }
 }
@@ -418,6 +478,7 @@ mod tests {
             execution_timeout_secs: None,
             constraints: PlacementConstraints::default(),
             data,
+            retry: RetryPolicy::default(),
         }
     }
 
@@ -473,6 +534,7 @@ mod tests {
             execution_timeout_secs: None,
             constraints: PlacementConstraints::default(),
             data: DataSpec::default(),
+            retry: Default::default(),
         };
 
         let json = serde_json::to_string(&spec).expect("job spec should serialize");
@@ -588,10 +650,81 @@ mod tests {
             execution_timeout_secs: None,
             constraints: PlacementConstraints::default(),
             data: DataSpec::default(),
+            retry: Default::default(),
         })
         .expect("valid spec");
         job.state = state;
         job
+    }
+
+    #[test]
+    fn retry_policy_defaults_to_a_single_attempt_and_is_omitted_from_json() {
+        let spec = spec_with_data(DataSpec::default());
+
+        assert!(!spec.retry.allows_automatic_retry());
+        assert!(
+            !serde_json::to_string(&spec)
+                .expect("spec should serialize")
+                .contains("retry")
+        );
+    }
+
+    #[test]
+    fn more_attempts_need_an_idempotence_declaration() {
+        let mut spec = spec_with_data(DataSpec::default());
+
+        spec.retry = RetryPolicy {
+            max_attempts: 3,
+            idempotent: false,
+        };
+        assert_eq!(
+            spec.validate(),
+            Err(JobSpecValidationError::RetryNeedsIdempotent)
+        );
+
+        spec.retry.idempotent = true;
+        assert_eq!(spec.validate(), Ok(()));
+        assert!(spec.retry.allows_automatic_retry());
+
+        spec.retry.max_attempts = 0;
+        assert_eq!(
+            spec.validate(),
+            Err(JobSpecValidationError::ZeroMaxAttempts)
+        );
+    }
+
+    #[test]
+    fn declaring_idempotence_alone_does_not_enable_retry() {
+        let policy = RetryPolicy {
+            max_attempts: 1,
+            idempotent: true,
+        };
+
+        assert_eq!(policy.validate(), Ok(()));
+        assert!(!policy.allows_automatic_retry());
+    }
+
+    #[test]
+    fn retry_policy_round_trips_and_older_specs_still_load() {
+        let mut spec = spec_with_data(DataSpec::default());
+        spec.retry = RetryPolicy {
+            max_attempts: 4,
+            idempotent: true,
+        };
+        let json = serde_json::to_string(&spec).expect("spec should serialize");
+        assert_eq!(
+            serde_json::from_str::<JobSpec>(&json).expect("round trip"),
+            spec
+        );
+
+        let older =
+            r#"{"program":"x","args":[],"requirements":{"logical_cpus":1,"memory_bytes":1}}"#;
+        assert!(
+            serde_json::from_str::<JobSpec>(older)
+                .expect("a spec without retry still loads")
+                .retry
+                .is_default()
+        );
     }
 
     #[test]
@@ -607,6 +740,7 @@ mod tests {
             execution_timeout_secs: None,
             constraints: PlacementConstraints::default(),
             data: DataSpec::default(),
+            retry: Default::default(),
         };
 
         let job = Job::new(spec.clone()).expect("valid spec should create a job");
@@ -628,6 +762,7 @@ mod tests {
             execution_timeout_secs: None,
             constraints: PlacementConstraints::default(),
             data: DataSpec::default(),
+            retry: Default::default(),
         })
         .expect("valid spec should create a job");
         job.queue().expect("job should be queued");
@@ -651,6 +786,7 @@ mod tests {
             execution_timeout_secs: None,
             constraints: PlacementConstraints::default(),
             data: DataSpec::default(),
+            retry: Default::default(),
         })
         .expect_err("blank program must be rejected");
 
@@ -670,6 +806,7 @@ mod tests {
             execution_timeout_secs: Some(0),
             constraints: PlacementConstraints::default(),
             data: DataSpec::default(),
+            retry: Default::default(),
         })
         .expect_err("zero execution timeout must be rejected");
 
@@ -689,6 +826,7 @@ mod tests {
             execution_timeout_secs: None,
             constraints: PlacementConstraints::default(),
             data: DataSpec::default(),
+            retry: Default::default(),
         })
         .expect_err("zero job timeout must be rejected");
 

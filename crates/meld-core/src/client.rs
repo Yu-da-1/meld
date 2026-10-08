@@ -104,6 +104,9 @@ pub struct JobStatusResponse {
     pub state: JobState,
     pub queue_reason: Option<QueueReason>,
     pub execution: Option<ExecutionView>,
+    /// Set while the job waits for an automatic retry.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub retry: Option<RetryView>,
     /// Every attempt so far, oldest first. `execution` is the last of them.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub attempts: Vec<ExecutionView>,
@@ -128,6 +131,31 @@ pub enum QueueReason {
     NoAvailableNodes,
     WaitingForEarlierJob,
     AwaitingAssignment,
+    /// An automatic retry is waiting out its delay.
+    WaitingToRetry,
+}
+
+/// Why the controller started another attempt by itself.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RetryCause {
+    /// The node went silent, so the attempt was lost.
+    NodeLost,
+    /// The node could not move the job's data, for a reason that may pass.
+    DataTransfer,
+    /// The node could not start the process.
+    StartFailed,
+}
+
+/// An automatic retry that is waiting or under way.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RetryView {
+    /// Number of the attempt that follows, counting from one.
+    pub next_attempt: u32,
+    pub max_attempts: u32,
+    /// Time left before it may be placed; zero once it is due.
+    pub retry_in_ms: u64,
+    pub cause: RetryCause,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

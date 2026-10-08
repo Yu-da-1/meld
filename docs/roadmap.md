@@ -293,7 +293,15 @@ processやnetworkの障害を状態として扱い、controller再起動後に�
   - `Lost`のjobは元のprocessがまだ動いている可能性があり、二重に実行し得ます。そのため`--allow-duplicate-run`を付けない限り拒否します。
   - retryで置き換えられた古いattemptが後から結果を報告しても、jobには反映しません(409)。新しいattemptが走っているjobを、古い結果で完了させないためです。
   - 入力fileの保持はjobが未完了の間だけなので、retry時に入力がcontrollerから消えていれば422で拒否します。その場合は`meld run`で投入し直します。
-- 未実装: 条件付きの自動retryとbackoff、障害注入test。
+- 自動retry(完了): `meld run --max-attempts N --idempotent`で、controllerが条件付きでjobを自動的に再実行します。既定は再実行なしです。
+  - 宣言: 2回以上の試行を許すには、jobが冪等であると明示する必要があります。回数だけの指定は投入時に拒否します(400)。再実行は、中断前の副作用を繰り返し得るためです。
+  - 対象: nodeの消失(`Lost`)、データ転送の一時的な失敗(`InputUnavailable` / `LocalStorage` / `InsufficientDisk` / `OutputUploadFailed`)、processの起動失敗です。exit codeが0以外の終了、timeout、チェックサム不一致やpath不正などjob自体に起因するデータ失敗、利用者のcancel中のjobは再実行しません。
+  - `Lost`の自動retry: 元のprocessが動き続けている場合、処理が二重に走り得ます。冪等と宣言したjobに限り許可し、古いattemptの結果はjobに反映しません。
+  - backoff: 5秒から始めて倍々に増やし、上限は5分です。待機中のjobは`Queued`のまま`waiting_to_retry`と表示し、後ろのjobを止めません。待機期限は壁時計で保存するので、再起動をまたいで残ります。
+  - 回数: `max_attempts`は1回の実行(run)あたりの試行数で、最初の試行を含みます。手動retryは新しいrunとして数え直します。
+  - job timeout: 自動retryでは延びません。最初の投入から通しで数え、期限を過ぎれば待機中に`TimedOut`になります。手動retryは利用者が意図して延長する操作なので、これまでどおり数え直します。
+  - 表示: `meld status`が`retry: attempt 2 of 3 in 4s (node lost)`のように、次の試行番号、残り時間、理由を示します。
+- 未実装: 障害注入test。
 
 ### 既知の制約
 

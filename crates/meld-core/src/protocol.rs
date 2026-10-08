@@ -245,6 +245,7 @@ mod tests {
                         execution_timeout_secs: None,
                         constraints: crate::PlacementConstraints::default(),
                         data: crate::DataSpec::default(),
+                        retry: crate::RetryPolicy::default(),
                     },
                 },
             }),

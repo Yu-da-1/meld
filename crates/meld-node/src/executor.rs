@@ -514,6 +514,7 @@ mod tests {
                 execution_timeout_secs: None,
                 constraints: meld_core::PlacementConstraints::default(),
                 data: meld_core::DataSpec::default(),
+                retry: Default::default(),
             },
         }
     }

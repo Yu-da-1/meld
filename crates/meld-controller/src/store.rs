@@ -35,6 +35,8 @@ pub enum Kind {
     JobTimeoutRequest,
     JobSubmittedAt,
     Queue,
+    AutoRetries,
+    RetryNotBefore,
     Node,
 }
 
@@ -52,6 +54,8 @@ impl Kind {
             Self::JobTimeoutRequest => "job_timeout_request",
             Self::JobSubmittedAt => "job_submitted_at",
             Self::Queue => "queue",
+            Self::AutoRetries => "auto_retries",
+            Self::RetryNotBefore => "retry_not_before",
             Self::Node => "node",
         }
     }
@@ -245,26 +249,37 @@ pub fn decode<T: serde::de::DeserializeOwned>(
     })
 }
 
-/// Wall-clock time at which `instant` occurred, in milliseconds since the epoch.
+/// Wall-clock time of `instant`, in milliseconds since the epoch.
 ///
 /// `Instant` cannot be stored, but deadlines must keep counting while the
-/// controller is down, so they are persisted as wall-clock time.
+/// controller is down, so they are persisted as wall-clock time. The instant
+/// may lie in the past (a job's submission) or the future (a retry's delay).
 pub fn instant_to_unix_ms(instant: Instant) -> u64 {
-    let elapsed = Instant::now().saturating_duration_since(instant);
-    let now = SystemTime::now()
+    let now = Instant::now();
+    let now_unix = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default();
-    millis(now.saturating_sub(elapsed))
+    if instant >= now {
+        millis(now_unix + (instant - now))
+    } else {
+        millis(now_unix.saturating_sub(now - instant))
+    }
 }
 
-/// The `Instant` for a stored wall-clock time, clamped to now if it lies in the future.
+/// The `Instant` for a stored wall-clock time, in the past or the future.
+///
+/// A time before the process could have started is clamped to now.
 pub fn unix_ms_to_instant(unix_ms: u64) -> Instant {
     let now = Instant::now();
     let now_unix = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default();
-    let age = now_unix.saturating_sub(Duration::from_millis(unix_ms));
-    now.checked_sub(age).unwrap_or(now)
+    let stored = Duration::from_millis(unix_ms);
+    if stored >= now_unix {
+        now + (stored - now_unix)
+    } else {
+        now.checked_sub(now_unix - stored).unwrap_or(now)
+    }
 }
 
 fn millis(duration: Duration) -> u64 {
@@ -351,6 +366,21 @@ mod tests {
         let error = StateStore::open(&path).expect_err("unknown schema must be refused");
 
         assert!(matches!(error, StoreError::UnsupportedSchema { .. }));
+    }
+
+    #[test]
+    fn a_future_instant_is_still_in_the_future_after_a_round_trip() {
+        let later = Instant::now() + Duration::from_secs(30);
+
+        let restored = unix_ms_to_instant(instant_to_unix_ms(later));
+
+        let drift = if restored > later {
+            restored - later
+        } else {
+            later - restored
+        };
+        assert!(drift < Duration::from_millis(50), "drift was {drift:?}");
+        assert!(restored > Instant::now() + Duration::from_secs(29));
     }
 
     #[test]

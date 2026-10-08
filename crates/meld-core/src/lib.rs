@@ -13,8 +13,8 @@ mod transition;
 pub use client::{
     ApiErrorResponse, BlobResponse, CancelJobResponse, ExecutionView, JobLogsResponse,
     JobStatusResponse, LimitedResource, ListNodesResponse, MissingInputsResponse, NodeAssessment,
-    NodeStateResponse, NodeVerdict, NodeView, QueueReason, RetryJobRequest, RetryJobResponse,
-    SubmitJobResponse,
+    NodeStateResponse, NodeVerdict, NodeView, QueueReason, RetryCause, RetryJobRequest,
+    RetryJobResponse, RetryView, SubmitJobResponse,
 };
 pub use data::{
     DataFailure, DataSpec, DataSpecError, InputFile, InvalidDigest, InvalidPath, MAX_FILE_BYTES,
@@ -26,7 +26,7 @@ pub use execution::{
     ExecutionState,
 };
 pub use id::{ExecutionId, JobId, MessageId, NodeId};
-pub use job::{Job, JobSpec, JobSpecValidationError, JobState, PlacementConstraints};
+pub use job::{Job, JobSpec, JobSpecValidationError, JobState, PlacementConstraints, RetryPolicy};
 pub use node::{NodeDescriptor, NodeState};
 pub use protocol::{
     Acknowledgement, CURRENT_PROTOCOL_VERSION, ExecutionAssignment, ExecutionEvent,

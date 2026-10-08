@@ -311,6 +311,7 @@ mod tests {
             execution_timeout_secs: Some(30),
             constraints: meld_core::PlacementConstraints::default(),
             data: meld_core::DataSpec::default(),
+            retry: Default::default(),
         };
 
         let submitted = client.submit(&spec).await.expect("job should be submitted");

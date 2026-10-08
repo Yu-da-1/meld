@@ -69,6 +69,8 @@ impl JobManager {
             &mut manager.outputs_recorded_at,
         )?;
         load_instants(store, Kind::JobSubmittedAt, &mut manager.job_submitted_at)?;
+        load_by_id(store, Kind::AutoRetries, &mut manager.auto_retries)?;
+        load_instants(store, Kind::RetryNotBefore, &mut manager.retry_not_before)?;
         load_flags(
             store,
             Kind::CancellationRequest,
@@ -136,6 +138,8 @@ impl JobManager {
             || self.job_timeout_requests.dirty().next().is_some()
             || self.job_submitted_at.dirty().next().is_some()
             || self.placements.dirty().next().is_some()
+            || self.auto_retries.dirty().next().is_some()
+            || self.retry_not_before.dirty().next().is_some()
     }
 
     /// Writes every record changed since the last flush in one transaction.
@@ -192,6 +196,13 @@ impl JobManager {
             &self.job_timeout_requests,
             |()| FLAG_BODY.to_owned(),
         );
+        collect(&mut changes, Kind::AutoRetries, &self.auto_retries, encode);
+        collect(
+            &mut changes,
+            Kind::RetryNotBefore,
+            &self.retry_not_before,
+            |instant| encode(&instant_to_unix_ms(*instant)),
+        );
         if self.queue_dirty {
             changes.push(Change::put(
                 Kind::Queue,
@@ -208,6 +219,8 @@ impl JobManager {
         self.data_failures.clear_dirty();
         self.output_files.clear_dirty();
         self.placements.clear_dirty();
+        self.auto_retries.clear_dirty();
+        self.retry_not_before.clear_dirty();
         self.outputs_recorded_at.clear_dirty();
         self.job_submitted_at.clear_dirty();
         self.cancellation_requests.clear_dirty();
@@ -341,6 +354,7 @@ mod tests {
             execution_timeout_secs: None,
             constraints: PlacementConstraints::default(),
             data: DataSpec::default(),
+            retry: Default::default(),
         }
     }
 
@@ -775,5 +789,39 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec![first, second]
         );
+    }
+
+    #[test]
+    fn the_retry_budget_and_delay_survive_a_restart() {
+        use meld_core::RetryPolicy;
+
+        let store = StateStore::open_in_memory().expect("store");
+        let registry = registry(1);
+        let mut manager = JobManager::new();
+        let mut retrying = spec();
+        retrying.retry = RetryPolicy {
+            max_attempts: 3,
+            idempotent: true,
+        };
+        let job = manager.submit(retrying).expect("submit");
+        let execution = manager
+            .schedule(job, &Scheduler::new(), &registry)
+            .expect("schedule");
+        manager.accept_execution(execution).expect("accept");
+        manager.start_execution(execution).expect("start");
+        let node = manager.execution(execution).expect("stored").node_id();
+        manager
+            .give_up_on_nodes(&BTreeSet::from([node]))
+            .expect("lost and retried");
+
+        let after = restored(&mut manager, &store);
+
+        assert_eq!(after.job(job).map(|j| j.state()), Some(JobState::Queued));
+        assert_eq!(after.automatic_retries(job), 1);
+        let wait = after
+            .retry_wait(job, Instant::now())
+            .expect("still waiting");
+        assert!(wait > Duration::from_secs(3), "{wait:?}");
+        assert_eq!(after.pending_position(job), Some(0));
     }
 }

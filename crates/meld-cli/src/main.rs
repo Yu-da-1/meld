@@ -13,7 +13,7 @@ use clap::{Args, Parser, Subcommand};
 use meld_core::{
     DataSpec, ExecutionState, JobId, JobSpec, JobState, LimitedResource, NodeId, NodeState,
     NodeStateResponse, NodeVerdict, OutputSpec, PlacementConstraints, QueueReason,
-    ResourceRequirements,
+    ResourceRequirements, RetryCause, RetryPolicy,
 };
 
 use crate::{
@@ -82,6 +82,17 @@ struct RunArgs {
     #[arg(long = "output", value_name = "PATH")]
     outputs: Vec<String>,
 
+    /// Let the controller run the job again by itself, up to this many
+    /// attempts in all, when its node is lost or cannot start it or move its
+    /// data. Needs --idempotent. A job that exits with an error is not rerun.
+    #[arg(long, value_name = "N", value_parser = clap::value_parser!(u32).range(1..))]
+    max_attempts: Option<u32>,
+
+    /// State that running the job again is safe. A rerun can repeat what the
+    /// job did before it was interrupted, so automatic retry requires this.
+    #[arg(long)]
+    idempotent: bool,
+
     /// Program and arguments. Place these after `--`.
     #[arg(required = true, num_args = 1.., trailing_var_arg = true)]
     command: Vec<String>,
@@ -115,6 +126,10 @@ impl RunArgs {
                     .into_iter()
                     .map(|path| OutputSpec { path })
                     .collect(),
+            },
+            retry: RetryPolicy {
+                max_attempts: self.max_attempts.unwrap_or(1),
+                idempotent: self.idempotent,
             },
         };
         (spec, self.inputs)
@@ -337,6 +352,15 @@ async fn show_status(client: &ControllerClient, job_id: JobId) -> Result<(), Box
             );
         }
     }
+    if let Some(retry) = response.retry {
+        println!(
+            "retry: attempt {} of {} in {}s ({})",
+            retry.next_attempt,
+            retry.max_attempts,
+            retry.retry_in_ms.div_ceil(1000),
+            retry_cause_name(retry.cause)
+        );
+    }
     if response.attempts.len() > 1 {
         println!("attempts:");
         for (index, attempt) in response.attempts.iter().enumerate() {
@@ -552,6 +576,15 @@ const fn queue_reason_name(reason: QueueReason) -> &'static str {
         QueueReason::NoAvailableNodes => "no_available_nodes",
         QueueReason::WaitingForEarlierJob => "waiting_for_earlier_job",
         QueueReason::AwaitingAssignment => "awaiting_assignment",
+        QueueReason::WaitingToRetry => "waiting_to_retry",
+    }
+}
+
+const fn retry_cause_name(cause: RetryCause) -> &'static str {
+    match cause {
+        RetryCause::NodeLost => "node lost",
+        RetryCause::DataTransfer => "data transfer failed",
+        RetryCause::StartFailed => "process could not start",
     }
 }
 

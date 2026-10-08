@@ -24,7 +24,8 @@ use meld_core::{
     MissingInputsResponse, NodeCommand, NodeId, NodeState, NodeStateResponse, NodeView, OutputFile,
     PollNodeCommandRequest, PollNodeCommandResponse, ProtocolError, ProtocolErrorResponse,
     QueueReason, RegisterNodeRequest, RegisterNodeResponse, ReportExecutionEventRequest,
-    ResponseMetadata, RetryJobRequest, RetryJobResponse, Sha256Digest, SubmitJobResponse,
+    ResponseMetadata, RetryJobRequest, RetryJobResponse, RetryView, Sha256Digest,
+    SubmitJobResponse,
 };
 use tokio::{sync::watch, time::timeout};
 use tokio_util::io::ReaderStream;
@@ -179,6 +180,17 @@ impl ControllerState {
             self.notify_command_update();
         }
         Ok((lost, requeued))
+    }
+
+    /// Wakes waiting nodes when an automatic retry's delay has passed.
+    pub fn release_due_retries(&self, now: Instant) -> Result<Vec<JobId>, ControllerStateError> {
+        let mut jobs = self.jobs_mut()?;
+        let due = jobs.release_due_retries(now);
+        drop(jobs);
+        if !due.is_empty() {
+            self.notify_command_update();
+        }
+        Ok(due)
     }
 
     pub fn expire_jobs(&self, now: Instant) -> Result<Vec<JobId>, ControllerStateError> {
@@ -804,7 +816,22 @@ async fn job_status(State(state): State<ControllerState>, Path(job_id): Path<Job
     let outputs = latest_execution_id
         .map(|id| jobs.output_files(id).to_vec())
         .unwrap_or_default();
-    let queue_reason = if job.state() == JobState::Queued {
+    let now = Instant::now();
+    let waiting_to_retry = jobs.retry_wait(job_id, now);
+    let retry = (job.state() == JobState::Queued && jobs.automatic_retries(job_id) > 0)
+        .then(|| {
+            jobs.retry_cause(job_id).map(|cause| RetryView {
+                next_attempt: jobs.attempts(job_id).len() as u32 + 1,
+                max_attempts: job.spec().retry.max_attempts,
+                retry_in_ms: waiting_to_retry
+                    .map_or(0, |wait| wait.as_millis().min(u128::from(u64::MAX)) as u64),
+                cause,
+            })
+        })
+        .flatten();
+    let queue_reason = if waiting_to_retry.is_some() {
+        Some(QueueReason::WaitingToRetry)
+    } else if job.state() == JobState::Queued {
         match jobs.pending_position(job_id) {
             Some(_)
                 if jobs
@@ -844,6 +871,7 @@ async fn job_status(State(state): State<ControllerState>, Path(job_id): Path<Job
         spec: job.spec().clone(),
         state: job.state(),
         queue_reason,
+        retry,
         execution,
         attempts,
         data_failure,
@@ -3057,6 +3085,93 @@ mod tests {
         }
     }
 
+    mod auto_retry {
+        use meld_core::{RetryCause, RetryPolicy};
+
+        use super::*;
+
+        #[tokio::test]
+        async fn several_attempts_without_an_idempotence_declaration_are_rejected() {
+            let state = ControllerState::new();
+            let mut spec = job_spec();
+            spec.retry = RetryPolicy {
+                max_attempts: 3,
+                idempotent: false,
+            };
+
+            let response = router(state.clone())
+                .oneshot(submit_job_json_request(spec))
+                .await
+                .expect("job submission should be handled");
+
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+            let body = to_bytes(response.into_body(), usize::MAX)
+                .await
+                .expect("body");
+            assert!(String::from_utf8_lossy(&body).contains("idempotent"));
+        }
+
+        #[tokio::test]
+        async fn status_shows_why_and_when_a_lost_attempt_will_be_retried() {
+            let state = ControllerState::new();
+            let node_id = NodeId::generate();
+            register_ready_node(&state, node_id);
+            let mut spec = job_spec();
+            spec.requirements.memory_bytes = 8_000;
+            spec.retry = RetryPolicy {
+                max_attempts: 3,
+                idempotent: true,
+            };
+            let response = router(state.clone())
+                .oneshot(submit_job_json_request(spec))
+                .await
+                .expect("job submission should be handled");
+            let body = to_bytes(response.into_body(), usize::MAX)
+                .await
+                .expect("body");
+            let job_id = serde_json::from_slice::<SubmitJobResponse>(&body)
+                .expect("submitted job")
+                .job_id;
+            let Some(NodeCommand::Start { assignment }) =
+                poll_for_command(&state, node_id, vec![]).await
+            else {
+                panic!("the job should be assigned");
+            };
+            for event in [ExecutionEvent::Accepted, ExecutionEvent::Running] {
+                report_event(state.clone(), node_id, assignment.execution_id, event).await;
+            }
+            let last_heartbeat = state
+                .registry
+                .read()
+                .expect("registry lock")
+                .get(node_id)
+                .and_then(|node| node.last_heartbeat_at())
+                .expect("node has heartbeated");
+            let timeout = Duration::from_secs(15);
+            state
+                .detect_unreachable_nodes(&FailureDetector::new(timeout), last_heartbeat + timeout)
+                .expect("detection");
+
+            state
+                .give_up_on_silent_nodes(last_heartbeat + timeout * 2, timeout)
+                .expect("giving up");
+
+            let status = get_job_status(state.clone(), job_id).await;
+            assert_eq!(status.state, JobState::Queued);
+            assert_eq!(status.queue_reason, Some(QueueReason::WaitingToRetry));
+            let retry = status.retry.expect("a waiting retry is described");
+            assert_eq!(retry.next_attempt, 2);
+            assert_eq!(retry.max_attempts, 3);
+            assert_eq!(retry.cause, RetryCause::NodeLost);
+            assert!(retry.retry_in_ms > 0);
+            assert_eq!(status.attempts.len(), 1);
+            // The delay holds the job back even from a node that is ready and idle.
+            let other = NodeId::generate();
+            register_ready_node(&state, other);
+            assert_eq!(poll_for_command(&state, other, vec![]).await, None);
+        }
+    }
+
     mod silent_nodes {
         use meld_core::ExecutionOutput;
 
@@ -3982,6 +4097,7 @@ mod tests {
             execution_timeout_secs: None,
             constraints: meld_core::PlacementConstraints::default(),
             data: meld_core::DataSpec::default(),
+            retry: Default::default(),
         }
     }
 }
