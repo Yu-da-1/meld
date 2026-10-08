@@ -12,6 +12,7 @@ use meld_controller::{
     api::{ControllerState, ControllerStateError, DEFAULT_OUTPUT_RETENTION, router},
     blob_store::{BlobLimits, BlobStore},
     failure_detector::FailureDetector,
+    job_manager::RetryBackoff,
     store::StateStore,
 };
 use tokio::net::TcpListener;
@@ -23,6 +24,8 @@ const DEFAULT_HEARTBEAT_TIMEOUT_SECS: u64 = 15;
 /// How long an unreachable node may stay silent before its executions are given up on.
 const LOST_GRACE_ENV: &str = "MELD_LOST_GRACE_SECS";
 const DEFAULT_LOST_GRACE_SECS: u64 = 30;
+const RETRY_BACKOFF_ENV: &str = "MELD_RETRY_BACKOFF_SECS";
+const RETRY_BACKOFF_MAX_ENV: &str = "MELD_RETRY_BACKOFF_MAX_SECS";
 const LIVENESS_CHECK_INTERVAL: Duration = Duration::from_secs(1);
 const STATE_DB_FILE: &str = "state.db";
 const STATE_DIR_ENV: &str = "MELD_CONTROLLER_STATE_DIR";
@@ -55,7 +58,9 @@ async fn main() -> Result<(), Box<dyn Error>> {
         DEFAULT_OUTPUT_RETENTION.as_secs(),
     )?);
     let store = StateStore::open(&state_directory.join(STATE_DB_FILE))?;
+    let retry_backoff = retry_backoff_from_env()?;
     let state = ControllerState::new()
+        .with_retry_backoff(retry_backoff)
         .with_blob_store(Arc::new(blobs))
         .with_output_retention(output_retention)
         .with_store(Arc::new(store))?;
@@ -64,6 +69,8 @@ async fn main() -> Result<(), Box<dyn Error>> {
         address = %listener.local_addr()?,
         heartbeat_timeout_secs = heartbeat_timeout.as_secs(),
         lost_grace_secs = lost_grace.as_secs(),
+        retry_backoff_secs = retry_backoff.initial.as_secs(),
+        retry_backoff_max_secs = retry_backoff.max.as_secs(),
         state_directory = %state_directory.display(),
         max_blob_bytes = blob_limits.max_blob_bytes,
         blob_quota_bytes = blob_limits.quota_bytes,
@@ -120,6 +127,28 @@ async fn monitor_liveness(
             tracing::warn!(%execution_id, "node stayed silent; unacknowledged execution requeued");
         }
     }
+}
+
+/// Delay before the first automatic retry, and the cap it doubles up to.
+fn retry_backoff_from_env() -> io::Result<RetryBackoff> {
+    let defaults = RetryBackoff::default();
+    let backoff = RetryBackoff {
+        initial: Duration::from_secs(positive_u64_from_env(
+            RETRY_BACKOFF_ENV,
+            defaults.initial.as_secs(),
+        )?),
+        max: Duration::from_secs(positive_u64_from_env(
+            RETRY_BACKOFF_MAX_ENV,
+            defaults.max.as_secs(),
+        )?),
+    };
+    if backoff.max < backoff.initial {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("{RETRY_BACKOFF_MAX_ENV} must not be smaller than {RETRY_BACKOFF_ENV}"),
+        ));
+    }
+    Ok(backoff)
 }
 
 fn heartbeat_timeout_from_env() -> io::Result<Duration> {

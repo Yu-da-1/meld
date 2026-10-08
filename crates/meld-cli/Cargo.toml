@@ -20,5 +20,6 @@ tokio-util = { version = "0.7", features = ["io"] }
 [dev-dependencies]
 axum = "0.8"
 meld-controller = { path = "../meld-controller" }
+serde_json = "1"
 tempfile = "3"
 tokio = { version = "1", features = ["net"] }

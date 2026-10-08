@@ -280,7 +280,7 @@ processやnetworkの障害を状態として扱い、controller再起動後に�
 
 ### 現在地
 
-進行中です。次のスライスを実装済みで、残りは未着手です。
+完了しています。
 
 - 永続化(完了): controllerの状態をローカルのSQLite(`<state dir>/state.db`)へ保存し、起動時に復元します。保存するのはjobとexecution(attemptの順序を含む)、stdout/stderr、データ失敗の理由、出力file、cancelとjob timeoutの要求、キューの順序、配置の判定、nodeのdescriptorとdrainの意図です。attempt一覧や資源の予約のように導出できるものは保存せず、復元時に組み直します。変更はロックを保持したまま保存してから応答します。job投入だけは、保存に失敗すると500を返します。
 - job timeout: deadlineは壁時計時刻で保存するので、controllerの停止中も進みます。
@@ -301,7 +301,32 @@ processやnetworkの障害を状態として扱い、controller再起動後に�
   - 回数: `max_attempts`は1回の実行(run)あたりの試行数で、最初の試行を含みます。手動retryは新しいrunとして数え直します。
   - job timeout: 自動retryでは延びません。最初の投入から通しで数え、期限を過ぎれば待機中に`TimedOut`になります。手動retryは利用者が意図して延長する操作なので、これまでどおり数え直します。
   - 表示: `meld status`が`retry: attempt 2 of 3 in 4s (node lost)`のように、次の試行番号、残り時間、理由を示します。
-- 未実装: 障害注入test。
+- 障害注入test(完了): `crates/meld-cli/tests/fault_injection.rs`が、実processのcontroller、node、`meld`を起動して障害を起こします。補助コードは`tests/common`で`data_movement.rs`と共有します。待ち時間は`MELD_HEARTBEAT_TIMEOUT_SECS`、`MELD_LOST_GRACE_SECS`、`MELD_RETRY_BACKOFF_SECS`、`MELD_RETRY_BACKOFF_MAX_SECS`で短縮できます。
+
+  | 起こす障害 | 確認すること |
+  |---|---|
+  | 実行中にcontrollerをkillして再起動 | jobは中断されず、nodeが新しいcontrollerへ結果を報告して完了する |
+  | 実行中にnodeをkill | 猶予後に`lost`になる。retryを求めていないjobは、別のnodeが空いていても再実行されない |
+  | 上のjobが冪等でretryを許可 | 別のnodeで2回目が走り、成功する。processは試行ごとに1回だけ起動する |
+  | 冪等なjobがexit 3で終了 | 再実行されない |
+  | nodeをkillしたままcontrollerを再起動 | 再起動したcontrollerが沈黙を数えなおし、jobを`lost`にする |
+  | retryの待機中にcontrollerを再起動 | 待機は残り、別のnodeの追加後に2回目が走る |
+  | nodeを`SIGSTOP`で凍結し、`SIGCONT`で再開 | 凍結中に`lost`になり、再開後に報告された実際の結果が`Lost`を置き換える |
+  | execution timeoutを超えるprocess(冪等でretry許可) | processは止まり、`failed`になる。再実行されない |
+  | job timeoutを超える実行中のjob(冪等でretry許可) | `timed_out`になる。再実行されない |
+  | 完了済みexecutionの終了報告を重複して送信 | 同じ報告は受理(200)、矛盾する結果と前の段階の再送は拒否(409)し、jobは変わらない |
+
+  テストが本当に障害を検出できることは、実装を意図的に壊して確認しました。復元後のnodeの沈黙を数えない、retryの待機期限を復元しない、`Lost`への遅れた結果を拒否する、の3つで、対応するテストがそれぞれ失敗します。この確認で、待機期限の復元は当初のテストでは検出できないことがわかり、再起動直後の待機表示を検証に加えました。
+
+### 完了条件の確認
+
+| 完了条件 | 状態 |
+|---|---|
+| controller再起動後にnodeとjobの既知状態を復元できる | 達成。SQLiteへ保存し、起動時に復元する |
+| nodeからの再接続情報と永続状態をreconcileできる | 達成。復元した実行中のexecutionを、nodeの最初のpollで確認する |
+| retryが新しいattemptとして記録される | 達成。手動と自動のどちらも、同じjobに新しいexecutionを追加する |
+| 非冪等jobを無条件に自動再実行しない | 達成。冪等の明示を必須とし、既定では再実行しない |
+| 障害注入testで切断、timeout、重複messageを検証できる | 達成。切断と重複は上の表のとおり。timeoutは、execution timeoutとjob timeoutのどちらも、実processで止まり、冪等でretryを許可したjobでも再実行されないことを確認している |
 
 ### 既知の制約
 

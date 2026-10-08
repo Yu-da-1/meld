@@ -817,6 +817,7 @@ dependencies = [
  "meld-core",
  "reqwest",
  "serde",
+ "serde_json",
  "sha2",
  "tempfile",
  "tokio",

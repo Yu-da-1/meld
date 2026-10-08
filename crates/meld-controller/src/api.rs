@@ -33,7 +33,7 @@ use tokio_util::io::ReaderStream;
 use crate::{
     blob_store::{BlobError, BlobStore, PutOutcome},
     failure_detector::FailureDetector,
-    job_manager::{JobManager, JobManagerError},
+    job_manager::{JobManager, JobManagerError, RetryBackoff},
     node_registry::{NodeRegistry, NodeRegistryError},
     scheduler::{Scheduler, SchedulingFailure},
     store::{Persist, StateStore, StoreError},
@@ -64,6 +64,8 @@ pub struct ControllerState {
     blobs: Option<Arc<BlobStore>>,
     /// Absent for a controller that keeps its state in memory only.
     store: Option<Arc<StateStore>>,
+    /// Kept here as well as in the job manager, which is replaced on restore.
+    retry_backoff: RetryBackoff,
     /// How long outputs are protected from eviction after a job finishes.
     output_retention: Duration,
     command_updates: watch::Sender<u64>,
@@ -80,6 +82,7 @@ impl Default for ControllerState {
             jobs: Arc::default(),
             blobs: None,
             store: None,
+            retry_backoff: RetryBackoff::default(),
             output_retention: DEFAULT_OUTPUT_RETENTION,
             command_updates,
             started_at: Instant::now(),
@@ -106,13 +109,28 @@ impl ControllerState {
         self
     }
 
+    /// Sets how long automatic retries wait.
+    #[must_use]
+    pub fn with_retry_backoff(self, backoff: RetryBackoff) -> Self {
+        let mut state = self;
+        state.retry_backoff = backoff;
+        state
+            .jobs
+            .write()
+            .expect("job manager lock is not shared yet")
+            .set_retry_backoff(backoff);
+        state
+    }
+
     /// Makes controller state durable, first restoring whatever the store holds.
     ///
     /// From then on every change to nodes and jobs is written before the
     /// request that made it is answered.
     pub fn with_store(mut self, store: Arc<StateStore>) -> Result<Self, StoreError> {
         self.registry = Arc::new(RwLock::new(NodeRegistry::restore(&store)?));
-        self.jobs = Arc::new(RwLock::new(JobManager::restore(&store)?));
+        let mut jobs = JobManager::restore(&store)?;
+        jobs.set_retry_backoff(self.retry_backoff);
+        self.jobs = Arc::new(RwLock::new(jobs));
         self.store = Some(store);
         Ok(self)
     }

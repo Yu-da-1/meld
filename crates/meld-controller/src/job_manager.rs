@@ -96,6 +96,11 @@ impl JobManager {
     }
 
     /// Replaces the delay between automatic retries.
+    pub fn set_retry_backoff(&mut self, backoff: RetryBackoff) {
+        self.backoff = backoff;
+    }
+
+    /// Replaces the delay between automatic retries.
     #[must_use]
     pub fn with_retry_backoff(mut self, backoff: RetryBackoff) -> Self {
         self.backoff = backoff;
