@@ -14,6 +14,7 @@ use axum::{
     body::Body,
     extract::{Path, State},
     http::{HeaderMap, StatusCode, header},
+    middleware,
     response::{IntoResponse, Response},
     routing::{get, post, put},
 };
@@ -31,6 +32,7 @@ use tokio::{sync::watch, time::timeout};
 use tokio_util::io::ReaderStream;
 
 use crate::{
+    auth::{Allowed, Authenticator, authenticate},
     blob_store::{BlobError, BlobStore, PutOutcome},
     failure_detector::FailureDetector,
     job_manager::{JobManager, JobManagerError, RetryBackoff},
@@ -299,21 +301,45 @@ impl fmt::Display for ControllerStateError {
 
 impl Error for ControllerStateError {}
 
+/// A router that lets every request through. See [`router_with_auth`].
 pub fn router(state: ControllerState) -> Router {
-    Router::new()
+    router_with_auth(state, Authenticator::disabled())
+}
+
+/// Every route is placed in one of three groups, so that adding a route
+/// forces a decision about who may call it.
+pub fn router_with_auth(state: ControllerState, authenticator: Authenticator) -> Router {
+    let guard =
+        |allowed| middleware::from_fn_with_state((authenticator.clone(), allowed), authenticate);
+
+    // Used by people through `meld`.
+    let client_routes = Router::new()
         .route(LIST_NODES_PATH, get(list_nodes))
-        .route(REGISTER_NODE_PATH, post(register_node))
-        .route(HEARTBEAT_PATH, post(record_heartbeat))
         .route(DRAIN_NODE_PATH, post(drain_node))
         .route(RESUME_NODE_PATH, post(resume_node))
-        .route(BLOB_PATH, put(put_blob).get(get_blob))
         .route(SUBMIT_JOB_PATH, post(submit_job))
         .route(JOB_STATUS_PATH, get(job_status))
         .route(JOB_LOGS_PATH, get(job_logs))
         .route(CANCEL_JOB_PATH, post(cancel_job))
         .route(RETRY_JOB_PATH, post(retry_job))
+        .route_layer(guard(Allowed::CLIENT));
+
+    // Used by `meld-node` to take part in the cluster.
+    let node_routes = Router::new()
+        .route(REGISTER_NODE_PATH, post(register_node))
+        .route(HEARTBEAT_PATH, post(record_heartbeat))
         .route(POLL_NODE_COMMAND_PATH, post(poll_node_command))
         .route(REPORT_EXECUTION_EVENT_PATH, post(report_execution_event))
+        .route_layer(guard(Allowed::NODE));
+
+    // Clients upload inputs and fetch outputs; nodes do the reverse.
+    let data_routes = Router::new()
+        .route(BLOB_PATH, put(put_blob).get(get_blob))
+        .route_layer(guard(Allowed::EITHER));
+
+    client_routes
+        .merge(node_routes)
+        .merge(data_routes)
         .with_state(state)
 }
 

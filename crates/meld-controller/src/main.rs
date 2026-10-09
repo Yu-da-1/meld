@@ -9,12 +9,14 @@ use std::{
 
 use directories::BaseDirs;
 use meld_controller::{
-    api::{ControllerState, ControllerStateError, DEFAULT_OUTPUT_RETENTION, router},
+    api::{ControllerState, ControllerStateError, DEFAULT_OUTPUT_RETENTION, router_with_auth},
+    auth::Authenticator,
     blob_store::{BlobLimits, BlobStore},
     failure_detector::FailureDetector,
     job_manager::RetryBackoff,
     store::StateStore,
 };
+use meld_core::{CLIENT_TOKEN_ENV, NODE_TOKEN_ENV, SecretToken};
 use tokio::net::TcpListener;
 use tokio::time::{MissedTickBehavior, interval};
 use tracing_subscriber::EnvFilter;
@@ -64,9 +66,29 @@ async fn main() -> Result<(), Box<dyn Error>> {
         .with_blob_store(Arc::new(blobs))
         .with_output_retention(output_retention)
         .with_store(Arc::new(store))?;
+    let authenticator = Authenticator::new(
+        SecretToken::from_env(CLIENT_TOKEN_ENV)?,
+        SecretToken::from_env(NODE_TOKEN_ENV)?,
+        CLIENT_TOKEN_ENV,
+        NODE_TOKEN_ENV,
+    )?;
     let listener = TcpListener::bind(&bind_address).await?;
+    let address = listener.local_addr()?;
+    if !authenticator.is_enabled() {
+        if !address.ip().is_loopback() {
+            return Err(format!(
+                "refusing to listen on {address} without authentication: \
+                 set {CLIENT_TOKEN_ENV} and {NODE_TOKEN_ENV}, or listen on a loopback address"
+            )
+            .into());
+        }
+        tracing::warn!(
+            "authentication is off; anyone on this machine can run commands through Meld"
+        );
+    }
     tracing::info!(
-        address = %listener.local_addr()?,
+        address = %address,
+        authentication = authenticator.is_enabled(),
         heartbeat_timeout_secs = heartbeat_timeout.as_secs(),
         lost_grace_secs = lost_grace.as_secs(),
         retry_backoff_secs = retry_backoff.initial.as_secs(),
@@ -79,7 +101,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
     );
 
     tokio::select! {
-        result = axum::serve(listener, router(state.clone())) => result?,
+        result = axum::serve(listener, router_with_auth(state.clone(), authenticator)) => result?,
         result = monitor_liveness(
             state.clone(),
             FailureDetector::new(heartbeat_timeout),

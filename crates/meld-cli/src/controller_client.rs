@@ -3,9 +3,13 @@ use std::{error::Error, fmt, path::Path, time::Duration};
 use meld_core::{
     ApiErrorResponse, BlobResponse, CancelJobResponse, JobId, JobLogsResponse, JobSpec,
     JobStatusResponse, ListNodesResponse, MissingInputsResponse, NodeId, NodeStateResponse,
-    RetryJobRequest, RetryJobResponse, Sha256Digest, SubmitJobResponse,
+    RetryJobRequest, RetryJobResponse, SecretToken, Sha256Digest, SubmitJobResponse,
 };
-use reqwest::{Body, Client, Response, StatusCode, Url, header::CONTENT_LENGTH};
+use reqwest::{
+    Body, Client, ClientBuilder, Response, StatusCode, Url,
+    header::{AUTHORIZATION, CONTENT_LENGTH, HeaderMap, HeaderValue},
+    redirect::Policy,
+};
 use serde::de::DeserializeOwned;
 use tokio_util::io::ReaderStream;
 
@@ -23,20 +27,31 @@ pub struct ControllerClient {
 }
 
 impl ControllerClient {
+    #[cfg(test)]
     pub fn new(controller_url: &str) -> Result<Self, ControllerClientError> {
+        Self::with_token(controller_url, None)
+    }
+
+    /// A client that presents `token` on every request.
+    pub fn with_token(
+        controller_url: &str,
+        token: Option<&SecretToken>,
+    ) -> Result<Self, ControllerClientError> {
         let normalized_url = format!("{}/", controller_url.trim_end_matches('/'));
         let controller_url = Url::parse(&normalized_url)
             .map_err(|error| ControllerClientError::InvalidUrl(error.to_string()))?;
-        let http = Client::builder()
-            .timeout(REQUEST_TIMEOUT)
+        let http = authenticated(Client::builder().timeout(REQUEST_TIMEOUT), token)?
             .build()
             .map_err(ControllerClientError::Request)?;
 
-        let blob_http = Client::builder()
-            .connect_timeout(BLOB_CONNECT_TIMEOUT)
-            .read_timeout(BLOB_READ_TIMEOUT)
-            .build()
-            .map_err(ControllerClientError::Request)?;
+        let blob_http = authenticated(
+            Client::builder()
+                .connect_timeout(BLOB_CONNECT_TIMEOUT)
+                .read_timeout(BLOB_READ_TIMEOUT),
+            token,
+        )?
+        .build()
+        .map_err(ControllerClientError::Request)?;
 
         Ok(Self {
             http,
@@ -235,6 +250,24 @@ where
         .map_err(ControllerClientError::InvalidResponse)
 }
 
+/// Makes the client present `token`, and never follow a redirect, which could
+/// carry it to another host.
+fn authenticated(
+    builder: ClientBuilder,
+    token: Option<&SecretToken>,
+) -> Result<ClientBuilder, ControllerClientError> {
+    let builder = builder.redirect(Policy::none());
+    let Some(token) = token else {
+        return Ok(builder);
+    };
+    let mut value = HeaderValue::from_str(&format!("Bearer {}", token.expose()))
+        .map_err(|_| ControllerClientError::InvalidUrl("the token is not a valid header".into()))?;
+    value.set_sensitive(true);
+    let mut headers = HeaderMap::new();
+    headers.insert(AUTHORIZATION, value);
+    Ok(builder.default_headers(headers))
+}
+
 #[derive(Debug)]
 pub enum ControllerClientError {
     InvalidUrl(String),
@@ -258,7 +291,11 @@ impl fmt::Display for ControllerClientError {
                 write!(
                     formatter,
                     "controller rejected the request ({status}): {message}"
-                )
+                )?;
+                if matches!(*status, StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN) {
+                    write!(formatter, " (check {})", meld_core::CLIENT_TOKEN_ENV)?;
+                }
+                Ok(())
             }
             Self::InvalidResponse(error) => {
                 write!(

@@ -8,7 +8,7 @@ Meld は、自宅や小規模な環境にある複数のコンピューターを
 
 ## 現在の状態
 
-Phase 0からPhase 5までが完了し、次はPhase 6の永続化と障害復旧へ進む段階です。
+Phase 0からPhase 6までが完了し、Phase 7(セキュリティと実行隔離)を進めています。認証(7a)まで実装済みです。
 
 - `meld-controller`、`meld-node`、`meld-core`、`meld-cli` の4 crateでvirtual workspaceを構成しています。
 - 共有domain model、job / execution状態遷移、in-memory Node RegistryとJob Manager、least-loaded Schedulerを実装済みです。
@@ -25,7 +25,8 @@ Phase 0からPhase 5までが完了し、次はPhase 6の永続化と障害復�
   - `meld run --input SRC[=DEST] --output PATH -- <command>`で、手元のファイルやディレクトリをjobの作業ディレクトリへ送り、jobが作ったファイルを宣言できます。`meld fetch <job-id>`で回収します。
   - ファイルは内容のsha256で識別し、controllerが持たない内容だけを転送します。nodeはローカルcacheで再利用します。受信側は常にhashとサイズを検証します。
   - 転送の失敗は、jobの失敗と理由(`meld status`の`data_failure`)として表示されます。
-  - 認証と暗号化はまだありません。信頼された開発用LANでのみ使用してください。
+- Phase 6の永続化と障害復旧として、controllerの状態はSQLiteに保存され、再起動後に復元されます。node消失は`Lost`として扱い、`meld retry`と、冪等と宣言したjobの自動retryがあります。
+- Phase 7の認証として、controllerはclient用とnode用の別々のトークンで呼び出し元を確認します。通信はまだ暗号化されないため、信頼された開発用LANでのみ使用してください。
 
 ## 使い方
 
@@ -50,6 +51,18 @@ meld cancel <job-id>
 | controller | `MELD_BLOB_QUOTA_BYTES` | 16GiB | 保管する内容の合計 |
 | controller | `MELD_OUTPUT_RETENTION_SECS` | 86400 | 完了したjobの出力を削除しない期間 |
 | node | `MELD_CACHE_MAX_BYTES` | 8GiB | 入力のcacheの上限 |
+| controller | `MELD_CLIENT_TOKEN` | なし | `meld`が提示するトークン(controllerと`meld`の両方に設定) |
+| controller | `MELD_NODE_TOKEN` | なし | nodeが提示するトークン(controllerと各nodeに設定) |
+
+### 認証
+
+トークンは16文字以上の、空白を含まない表示可能なASCII文字列です。`meld`は`MELD_CLIENT_TOKEN`、nodeは`MELD_NODE_TOKEN`を環境変数から読みます(コマンドラインに出さないため、引数では渡せません)。
+
+- 両方のトークンを設定すると、controllerは全APIで`Authorization: Bearer <token>`を要求します。片方だけの設定と、同じ値の設定は起動時に拒否します。
+- clientのトークンではjobの投入・照会・cancelなど、nodeのトークンではnodeの登録・heartbeat・割り当ての取得・結果の報告ができます。互いの操作はできません(403)。ファイルの転送だけは両方に許可します。
+- 未設定のままloopback以外のアドレス(`MELD_CONTROLLER_ADDR=0.0.0.0:3000`など)で待ち受けようとすると、controllerは起動を拒否します。loopbackでは警告を出して認証なしで動きます。
+- トークンの変更は、controllerとすべてのnode、`meld`の設定を揃えて再起動します。トークンが合わないnodeは終了します。
+- 通信は暗号化されません。トークンは平文で送られるため、盗聴できるネットワークでは守りになりません。暗号化は7cで扱います。
 
 将来的には、利用者が物理的な実行先を毎回指定せず、データの所在も考慮して実行先が決まる状態を目指します。
 

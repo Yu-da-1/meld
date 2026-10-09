@@ -11,9 +11,9 @@ use std::{
 
 use clap::{Args, Parser, Subcommand};
 use meld_core::{
-    DataSpec, ExecutionState, JobId, JobSpec, JobState, LimitedResource, NodeId, NodeState,
-    NodeStateResponse, NodeVerdict, OutputSpec, PlacementConstraints, QueueReason,
-    ResourceRequirements, RetryCause, RetryPolicy,
+    CLIENT_TOKEN_ENV, DataSpec, ExecutionState, JobId, JobSpec, JobState, LimitedResource, NodeId,
+    NodeState, NodeStateResponse, NodeVerdict, OutputSpec, PlacementConstraints, QueueReason,
+    ResourceRequirements, RetryCause, RetryPolicy, SecretToken,
 };
 
 use crate::{
@@ -198,7 +198,8 @@ async fn main() -> ExitCode {
 
 async fn run() -> Result<(), Box<dyn Error>> {
     let cli = Cli::parse();
-    let client = ControllerClient::new(&cli.controller)?;
+    let token = SecretToken::from_env(CLIENT_TOKEN_ENV)?;
+    let client = ControllerClient::with_token(&cli.controller, token.as_ref())?;
 
     match cli.command {
         Commands::Run(args) => {

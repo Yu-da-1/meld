@@ -8,9 +8,13 @@ use meld_core::{
     Acknowledgement, CURRENT_PROTOCOL_VERSION, ExecutionEvent, ExecutionId, HeartbeatRequest,
     NodeCommand, NodeDescriptor, NodeId, PollNodeCommandRequest, PollNodeCommandResponse,
     ProtocolError, ProtocolErrorResponse, RegisterNodeRequest, RegisterNodeResponse,
-    ReportExecutionEventRequest, RequestMetadata, ResourceSnapshot, ResponseMetadata,
+    ReportExecutionEventRequest, RequestMetadata, ResourceSnapshot, ResponseMetadata, SecretToken,
 };
-use reqwest::{Body, Client, Response, StatusCode, header::CONTENT_LENGTH};
+use reqwest::{
+    Body, Client, ClientBuilder, Response, StatusCode,
+    header::{AUTHORIZATION, CONTENT_LENGTH, HeaderMap, HeaderValue},
+    redirect::Policy,
+};
 use tokio_util::io::ReaderStream;
 
 use crate::{
@@ -38,13 +42,25 @@ pub struct ControllerClient {
 }
 
 impl ControllerClient {
+    #[cfg(test)]
     pub fn new(controller_url: &str) -> Result<Self, reqwest::Error> {
+        Self::with_token(controller_url, None)
+    }
+
+    /// A client that presents `token` on every request.
+    pub fn with_token(
+        controller_url: &str,
+        token: Option<&SecretToken>,
+    ) -> Result<Self, reqwest::Error> {
         Ok(Self {
-            http: Client::builder().timeout(REQUEST_TIMEOUT).build()?,
-            blob_http: Client::builder()
-                .connect_timeout(BLOB_CONNECT_TIMEOUT)
-                .read_timeout(BLOB_READ_TIMEOUT)
-                .build()?,
+            http: authenticated(Client::builder().timeout(REQUEST_TIMEOUT), token).build()?,
+            blob_http: authenticated(
+                Client::builder()
+                    .connect_timeout(BLOB_CONNECT_TIMEOUT)
+                    .read_timeout(BLOB_READ_TIMEOUT),
+                token,
+            )
+            .build()?,
             controller_url: controller_url.trim_end_matches('/').to_owned(),
         })
     }
@@ -249,6 +265,22 @@ impl BlobSink for ControllerClient {
     }
 }
 
+/// Makes the client present `token`, and never follow a redirect, which could
+/// carry it to another host.
+fn authenticated(builder: ClientBuilder, token: Option<&SecretToken>) -> ClientBuilder {
+    let builder = builder.redirect(Policy::none());
+    let Some(token) = token else {
+        return builder;
+    };
+    // A token is visible ASCII, which is always a valid header value.
+    let mut value = HeaderValue::from_str(&format!("Bearer {}", token.expose()))
+        .expect("a token is a valid header value");
+    value.set_sensitive(true);
+    let mut headers = HeaderMap::new();
+    headers.insert(AUTHORIZATION, value);
+    builder.default_headers(headers)
+}
+
 #[derive(Debug)]
 pub enum ControllerClientError {
     Unavailable(reqwest::Error),
@@ -261,6 +293,13 @@ impl ControllerClientError {
     pub fn is_retryable(&self) -> bool {
         matches!(self, Self::Unavailable(_))
             || matches!(self, Self::Rejected(status) if status.is_server_error() || *status == StatusCode::TOO_MANY_REQUESTS)
+    }
+
+    /// The controller does not accept this node's token. Retrying cannot help
+    /// until the configuration is fixed.
+    pub fn is_authentication_failure(&self) -> bool {
+        matches!(self, Self::Rejected(status)
+            if matches!(*status, StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN))
     }
 
     pub fn requires_registration(&self) -> bool {
@@ -277,7 +316,11 @@ impl fmt::Display for ControllerClientError {
             Self::Unavailable(error) => write!(formatter, "controller is unavailable: {error}"),
             Self::Protocol(error) => write!(formatter, "controller rejected protocol: {error:?}"),
             Self::Rejected(status) => {
-                write!(formatter, "controller rejected request with HTTP {status}")
+                write!(formatter, "controller rejected request with HTTP {status}")?;
+                if self.is_authentication_failure() {
+                    write!(formatter, " (check {})", meld_core::NODE_TOKEN_ENV)?;
+                }
+                Ok(())
             }
             Self::InvalidResponse(message) => {
                 write!(

@@ -359,6 +359,37 @@ processやnetworkの障害を状態として扱い、controller再起動後に�
 - native executorとcontainer executorを同じ上位interfaceから選べる。
 - 実行権限と残存ファイルのcleanup方針が文書化・testされている。
 
+### 進め方
+
+小さな段階に分けて進めます。
+
+| 段階 | 内容 | 状態 |
+|---|---|---|
+| 7a | 共有トークンによるclient / nodeの認証 | 完了 |
+| 7b | nodeのjoin承認と個別の失効 | 未着手 |
+| 7c | TLSによる暗号化とcontrollerの検証 | 未着手 |
+| 7d | Executorの抽象化 | 未着手 |
+| 7e | container executorと資源制限 | 未着手 |
+| 7f | cleanup方針の文書化、secretの受け渡し | 未着手 |
+
+### 現在地
+
+7aまで完了しています。
+
+- 役割: controllerのAPIは、`meld`が使うclient用、`meld-node`が使うnode用、ファイル転送の両方用に分けています。経路を追加するときは`router_with_auth`でどのグループに入れるかを決めます。
+- トークン: 役割ごとに別のトークンを持ちます(`MELD_CLIENT_TOKEN`、`MELD_NODE_TOKEN`)。controllerはハッシュだけを保持し、ハッシュ同士を定数時間で比較します。ログとエラーには出ません。短いトークン、片方だけの設定、同じ値の設定は起動時に拒否します。
+- 失敗の応答: トークンがない、または誤っていると401(`WWW-Authenticate: Bearer`)、他の役割のトークンだと403です。`meld`とnodeは、設定すべき環境変数をエラーに示します。tokenが合わないnodeは再試行せず終了します。
+- 既定: loopbackでは認証なしでも動きます(警告あり)。loopback以外で待ち受けるにはトークンが必須です。clientは転送先のhostを越えるリダイレクトにトークンを渡さないよう、リダイレクトを辿りません。
+- protocol versionは上げていません。メッセージの形は変わらず、認証は通信の外側にあります。
+- test: 全経路について、トークンなし・誤り・役割違い・正しい場合を確認するtest(`crates/meld-controller/tests/auth.rs`)と、実processのcontroller、node、`meld`でのend-to-end test(`crates/meld-cli/tests/authentication.rs`)があります。経路の許可を意図的に緩めると、前者が失敗することを確認しました。
+
+### 既知の制約(7a時点)
+
+- 通信が平文なので、トークンは盗聴で漏れます。7cで暗号化します。
+- トークンはclientとnodeでそれぞれ共有です。nodeを個別に失効することも、利用者を区別することもできません。漏れたら全員のトークンを替えます。7bで扱います。
+- 認証を通ったnodeは、他のnodeのexecutionやjobのファイルにも触れます。nodeごとの認可は7bで扱います。
+- トークンは環境変数で渡します。同じ権限のユーザーは`/proc`などから読めます。
+
 安全性はPhase 7まで無視するという意味ではありません。初期phaseは信頼された開発用LANに範囲を限定し、外部公開はこのphaseの完了後とします。
 
 ## 10. Phase 8 — Data Locality and Distributed Data

@@ -1,5 +1,6 @@
 //! Shared domain model and protocol contracts for Meld.
 
+mod auth;
 mod client;
 mod data;
 mod execution;
@@ -10,6 +11,7 @@ mod protocol;
 mod resource;
 mod transition;
 
+pub use auth::{CLIENT_TOKEN_ENV, InvalidToken, NODE_TOKEN_ENV, SecretToken};
 pub use client::{
     ApiErrorResponse, BlobResponse, CancelJobResponse, ExecutionView, JobLogsResponse,
     JobStatusResponse, LimitedResource, ListNodesResponse, MissingInputsResponse, NodeAssessment,

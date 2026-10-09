@@ -16,7 +16,7 @@ use std::{
 
 use meld_core::{
     ExecutionAssignment, ExecutionEvent, ExecutionId, ExecutionOutput, ExecutionResult,
-    NodeCommand, NodeDescriptor, ResourceCapacity,
+    NODE_TOKEN_ENV, NodeCommand, NodeDescriptor, ResourceCapacity, SecretToken,
 };
 use tokio::{
     sync::oneshot,
@@ -57,7 +57,8 @@ async fn main() -> Result<(), Box<dyn Error>> {
     let mut resource_reporter = ResourceReporter::new();
     let descriptor = local_node_descriptor(&resource_reporter)?;
     let node_id = descriptor.id;
-    let client = ControllerClient::new(&controller_url)?;
+    let token = SecretToken::from_env(NODE_TOKEN_ENV)?;
+    let client = ControllerClient::with_token(&controller_url, token.as_ref())?;
     let state_directory = state_directory()?;
     let executor = NativeExecutor::new(&state_directory);
     let cache = InputCache::new(&state_directory, cache_max_bytes_from_env()?)?;

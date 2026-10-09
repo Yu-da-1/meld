@@ -64,12 +64,21 @@ pub const FAST_FAILURE_DETECTION: &[(&str, &str)] = &[
     ("MELD_RETRY_BACKOFF_MAX_SECS", "2"),
 ];
 
+/// Tokens for a cluster that requires authentication.
+#[derive(Clone)]
+pub struct Tokens {
+    pub client: String,
+    pub node: String,
+}
+
 /// A controller and any number of nodes, stopped when dropped.
 pub struct Cluster {
     directory: TempDir,
     port: u16,
     url: String,
     controller_env: Vec<(String, String)>,
+    /// Tokens the controller requires, and that `meld` and the nodes present.
+    tokens: Option<Tokens>,
     controller: Option<Child>,
     nodes: Vec<Option<Child>>,
 }
@@ -82,6 +91,16 @@ impl Cluster {
 
     /// Starts a controller with extra environment, such as [`FAST_FAILURE_DETECTION`].
     pub fn start_with(controller_env: &[(&str, &str)]) -> Self {
+        Self::start_inner(controller_env, None)
+    }
+
+    /// Starts a controller that requires `tokens`. `meld` and the nodes this
+    /// cluster starts present them.
+    pub fn start_with_tokens(tokens: Tokens) -> Self {
+        Self::start_inner(&[], Some(tokens))
+    }
+
+    fn start_inner(controller_env: &[(&str, &str)], tokens: Option<Tokens>) -> Self {
         let directory = TempDir::new().expect("cluster directory");
         let port = TcpListener::bind("127.0.0.1:0")
             .expect("a free port")
@@ -96,6 +115,7 @@ impl Cluster {
                 .iter()
                 .map(|(name, value)| ((*name).to_owned(), (*value).to_owned()))
                 .collect(),
+            tokens,
             controller: None,
             nodes: Vec::new(),
         };
@@ -131,6 +151,11 @@ impl Cluster {
         for (name, value) in &self.controller_env {
             command.env(name, value);
         }
+        if let Some(tokens) = &self.tokens {
+            command
+                .env("MELD_CLIENT_TOKEN", &tokens.client)
+                .env("MELD_NODE_TOKEN", &tokens.node);
+        }
         self.controller = Some(command.spawn().expect("controller should start"));
         self.wait_until_listening();
     }
@@ -150,14 +175,46 @@ impl Cluster {
         index
     }
 
+    /// Starts a node presenting `token` and returns its index.
+    pub fn add_node_with_token(&mut self, token: Option<&str>) -> usize {
+        let index = self.nodes.len();
+        self.nodes.push(None);
+        self.start_node_with_token(index, token);
+        index
+    }
+
+    /// Waits for a node process to exit by itself, and returns whether it did.
+    pub fn node_exits(&mut self, index: usize) -> bool {
+        let deadline = Instant::now() + WAIT_LIMIT;
+        let node = self.nodes[index].as_mut().expect("the node is running");
+        while Instant::now() < deadline {
+            if node.try_wait().expect("node status").is_some() {
+                return true;
+            }
+            sleep(POLL_INTERVAL);
+        }
+        false
+    }
+
     /// Starts (or restarts) the node on its own state directory, so a
     /// restarted node keeps the identity it had.
     pub fn start_node(&mut self, index: usize) {
+        let token = self.tokens.as_ref().map(|tokens| tokens.node.clone());
+        self.start_node_with_token(index, token.as_deref());
+    }
+
+    /// Starts a node presenting `token`, whatever the cluster expects.
+    pub fn start_node_with_token(&mut self, index: usize, token: Option<&str>) {
         assert!(
             self.nodes[index].is_none(),
             "node {index} is already running"
         );
-        let node = Command::new(binary_directory().join("meld-node"))
+        let mut command = Command::new(binary_directory().join("meld-node"));
+        command.env_remove("MELD_NODE_TOKEN");
+        if let Some(token) = token {
+            command.env("MELD_NODE_TOKEN", token);
+        }
+        let node = command
             .env("MELD_CONTROLLER_URL", &self.url)
             .env("MELD_STATE_DIR", self.node_directory(index))
             .env("MELD_HEARTBEAT_INTERVAL_SECS", "1")
@@ -233,12 +290,22 @@ impl Cluster {
     }
 
     pub fn meld(&self, directory: &Path, args: &[&str]) -> Output {
-        Command::new(env!("CARGO_BIN_EXE_meld"))
+        let token = self.tokens.as_ref().map(|tokens| tokens.client.as_str());
+        self.meld_with_token(directory, args, token)
+    }
+
+    /// Runs `meld` presenting `token`, whatever the cluster expects.
+    pub fn meld_with_token(&self, directory: &Path, args: &[&str], token: Option<&str>) -> Output {
+        let mut command = Command::new(env!("CARGO_BIN_EXE_meld"));
+        command
             .args(args)
             .current_dir(directory)
             .env("MELD_CONTROLLER_URL", &self.url)
-            .output()
-            .expect("meld should run")
+            .env_remove("MELD_CLIENT_TOKEN");
+        if let Some(token) = token {
+            command.env("MELD_CLIENT_TOKEN", token);
+        }
+        command.output().expect("meld should run")
     }
 
     /// Runs `meld` expecting success.
@@ -328,6 +395,36 @@ impl Cluster {
         self.meld(Path::new("."), &args)
     }
 
+    /// Runs the controller binary with this environment and returns how it
+    /// ended, for configurations it must refuse to start with.
+    pub fn controller_start_attempt(env: &[(&str, &str)]) -> Output {
+        let directory = TempDir::new().expect("controller state directory");
+        let mut command = Command::new(binary_directory().join("meld-controller"));
+        command
+            .env("MELD_CONTROLLER_STATE_DIR", directory.path())
+            .env_remove("MELD_CLIENT_TOKEN")
+            .env_remove("MELD_NODE_TOKEN")
+            .stdin(Stdio::null());
+        for (name, value) in env {
+            command.env(name, value);
+        }
+        let mut child = command
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("controller should start");
+        // A controller that accepted the configuration never exits by itself.
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while Instant::now() < deadline {
+            if child.try_wait().expect("controller status").is_some() {
+                return child.wait_with_output().expect("controller output");
+            }
+            sleep(POLL_INTERVAL);
+        }
+        let _ = child.kill();
+        child.wait_with_output().expect("controller output")
+    }
+
     /// Everything the cluster processes logged, for failure messages.
     pub fn logs(&self) -> String {
         fs::read_dir(self.directory.path())
@@ -370,9 +467,12 @@ impl Drop for Cluster {
     fn drop(&mut self) {
         // A node that was paused must be resumed to be killed cleanly.
         for node in self.nodes.iter_mut().flatten() {
-            let _ = Command::new("kill")
-                .args(["-CONT", &node.id().to_string()])
-                .status();
+            // One that already exited has nothing to resume.
+            if node.try_wait().is_ok_and(|status| status.is_none()) {
+                let _ = Command::new("kill")
+                    .args(["-CONT", &node.id().to_string()])
+                    .status();
+            }
         }
         for child in self
             .nodes
