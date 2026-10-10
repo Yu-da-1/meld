@@ -4,6 +4,7 @@ members = [
     "crates/meld-controller",
     "crates/meld-node",
     "crates/meld-core",
+    "crates/meld-tls",
 ]
 resolver = "3"
 

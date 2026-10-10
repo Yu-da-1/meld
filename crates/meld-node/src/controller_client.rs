@@ -6,10 +6,12 @@ use futures_util::StreamExt;
 use meld_core::Sha256Digest;
 use meld_core::{
     Acknowledgement, CURRENT_PROTOCOL_VERSION, ExecutionEvent, ExecutionId, HeartbeatRequest,
-    NodeCommand, NodeDescriptor, NodeId, PollNodeCommandRequest, PollNodeCommandResponse,
-    ProtocolError, ProtocolErrorResponse, RegisterNodeRequest, RegisterNodeResponse,
-    ReportExecutionEventRequest, RequestMetadata, ResourceSnapshot, ResponseMetadata, SecretToken,
+    NodeCommand, NodeDescriptor, NodeId, NodeSecret, PollNodeCommandRequest,
+    PollNodeCommandResponse, ProtocolError, ProtocolErrorResponse, RegisterNodeRequest,
+    RegisterNodeResponse, ReportExecutionEventRequest, RequestMetadata, ResourceSnapshot,
+    ResponseMetadata, SecretToken,
 };
+use meld_tls::{Fingerprint, pinned_client_config};
 use reqwest::{
     Body, Client, ClientBuilder, Response, StatusCode,
     header::{AUTHORIZATION, CONTENT_LENGTH, HeaderMap, HeaderValue},
@@ -39,41 +41,65 @@ pub struct ControllerClient {
     /// Without a total timeout, so large files can transfer.
     blob_http: Client,
     controller_url: String,
+    /// Digest of the node's own secret, given when registering.
+    credential: Sha256Digest,
+    /// What a node that has not joined yet registers with.
+    enrollment: Option<HeaderValue>,
 }
 
 impl ControllerClient {
     #[cfg(test)]
     pub fn new(controller_url: &str) -> Result<Self, reqwest::Error> {
-        Self::with_token(controller_url, None)
+        Self::with_credentials(controller_url, None, &NodeSecret::generate(), None)
     }
 
-    /// A client that presents `token` on every request.
-    pub fn with_token(
+    /// A client that speaks with the node's own `secret`, and registers with
+    /// the cluster's `enrollment` token when it has one.
+    pub fn with_credentials(
         controller_url: &str,
-        token: Option<&SecretToken>,
+        enrollment: Option<&SecretToken>,
+        secret: &NodeSecret,
+        fingerprint: Option<&Fingerprint>,
     ) -> Result<Self, reqwest::Error> {
         Ok(Self {
-            http: authenticated(Client::builder().timeout(REQUEST_TIMEOUT), token).build()?,
+            http: authenticated(
+                Client::builder().timeout(REQUEST_TIMEOUT),
+                secret,
+                fingerprint,
+            )
+            .build()?,
             blob_http: authenticated(
                 Client::builder()
                     .connect_timeout(BLOB_CONNECT_TIMEOUT)
                     .read_timeout(BLOB_READ_TIMEOUT),
-                token,
+                secret,
+                fingerprint,
             )
             .build()?,
             controller_url: controller_url.trim_end_matches('/').to_owned(),
+            credential: secret.digest(),
+            enrollment: enrollment.map(bearer),
         })
     }
 
-    pub async fn register(&self, node: &NodeDescriptor) -> Result<(), ControllerClientError> {
+    /// Registers the node and returns whether it was admitted. A node that is
+    /// not admitted yet must wait for an operator and register again.
+    pub async fn register(&self, node: &NodeDescriptor) -> Result<bool, ControllerClientError> {
         let request = RegisterNodeRequest {
             metadata: RequestMetadata::new(),
             node: node.clone(),
+            credential: self.credential.clone(),
         };
-        let response = self
+        let mut builder = self
             .http
             .post(format!("{}{REGISTER_NODE_PATH}", self.controller_url))
-            .json(&request)
+            .json(&request);
+        if let Some(enrollment) = &self.enrollment {
+            // Instead of the node's own secret, which the controller does
+            // not know yet when the node joins for the first time.
+            builder = builder.header(AUTHORIZATION, enrollment.clone());
+        }
+        let response = builder
             .send()
             .await
             .map_err(ControllerClientError::Unavailable)?;
@@ -95,7 +121,7 @@ impl ControllerClient {
                 "controller response contains a different node identity".to_owned(),
             ));
         }
-        Ok(())
+        Ok(response.admitted)
     }
 
     pub async fn heartbeat(
@@ -265,20 +291,33 @@ impl BlobSink for ControllerClient {
     }
 }
 
-/// Makes the client present `token`, and never follow a redirect, which could
-/// carry it to another host.
-fn authenticated(builder: ClientBuilder, token: Option<&SecretToken>) -> ClientBuilder {
-    let builder = builder.redirect(Policy::none());
-    let Some(token) = token else {
-        return builder;
-    };
+/// `Authorization` for a token, kept out of logs and debug output.
+fn bearer(token: &SecretToken) -> HeaderValue {
     // A token is visible ASCII, which is always a valid header value.
     let mut value = HeaderValue::from_str(&format!("Bearer {}", token.expose()))
         .expect("a token is a valid header value");
     value.set_sensitive(true);
+    value
+}
+
+/// Makes the client present the node's secret, and never follow a redirect,
+/// which could carry it to another host.
+fn authenticated(
+    builder: ClientBuilder,
+    secret: &NodeSecret,
+    fingerprint: Option<&Fingerprint>,
+) -> ClientBuilder {
+    let mut value = HeaderValue::from_str(&format!("Bearer {}", secret.expose()))
+        .expect("a node secret is a valid header value");
+    value.set_sensitive(true);
     let mut headers = HeaderMap::new();
     headers.insert(AUTHORIZATION, value);
-    builder.default_headers(headers)
+    let mut builder = builder.redirect(Policy::none()).default_headers(headers);
+    if let Some(fingerprint) = fingerprint {
+        // Accept only the controller whose certificate was pinned.
+        builder = builder.use_preconfigured_tls(pinned_client_config(fingerprint));
+    }
+    builder
 }
 
 #[derive(Debug)]
@@ -302,10 +341,14 @@ impl ControllerClientError {
             if matches!(*status, StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN))
     }
 
+    /// The controller does not know the node, or has not approved it yet.
+    /// Registering again either adds it or finds out where approval stands.
     pub fn requires_registration(&self) -> bool {
         matches!(
             self,
-            Self::Protocol(ProtocolError::NodeNotRegistered { .. })
+            Self::Protocol(
+                ProtocolError::NodeNotRegistered { .. } | ProtocolError::NodeNotApproved { .. }
+            )
         )
     }
 }
@@ -313,7 +356,19 @@ impl ControllerClientError {
 impl fmt::Display for ControllerClientError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::Unavailable(error) => write!(formatter, "controller is unavailable: {error}"),
+            Self::Unavailable(error) => write!(
+                formatter,
+                "controller is unavailable: {}",
+                meld_core::error_chain(error)
+            ),
+            Self::Protocol(ProtocolError::NodeIdentityRejected { node_id }) => write!(
+                formatter,
+                "the controller knows node {node_id} under a different secret; \
+                 if this node lost its own, an operator can revoke and approve it again"
+            ),
+            Self::Protocol(ProtocolError::NodeRevoked { .. }) => formatter.write_str(
+                "an operator revoked this node; it will not be accepted again unless approved",
+            ),
             Self::Protocol(error) => write!(formatter, "controller rejected protocol: {error:?}"),
             Self::Rejected(status) => {
                 write!(formatter, "controller rejected request with HTTP {status}")?;
@@ -342,12 +397,19 @@ impl Error for ControllerClientError {
 }
 
 fn is_protocol_error(status: StatusCode) -> bool {
-    matches!(status, StatusCode::UPGRADE_REQUIRED | StatusCode::NOT_FOUND)
+    matches!(
+        status,
+        StatusCode::UPGRADE_REQUIRED | StatusCode::NOT_FOUND | StatusCode::FORBIDDEN
+    )
 }
 
 async fn decode_protocol_error(response: Response) -> ControllerClientError {
+    let status = response.status();
     match response.json::<ProtocolErrorResponse>().await {
         Ok(response) => ControllerClientError::Protocol(response.error),
+        // A 403 can also come from authentication, which says nothing in
+        // protocol terms.
+        Err(_) if status == StatusCode::FORBIDDEN => ControllerClientError::Rejected(status),
         Err(error) => ControllerClientError::InvalidResponse(error.to_string()),
     }
 }

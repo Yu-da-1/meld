@@ -182,6 +182,13 @@ enum Commands {
 
     /// Make a drained node eligible for new jobs again.
     Resume { node_id: NodeId },
+
+    /// Let a node that is waiting, or was revoked, take part in the cluster.
+    Approve { node_id: NodeId },
+
+    /// Remove a node from the cluster. It gets no work, and what it was
+    /// running is given up on like that of a node that went silent.
+    Revoke { node_id: NodeId },
 }
 
 #[tokio::main]
@@ -199,7 +206,17 @@ async fn main() -> ExitCode {
 async fn run() -> Result<(), Box<dyn Error>> {
     let cli = Cli::parse();
     let token = SecretToken::from_env(CLIENT_TOKEN_ENV)?;
-    let client = ControllerClient::with_token(&cli.controller, token.as_ref())?;
+    let fingerprint = meld_tls::Fingerprint::from_env()?;
+    if token.is_some() && meld_tls::is_cleartext_beyond_loopback(&cli.controller) {
+        eprintln!(
+            "warning: {} is not encrypted, so the token can be read on the network; \
+             use https and {}",
+            cli.controller,
+            meld_tls::FINGERPRINT_ENV
+        );
+    }
+    let client =
+        ControllerClient::with_security(&cli.controller, token.as_ref(), fingerprint.as_ref())?;
 
     match cli.command {
         Commands::Run(args) => {
@@ -221,6 +238,8 @@ async fn run() -> Result<(), Box<dyn Error>> {
         Commands::Nodes => show_nodes(&client).await?,
         Commands::Drain { node_id } => print_node_state(client.drain(node_id).await?),
         Commands::Resume { node_id } => print_node_state(client.resume(node_id).await?),
+        Commands::Approve { node_id } => print_node_state(client.approve(node_id).await?),
+        Commands::Revoke { node_id } => print_node_state(client.revoke(node_id).await?),
     }
 
     Ok(())
@@ -478,6 +497,8 @@ fn print_node_state(response: NodeStateResponse) {
 
 const fn node_state_name(state: NodeState) -> &'static str {
     match state {
+        NodeState::Pending => "pending",
+        NodeState::Revoked => "revoked",
         NodeState::Joining => "joining",
         NodeState::Ready => "ready",
         NodeState::Draining => "draining",

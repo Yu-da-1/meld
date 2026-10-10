@@ -1,8 +1,10 @@
 use std::{
     env,
     error::Error,
+    future::Future,
     io,
     path::PathBuf,
+    pin::Pin,
     sync::Arc,
     time::{Duration, Instant},
 };
@@ -15,8 +17,10 @@ use meld_controller::{
     failure_detector::FailureDetector,
     job_manager::RetryBackoff,
     store::StateStore,
+    tls::TlsListener,
 };
 use meld_core::{CLIENT_TOKEN_ENV, NODE_TOKEN_ENV, SecretToken};
+use meld_tls::ServerIdentity;
 use tokio::net::TcpListener;
 use tokio::time::{MissedTickBehavior, interval};
 use tracing_subscriber::EnvFilter;
@@ -61,17 +65,17 @@ async fn main() -> Result<(), Box<dyn Error>> {
     )?);
     let store = StateStore::open(&state_directory.join(STATE_DB_FILE))?;
     let retry_backoff = retry_backoff_from_env()?;
-    let state = ControllerState::new()
-        .with_retry_backoff(retry_backoff)
-        .with_blob_store(Arc::new(blobs))
-        .with_output_retention(output_retention)
-        .with_store(Arc::new(store))?;
     let authenticator = Authenticator::new(
         SecretToken::from_env(CLIENT_TOKEN_ENV)?,
         SecretToken::from_env(NODE_TOKEN_ENV)?,
         CLIENT_TOKEN_ENV,
         NODE_TOKEN_ENV,
     )?;
+    let state = ControllerState::new()
+        .with_retry_backoff(retry_backoff)
+        .with_blob_store(Arc::new(blobs))
+        .with_output_retention(output_retention)
+        .with_store(Arc::new(store))?;
     let listener = TcpListener::bind(&bind_address).await?;
     let address = listener.local_addr()?;
     if !authenticator.is_enabled() {
@@ -86,6 +90,18 @@ async fn main() -> Result<(), Box<dyn Error>> {
             "authentication is off; anyone on this machine can run commands through Meld"
         );
     }
+    let identity = if authenticator.is_enabled() {
+        let identity = ServerIdentity::load_or_create(&state_directory)?;
+        // Nodes and `meld` are given this to trust the controller.
+        tracing::info!(
+            "encrypted connections only; give clients and nodes {}={}",
+            meld_tls::FINGERPRINT_ENV,
+            identity.fingerprint()
+        );
+        Some(identity)
+    } else {
+        None
+    };
     tracing::info!(
         address = %address,
         authentication = authenticator.is_enabled(),
@@ -100,8 +116,19 @@ async fn main() -> Result<(), Box<dyn Error>> {
         "controller listening"
     );
 
+    // Tokens and secrets cross the network exactly when authentication is on,
+    // so that is when the connection is encrypted.
+    let app = router_with_auth(state.clone(), authenticator);
+    let serve: Pin<Box<dyn Future<Output = io::Result<()>> + Send>> = match identity {
+        Some(identity) => {
+            let listener = TlsListener::new(listener, identity.acceptor())?;
+            Box::pin(async move { axum::serve(listener, app).await })
+        }
+        None => Box::pin(async move { axum::serve(listener, app).await }),
+    };
+
     tokio::select! {
-        result = axum::serve(listener, router_with_auth(state.clone(), authenticator)) => result?,
+        result = serve => result?,
         result = monitor_liveness(
             state.clone(),
             FailureDetector::new(heartbeat_timeout),

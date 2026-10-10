@@ -8,15 +8,25 @@ use std::{
 };
 
 use directories::BaseDirs;
-use meld_core::NodeId;
+use meld_core::{NodeId, NodeSecret};
 
 const STATE_DIR_ENV: &str = "MELD_STATE_DIR";
 const NODE_ID_FILE: &str = "node-id";
+const NODE_SECRET_FILE: &str = "node-secret";
 const IDENTITY_LOCK_FILE: &str = ".identity.lock";
 
 /// Loads the existing node identity or creates it on first startup.
 pub fn load_or_create_node_id() -> io::Result<NodeId> {
     load_or_create_at(&state_directory()?)
+}
+
+/// Loads the secret this node speaks with, or makes it on first startup.
+///
+/// The controller binds the secret's digest to the node's identity the first
+/// time it sees them, so the file must be kept: without it the node is
+/// refused until an operator revokes and approves it again.
+pub fn load_or_create_node_secret() -> io::Result<NodeSecret> {
+    load_or_create_secret_at(&state_directory()?)
 }
 
 pub(crate) fn state_directory() -> io::Result<PathBuf> {
@@ -62,6 +72,62 @@ fn load_or_create_at(state_directory: &Path) -> io::Result<NodeId> {
         Err(error) if error.kind() == io::ErrorKind::NotFound => create_node_id(&node_id_path),
         Err(error) => Err(error),
     }
+}
+
+fn load_or_create_secret_at(state_directory: &Path) -> io::Result<NodeSecret> {
+    fs::create_dir_all(state_directory)
+        .map_err(|error| with_path("create state directory", state_directory, error))?;
+
+    // The same lock as the identity, so two processes do not both make one.
+    let lock_path = state_directory.join(IDENTITY_LOCK_FILE);
+    let lock_file = OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .read(true)
+        .write(true)
+        .open(&lock_path)
+        .map_err(|error| with_path("open identity lock", &lock_path, error))?;
+    lock_file
+        .lock()
+        .map_err(|error| with_path("lock node identity", &lock_path, error))?;
+
+    let path = state_directory.join(NODE_SECRET_FILE);
+    match fs::read_to_string(&path) {
+        Ok(contents) => NodeSecret::parse(contents.trim()).map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("node secret at {} is invalid", path.display()),
+            )
+        }),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => create_node_secret(&path),
+        Err(error) => Err(with_path("read node secret", &path, error)),
+    }
+}
+
+fn create_node_secret(path: &Path) -> io::Result<NodeSecret> {
+    let secret = NodeSecret::generate();
+    let temporary_path = path.with_extension("tmp");
+    let mut options = OpenOptions::new();
+    options.create(true).truncate(true).write(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        // Readable by the node's user only, from the moment it exists.
+        options.mode(0o600);
+    }
+    let mut temporary_file = options
+        .open(&temporary_path)
+        .map_err(|error| with_path("create temporary node secret", &temporary_path, error))?;
+    writeln!(temporary_file, "{}", secret.expose())
+        .map_err(|error| with_path("write temporary node secret", &temporary_path, error))?;
+    temporary_file
+        .sync_all()
+        .map_err(|error| with_path("sync temporary node secret", &temporary_path, error))?;
+    drop(temporary_file);
+
+    fs::rename(&temporary_path, path)
+        .map_err(|error| with_path("install node secret", path, error))?;
+    Ok(secret)
 }
 
 fn read_node_id(path: &Path) -> io::Result<NodeId> {
@@ -129,6 +195,38 @@ mod tests {
                 .trim(),
             initial.to_string()
         );
+    }
+
+    #[test]
+    fn the_secret_is_created_once_reused_and_kept_private() {
+        let state_directory = tempdir().expect("temporary directory should be created");
+
+        let first = load_or_create_secret_at(state_directory.path()).expect("secret is created");
+        let again = load_or_create_secret_at(state_directory.path()).expect("secret is reloaded");
+
+        assert_eq!(first.expose(), again.expose());
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = fs::metadata(state_directory.path().join(NODE_SECRET_FILE))
+                .expect("secret file exists")
+                .permissions()
+                .mode();
+            assert_eq!(mode & 0o077, 0, "group and others must have no access");
+        }
+    }
+
+    #[test]
+    fn a_damaged_secret_is_reported_and_not_replaced() {
+        let state_directory = tempdir().expect("temporary directory should be created");
+        let path = state_directory.path().join(NODE_SECRET_FILE);
+        fs::write(&path, "not a secret").expect("fixture is written");
+
+        let error = load_or_create_secret_at(state_directory.path())
+            .expect_err("a damaged secret must not be replaced silently");
+
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert_eq!(fs::read_to_string(&path).unwrap(), "not a secret");
     }
 
     #[test]

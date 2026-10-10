@@ -1,8 +1,14 @@
 //! Authentication of the callers of the controller API.
 //!
-//! Every route accepts one or both of two roles. A `Client` is a person using
-//! `meld`; a `Node` is a `meld-node` process. Each role has its own token, so
-//! a node cannot submit jobs and a client cannot pose as a node.
+//! There are three kinds of caller, each with its own secret, so that none can
+//! do what another may:
+//!
+//! - a client, a person using `meld`, holds the client token;
+//! - a node that wants to join holds the enrollment token, shared by the
+//!   nodes of the cluster, which only lets it register;
+//! - a node that has registered speaks with a secret of its own, which the
+//!   controller bound to its identity, and which lets it act as that node
+//!   and no other.
 
 use std::{error::Error, fmt};
 
@@ -13,40 +19,86 @@ use axum::{
     middleware::Next,
     response::{IntoResponse, Response},
 };
-use meld_core::{ApiErrorResponse, SecretToken};
+use meld_core::{Admission, ApiErrorResponse, NodeId, SecretToken, credential_digest};
 use sha2::{Digest, Sha256};
 
+use crate::api::ControllerState;
+
+/// A caller of the token kind, which the controller knows without looking at
+/// its nodes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Role {
     Client,
-    Node,
+    /// A node that holds the enrollment token.
+    Enrollment,
 }
 
-/// The roles a route lets in.
+/// Who an authenticated request came from. Handlers read it to make sure a
+/// node acts only for itself.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Principal {
+    Client,
+    Enrollment,
+    /// A node, proven by the secret bound to its identity.
+    Node {
+        id: NodeId,
+        admission: Admission,
+    },
+}
+
+/// How much of a node a route trusts.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum NodeAccess {
+    No,
+    /// Any node that holds a bound secret. The route itself answers a node
+    /// that is waiting or revoked, so it can say why.
+    Registered,
+    Approved,
+}
+
+/// The callers a route lets in.
 #[derive(Debug, Clone, Copy)]
 pub struct Allowed {
     client: bool,
-    node: bool,
+    enrollment: bool,
+    node: NodeAccess,
 }
 
 impl Allowed {
+    /// Operator actions.
     pub const CLIENT: Self = Self {
         client: true,
-        node: false,
+        enrollment: false,
+        node: NodeAccess::No,
     };
+    /// Joining the cluster: with the enrollment token, or as a node again.
+    pub const JOIN: Self = Self {
+        client: false,
+        enrollment: true,
+        node: NodeAccess::Registered,
+    };
+    /// What a node does once it has joined.
     pub const NODE: Self = Self {
         client: false,
-        node: true,
+        enrollment: false,
+        node: NodeAccess::Registered,
     };
-    pub const EITHER: Self = Self {
+    /// Files, which clients upload and fetch and approved nodes do the reverse.
+    pub const DATA: Self = Self {
         client: true,
-        node: true,
+        enrollment: false,
+        node: NodeAccess::Approved,
     };
 
-    fn permits(self, role: Role) -> bool {
-        match role {
-            Role::Client => self.client,
-            Role::Node => self.node,
+    fn permits(self, principal: Principal) -> bool {
+        match principal {
+            Principal::Client => self.client,
+            Principal::Enrollment => self.enrollment,
+            Principal::Node { admission, .. } => match self.node {
+                NodeAccess::No => false,
+                NodeAccess::Registered => true,
+                NodeAccess::Approved => admission == Admission::Approved,
+            },
         }
     }
 }
@@ -136,7 +188,7 @@ impl Authenticator {
         let is_node = equal(&presented, &tokens.node);
         match (is_client, is_node) {
             (true, _) => Some(Role::Client),
-            (_, true) => Some(Role::Node),
+            (_, true) => Some(Role::Enrollment),
             _ => None,
         }
     }
@@ -164,19 +216,28 @@ fn bearer_token(request: &Request) -> Option<&str> {
     scheme.eq_ignore_ascii_case("bearer").then(|| token.trim())
 }
 
-/// Middleware that admits a request only if its token belongs to an allowed
-/// role. The reason is deliberately the same for a missing, wrong or
-/// malformed token.
+/// Middleware that admits a request only if its caller is allowed on the
+/// route, and tells the handler who it is. The reason is deliberately the
+/// same for a missing, wrong or malformed secret.
 pub async fn authenticate(
-    State((authenticator, allowed)): State<(Authenticator, Allowed)>,
-    request: Request,
+    State((authenticator, allowed, state)): State<(Authenticator, Allowed, ControllerState)>,
+    mut request: Request,
     next: Next,
 ) -> Response {
     if !authenticator.is_enabled() {
         return next.run(request).await;
     }
-    match bearer_token(&request).and_then(|token| authenticator.role_of(token)) {
-        Some(role) if allowed.permits(role) => next.run(request).await,
+    let principal =
+        bearer_token(&request).and_then(|presented| match authenticator.role_of(presented) {
+            Some(Role::Client) => Some(Principal::Client),
+            Some(Role::Enrollment) => Some(Principal::Enrollment),
+            None => state.node_for_secret(&credential_digest(presented)),
+        });
+    match principal {
+        Some(principal) if allowed.permits(principal) => {
+            request.extensions_mut().insert(principal);
+            next.run(request).await
+        }
         Some(_) => rejection(
             StatusCode::FORBIDDEN,
             "this token is not allowed to use this endpoint",
@@ -224,7 +285,10 @@ mod tests {
             authenticator.role_of("client-token-0000"),
             Some(Role::Client)
         );
-        assert_eq!(authenticator.role_of("node-token-000000"), Some(Role::Node));
+        assert_eq!(
+            authenticator.role_of("node-token-000000"),
+            Some(Role::Enrollment)
+        );
         assert_eq!(authenticator.role_of("client-token-0001"), None);
         assert_eq!(authenticator.role_of(""), None);
     }
@@ -252,11 +316,31 @@ mod tests {
     }
 
     #[test]
-    fn routes_admit_only_the_roles_they_allow() {
-        assert!(Allowed::CLIENT.permits(Role::Client));
-        assert!(!Allowed::CLIENT.permits(Role::Node));
-        assert!(Allowed::NODE.permits(Role::Node));
-        assert!(!Allowed::NODE.permits(Role::Client));
-        assert!(Allowed::EITHER.permits(Role::Client) && Allowed::EITHER.permits(Role::Node));
+    fn routes_admit_only_the_callers_they_allow() {
+        let id = NodeId::generate();
+        let node = |admission| Principal::Node { id, admission };
+
+        assert!(Allowed::CLIENT.permits(Principal::Client));
+        assert!(!Allowed::CLIENT.permits(Principal::Enrollment));
+        assert!(!Allowed::CLIENT.permits(node(Admission::Approved)));
+
+        // Joining: the enrollment token, or a node that holds its own secret.
+        assert!(Allowed::JOIN.permits(Principal::Enrollment));
+        assert!(Allowed::JOIN.permits(node(Admission::Pending)));
+        assert!(!Allowed::JOIN.permits(Principal::Client));
+
+        // After joining, the enrollment token is no longer enough.
+        assert!(!Allowed::NODE.permits(Principal::Enrollment));
+        assert!(!Allowed::NODE.permits(Principal::Client));
+        // A waiting or revoked node gets in, to be told why it is refused.
+        assert!(Allowed::NODE.permits(node(Admission::Pending)));
+        assert!(Allowed::NODE.permits(node(Admission::Revoked)));
+
+        // Data goes to approved nodes only.
+        assert!(Allowed::DATA.permits(Principal::Client));
+        assert!(Allowed::DATA.permits(node(Admission::Approved)));
+        assert!(!Allowed::DATA.permits(node(Admission::Pending)));
+        assert!(!Allowed::DATA.permits(node(Admission::Revoked)));
+        assert!(!Allowed::DATA.permits(Principal::Enrollment));
     }
 }

@@ -2,6 +2,11 @@
 
 use std::{env, error::Error, fmt};
 
+use sha2::{Digest, Sha256};
+use uuid::Uuid;
+
+use crate::Sha256Digest;
+
 /// Environment variable holding the token `meld` presents to the controller.
 pub const CLIENT_TOKEN_ENV: &str = "MELD_CLIENT_TOKEN";
 /// Environment variable holding the token a node presents to the controller.
@@ -50,6 +55,56 @@ impl fmt::Debug for SecretToken {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter.write_str("SecretToken(<redacted>)")
     }
+}
+
+/// A secret a node makes for itself and keeps. Only its digest is ever
+/// given to the controller, which binds it to the node's identity: from then
+/// on, only the holder of the secret can speak as that node.
+#[derive(Clone)]
+pub struct NodeSecret(String);
+
+impl NodeSecret {
+    const HEX_LEN: usize = 64;
+
+    /// 244 random bits.
+    pub fn generate() -> Self {
+        Self(format!(
+            "{}{}",
+            Uuid::new_v4().simple(),
+            Uuid::new_v4().simple()
+        ))
+    }
+
+    pub fn parse(value: &str) -> Result<Self, InvalidToken> {
+        let valid = value.len() == Self::HEX_LEN
+            && value
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte));
+        if valid {
+            Ok(Self(value.to_owned()))
+        } else {
+            Err(InvalidToken::BadCharacter)
+        }
+    }
+
+    pub fn expose(&self) -> &str {
+        &self.0
+    }
+
+    pub fn digest(&self) -> Sha256Digest {
+        credential_digest(&self.0)
+    }
+}
+
+impl fmt::Debug for NodeSecret {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("NodeSecret(<redacted>)")
+    }
+}
+
+/// The digest the controller keeps of whatever a caller presents as a secret.
+pub fn credential_digest(presented: &str) -> Sha256Digest {
+    Sha256Digest::from_bytes(Sha256::digest(presented.as_bytes()).into())
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -109,6 +164,21 @@ mod tests {
             InvalidToken::BadCharacter
         );
         assert!(SecretToken::new("0123456789abcdef").is_ok());
+    }
+
+    #[test]
+    fn a_node_secret_is_random_parses_back_and_is_never_shown() {
+        let secret = NodeSecret::generate();
+        assert_ne!(secret.expose(), NodeSecret::generate().expose());
+        assert_eq!(
+            NodeSecret::parse(secret.expose())
+                .expect("generated secret parses")
+                .digest(),
+            secret.digest()
+        );
+        assert!(NodeSecret::parse("short").is_err());
+        assert!(NodeSecret::parse(&"G".repeat(64)).is_err());
+        assert!(!format!("{secret:?}").contains(secret.expose()));
     }
 
     #[test]

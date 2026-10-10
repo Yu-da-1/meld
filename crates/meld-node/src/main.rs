@@ -29,7 +29,7 @@ use crate::{
     collection::collect_outputs,
     controller_client::{ControllerClient, ControllerClientError},
     executor::{CompletedExecution, ControlledExecutionOutcome, NativeExecutor, Workspace},
-    identity::{load_or_create_node_id, state_directory},
+    identity::{load_or_create_node_id, load_or_create_node_secret, state_directory},
     resource_reporter::ResourceReporter,
     staging::{DEFAULT_CACHE_MAX_BYTES, InputCache, stage_inputs},
 };
@@ -58,12 +58,27 @@ async fn main() -> Result<(), Box<dyn Error>> {
     let descriptor = local_node_descriptor(&resource_reporter)?;
     let node_id = descriptor.id;
     let token = SecretToken::from_env(NODE_TOKEN_ENV)?;
-    let client = ControllerClient::with_token(&controller_url, token.as_ref())?;
+    let secret = load_or_create_node_secret()?;
+    let fingerprint = meld_tls::Fingerprint::from_env()?;
+    if token.is_some() && meld_tls::is_cleartext_beyond_loopback(&controller_url) {
+        tracing::warn!(
+            %controller_url,
+            "the connection is not encrypted, so tokens can be read on the network; \
+             use https and {}",
+            meld_tls::FINGERPRINT_ENV
+        );
+    }
+    let client = ControllerClient::with_credentials(
+        &controller_url,
+        token.as_ref(),
+        &secret,
+        fingerprint.as_ref(),
+    )?;
     let state_directory = state_directory()?;
     let executor = NativeExecutor::new(&state_directory);
     let cache = InputCache::new(&state_directory, cache_max_bytes_from_env()?)?;
 
-    run_node(
+    if let Err(error) = run_node(
         &client,
         &executor,
         &cache,
@@ -71,7 +86,13 @@ async fn main() -> Result<(), Box<dyn Error>> {
         heartbeat_interval,
         &mut resource_reporter,
     )
-    .await?;
+    .await
+    {
+        // Returning it from `main` would print its debug form, which does
+        // not tell an operator what to do.
+        tracing::error!(%node_id, %error, "node stopped");
+        return Err(error);
+    }
     tracing::info!(%node_id, "node shut down");
     Ok(())
 }
@@ -174,9 +195,21 @@ async fn run_node(
         };
 
         match registration {
-            Ok(()) => {
+            Ok(true) => {
                 backoff.reset();
                 tracing::info!(%node_id, "node registration accepted");
+            }
+            Ok(false) => {
+                // Known to the controller, but nobody has approved it yet.
+                tracing::warn!(
+                    %node_id,
+                    retry_in_secs = heartbeat_interval.as_secs(),
+                    "node is waiting for approval; run `meld approve {node_id}`"
+                );
+                if wait_for_retry_or_shutdown(heartbeat_interval).await? {
+                    return Ok(());
+                }
+                continue;
             }
             Err(error) if error.is_retryable() => {
                 let delay = backoff.next_delay();

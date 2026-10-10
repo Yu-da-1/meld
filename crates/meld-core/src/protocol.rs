@@ -4,11 +4,11 @@ use serde::{Deserialize, Serialize};
 
 use crate::{
     DataFailure, ExecutionId, ExecutionOutput, ExecutionResult, JobId, JobSpec, MessageId,
-    NodeDescriptor, NodeId, OutputFile, ResourceSnapshot,
+    NodeDescriptor, NodeId, OutputFile, ResourceSnapshot, Sha256Digest,
 };
 
 /// Protocol version implemented by this build.
-pub const CURRENT_PROTOCOL_VERSION: ProtocolVersion = ProtocolVersion::new(7);
+pub const CURRENT_PROTOCOL_VERSION: ProtocolVersion = ProtocolVersion::new(8);
 
 /// Version of the controller-node message contract.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -70,6 +70,9 @@ impl ResponseMetadata {
 pub struct RegisterNodeRequest {
     pub metadata: RequestMetadata,
     pub node: NodeDescriptor,
+    /// Digest of the node's own secret. The controller binds it to the node's
+    /// identity when it first sees it, and refuses any other afterwards.
+    pub credential: Sha256Digest,
 }
 
 /// Confirms that the controller accepted a node identity.
@@ -77,6 +80,9 @@ pub struct RegisterNodeRequest {
 pub struct RegisterNodeResponse {
     pub metadata: ResponseMetadata,
     pub node_id: NodeId,
+    /// False while an operator has yet to approve the node. The node must
+    /// wait and register again; it receives no work until then.
+    pub admitted: bool,
 }
 
 /// Describes a protocol-level request failure.
@@ -88,6 +94,19 @@ pub enum ProtocolError {
         received: ProtocolVersion,
     },
     NodeNotRegistered {
+        node_id: NodeId,
+    },
+    /// The node is registered but not approved yet.
+    NodeNotApproved {
+        node_id: NodeId,
+    },
+    /// An operator revoked the node. It must not try again.
+    NodeRevoked {
+        node_id: NodeId,
+    },
+    /// The caller is not the node it claims to be: it does not hold the
+    /// secret the controller bound to that identity.
+    NodeIdentityRejected {
         node_id: NodeId,
     },
 }
@@ -201,6 +220,7 @@ mod tests {
         let request = RegisterNodeRequest {
             metadata: RequestMetadata::new(),
             node: descriptor(),
+            credential: crate::credential_digest("a node's own secret"),
         };
 
         assert_json_round_trip(&request);

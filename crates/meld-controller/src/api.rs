@@ -12,31 +12,31 @@ use std::{
 use axum::{
     Json, Router,
     body::Body,
-    extract::{Path, State},
+    extract::{Extension, Path, State},
     http::{HeaderMap, StatusCode, header},
     middleware,
     response::{IntoResponse, Response},
     routing::{get, post, put},
 };
 use meld_core::{
-    Acknowledgement, ApiErrorResponse, BlobResponse, CURRENT_PROTOCOL_VERSION, CancelJobResponse,
-    DataFailure, ExecutionEvent, ExecutionId, ExecutionOutput, ExecutionView, HeartbeatRequest,
-    JobId, JobLogsResponse, JobSpec, JobState, JobStatusResponse, ListNodesResponse,
-    MissingInputsResponse, NodeCommand, NodeId, NodeState, NodeStateResponse, NodeView, OutputFile,
-    PollNodeCommandRequest, PollNodeCommandResponse, ProtocolError, ProtocolErrorResponse,
-    QueueReason, RegisterNodeRequest, RegisterNodeResponse, ReportExecutionEventRequest,
-    ResponseMetadata, RetryJobRequest, RetryJobResponse, RetryView, Sha256Digest,
-    SubmitJobResponse,
+    Acknowledgement, Admission, ApiErrorResponse, BlobResponse, CURRENT_PROTOCOL_VERSION,
+    CancelJobResponse, DataFailure, ExecutionEvent, ExecutionId, ExecutionOutput, ExecutionView,
+    HeartbeatRequest, JobId, JobLogsResponse, JobSpec, JobState, JobStatusResponse,
+    ListNodesResponse, MissingInputsResponse, NodeCommand, NodeId, NodeState, NodeStateResponse,
+    NodeView, OutputFile, PollNodeCommandRequest, PollNodeCommandResponse, ProtocolError,
+    ProtocolErrorResponse, QueueReason, RegisterNodeRequest, RegisterNodeResponse,
+    ReportExecutionEventRequest, ResponseMetadata, RetryJobRequest, RetryJobResponse, RetryView,
+    Sha256Digest, SubmitJobResponse,
 };
 use tokio::{sync::watch, time::timeout};
 use tokio_util::io::ReaderStream;
 
 use crate::{
-    auth::{Allowed, Authenticator, authenticate},
+    auth::{Allowed, Authenticator, Principal, authenticate},
     blob_store::{BlobError, BlobStore, PutOutcome},
     failure_detector::FailureDetector,
     job_manager::{JobManager, JobManagerError, RetryBackoff},
-    node_registry::{NodeRegistry, NodeRegistryError},
+    node_registry::{NodeRegistry, NodeRegistryError, RegisteredNode},
     scheduler::{Scheduler, SchedulingFailure},
     store::{Persist, StateStore, StoreError},
 };
@@ -46,6 +46,8 @@ pub const HEARTBEAT_PATH: &str = "/v1/nodes/heartbeat";
 pub const LIST_NODES_PATH: &str = "/v1/nodes";
 pub const DRAIN_NODE_PATH: &str = "/v1/nodes/{node_id}/drain";
 pub const RESUME_NODE_PATH: &str = "/v1/nodes/{node_id}/resume";
+pub const APPROVE_NODE_PATH: &str = "/v1/nodes/{node_id}/approve";
+pub const REVOKE_NODE_PATH: &str = "/v1/nodes/{node_id}/revoke";
 pub const SUBMIT_JOB_PATH: &str = "/v1/jobs";
 pub const JOB_STATUS_PATH: &str = "/v1/jobs/{job_id}";
 pub const JOB_LOGS_PATH: &str = "/v1/jobs/{job_id}/logs";
@@ -70,6 +72,12 @@ pub struct ControllerState {
     retry_backoff: RetryBackoff,
     /// How long outputs are protected from eviction after a job finishes.
     output_retention: Duration,
+    /// What a node seen for the first time is. `Pending` makes an operator
+    /// approve every new node.
+    first_admission: Admission,
+    /// Whether each node must prove it is the node it claims to be. Without
+    /// authentication there is nobody to prove it to.
+    node_identity_required: bool,
     command_updates: watch::Sender<u64>,
     /// When this controller process started. A node restored from the store
     /// has no heartbeat to measure silence from, so silence counts from here.
@@ -86,6 +94,8 @@ impl Default for ControllerState {
             store: None,
             retry_backoff: RetryBackoff::default(),
             output_retention: DEFAULT_OUTPUT_RETENTION,
+            first_admission: Admission::Approved,
+            node_identity_required: false,
             command_updates,
             started_at: Instant::now(),
         }
@@ -102,6 +112,24 @@ impl ControllerState {
     pub fn with_output_retention(mut self, output_retention: Duration) -> Self {
         self.output_retention = output_retention;
         self
+    }
+
+    /// Makes an operator approve each new node before it receives work.
+    #[must_use]
+    pub fn with_manual_admission(mut self) -> Self {
+        self.first_admission = Admission::Pending;
+        self
+    }
+
+    /// The node that speaks with `secret`, if any node does.
+    pub(crate) fn node_for_secret(&self, secret: &Sha256Digest) -> Option<Principal> {
+        let registry = self.registry.read().ok()?;
+        registry
+            .find_by_credential(secret)
+            .map(|node| Principal::Node {
+                id: node.descriptor().id,
+                admission: node.admission(),
+            })
     }
 
     /// Enables storage of job input and output files.
@@ -178,7 +206,7 @@ impl ControllerState {
             let registry = self.registry.read().map_err(|_| ControllerStateError)?;
             registry
                 .nodes()
-                .filter(|node| node.state() == NodeState::Unreachable)
+                .filter(|node| node.is_silent())
                 .filter(|node| {
                     let last_seen = node.last_heartbeat_at().unwrap_or(self.started_at);
                     now.saturating_duration_since(last_seen) >= silent_for
@@ -307,16 +335,27 @@ pub fn router(state: ControllerState) -> Router {
 }
 
 /// Every route is placed in one of three groups, so that adding a route
-/// forces a decision about who may call it.
-pub fn router_with_auth(state: ControllerState, authenticator: Authenticator) -> Router {
-    let guard =
-        |allowed| middleware::from_fn_with_state((authenticator.clone(), allowed), authenticate);
+/// forces a decision about who may call it. With authentication, a new node
+/// also waits to be approved, and every node proves it is the node it names.
+pub fn router_with_auth(mut state: ControllerState, authenticator: Authenticator) -> Router {
+    if authenticator.is_enabled() {
+        state = state.with_manual_admission();
+        state.node_identity_required = true;
+    }
+    let guard = |allowed| {
+        middleware::from_fn_with_state(
+            (authenticator.clone(), allowed, state.clone()),
+            authenticate,
+        )
+    };
 
     // Used by people through `meld`.
     let client_routes = Router::new()
         .route(LIST_NODES_PATH, get(list_nodes))
         .route(DRAIN_NODE_PATH, post(drain_node))
         .route(RESUME_NODE_PATH, post(resume_node))
+        .route(APPROVE_NODE_PATH, post(approve_node))
+        .route(REVOKE_NODE_PATH, post(revoke_node))
         .route(SUBMIT_JOB_PATH, post(submit_job))
         .route(JOB_STATUS_PATH, get(job_status))
         .route(JOB_LOGS_PATH, get(job_logs))
@@ -324,9 +363,13 @@ pub fn router_with_auth(state: ControllerState, authenticator: Authenticator) ->
         .route(RETRY_JOB_PATH, post(retry_job))
         .route_layer(guard(Allowed::CLIENT));
 
-    // Used by `meld-node` to take part in the cluster.
-    let node_routes = Router::new()
+    // How a node joins.
+    let join_routes = Router::new()
         .route(REGISTER_NODE_PATH, post(register_node))
+        .route_layer(guard(Allowed::JOIN));
+
+    // What a node does as itself.
+    let node_routes = Router::new()
         .route(HEARTBEAT_PATH, post(record_heartbeat))
         .route(POLL_NODE_COMMAND_PATH, post(poll_node_command))
         .route(REPORT_EXECUTION_EVENT_PATH, post(report_execution_event))
@@ -335,9 +378,10 @@ pub fn router_with_auth(state: ControllerState, authenticator: Authenticator) ->
     // Clients upload inputs and fetch outputs; nodes do the reverse.
     let data_routes = Router::new()
         .route(BLOB_PATH, put(put_blob).get(get_blob))
-        .route_layer(guard(Allowed::EITHER));
+        .route_layer(guard(Allowed::DATA));
 
     client_routes
+        .merge(join_routes)
         .merge(node_routes)
         .merge(data_routes)
         .with_state(state)
@@ -345,10 +389,19 @@ pub fn router_with_auth(state: ControllerState, authenticator: Authenticator) ->
 
 async fn report_execution_event(
     State(state): State<ControllerState>,
+    principal: Option<Extension<Principal>>,
     Json(request): Json<ReportExecutionEventRequest>,
 ) -> Response {
     let request_metadata = request.metadata;
     if let Some(response) = protocol_version_error(request_metadata) {
+        return response;
+    }
+    if let Some(response) = identity_error(
+        &state,
+        principal.map(|Extension(principal)| principal),
+        request.node_id,
+        request_metadata,
+    ) {
         return response;
     }
 
@@ -363,17 +416,24 @@ async fn report_execution_event(
                 .into_response();
         }
     };
-    if registry.get(request.node_id).is_none() {
-        return (
-            StatusCode::NOT_FOUND,
-            Json(ProtocolErrorResponse {
-                metadata: ResponseMetadata::for_request(request_metadata),
-                error: ProtocolError::NodeNotRegistered {
-                    node_id: request.node_id,
-                },
-            }),
-        )
-            .into_response();
+    match registry.get(request.node_id) {
+        None => {
+            return (
+                StatusCode::NOT_FOUND,
+                Json(ProtocolErrorResponse {
+                    metadata: ResponseMetadata::for_request(request_metadata),
+                    error: ProtocolError::NodeNotRegistered {
+                        node_id: request.node_id,
+                    },
+                }),
+            )
+                .into_response();
+        }
+        Some(node) => {
+            if let Some(response) = admission_error(node, request_metadata) {
+                return response;
+            }
+        }
     }
     drop(registry);
 
@@ -507,8 +567,17 @@ async fn report_execution_event(
 
 async fn poll_node_command(
     State(state): State<ControllerState>,
+    principal: Option<Extension<Principal>>,
     Json(request): Json<PollNodeCommandRequest>,
 ) -> Response {
+    if let Some(response) = identity_error(
+        &state,
+        principal.map(|Extension(principal)| principal),
+        request.node_id,
+        request.metadata,
+    ) {
+        return response;
+    }
     poll_node_command_with_timeout(state, request, COMMAND_LONG_POLL_TIMEOUT).await
 }
 
@@ -586,6 +655,11 @@ fn command_for_node(
                 .into_response(),
         ));
     };
+    // Checked on every wake of a long poll, so a node revoked while it
+    // waits is turned away at once.
+    if let Some(response) = admission_error(node, request.metadata) {
+        return Err(Box::new(response));
+    }
 
     let mut jobs = match state.jobs_mut() {
         Ok(jobs) => jobs,
@@ -1298,6 +1372,7 @@ fn set_node_draining(state: ControllerState, node_id: NodeId, draining: bool) ->
 
 async fn register_node(
     State(state): State<ControllerState>,
+    principal: Option<Extension<Principal>>,
     Json(request): Json<RegisterNodeRequest>,
 ) -> Response {
     let request_metadata = request.metadata;
@@ -1306,6 +1381,23 @@ async fn register_node(
     }
 
     let node_id = request.node.id;
+    // Joining takes the enrollment token. Registering again may also be done
+    // with the node's own secret; either way it is that node, and no other,
+    // whose credential gets bound below.
+    if state.node_identity_required
+        && !matches!(
+            principal.map(|Extension(principal)| principal),
+            Some(Principal::Enrollment)
+        )
+        && let Some(response) = identity_error(
+            &state,
+            principal.map(|Extension(principal)| principal),
+            node_id,
+            request_metadata,
+        )
+    {
+        return response;
+    }
     let mut registry = match state.registry_mut() {
         Ok(registry) => registry,
         Err(error) => {
@@ -1317,24 +1409,61 @@ async fn register_node(
                 .into_response();
         }
     };
-    registry.register(request.node);
+    if let Some(node) = registry.get(node_id)
+        && node.admission() == Admission::Revoked
+    {
+        // Not updated: a revoked node does not get to rewrite its record.
+        tracing::warn!(%node_id, "a revoked node tried to register");
+        return admission_error(node, request_metadata)
+            .unwrap_or_else(|| StatusCode::FORBIDDEN.into_response());
+    }
+    if state.node_identity_required {
+        if registry
+            .register_with(request.node, state.first_admission, request.credential)
+            .is_err()
+        {
+            // The identity is bound to another secret: someone else is
+            // claiming this node, or it lost its own.
+            tracing::warn!(%node_id, "registration with a secret other than the node's own");
+            return identity_rejection(node_id, request_metadata);
+        }
+    } else {
+        registry.register_as(request.node, state.first_admission);
+    }
+    let admitted = registry
+        .get(node_id)
+        .is_some_and(|node| node.admission() == Admission::Approved);
     drop(registry);
 
-    tracing::info!(%node_id, "node registered");
+    if admitted {
+        tracing::info!(%node_id, "node registered");
+    } else {
+        tracing::info!(%node_id, "node registered and waits for approval");
+    }
 
     Json(RegisterNodeResponse {
         metadata: ResponseMetadata::for_request(request_metadata),
         node_id,
+        admitted,
     })
     .into_response()
 }
 
 async fn record_heartbeat(
     State(state): State<ControllerState>,
+    principal: Option<Extension<Principal>>,
     Json(request): Json<HeartbeatRequest>,
 ) -> Response {
     let request_metadata = request.metadata;
     if let Some(response) = protocol_version_error(request_metadata) {
+        return response;
+    }
+    if let Some(response) = identity_error(
+        &state,
+        principal.map(|Extension(principal)| principal),
+        request.node_id,
+        request_metadata,
+    ) {
         return response;
     }
 
@@ -1350,6 +1479,12 @@ async fn record_heartbeat(
         }
     };
 
+    if let Some(response) = registry
+        .get(request.node_id)
+        .and_then(|node| admission_error(node, request_metadata))
+    {
+        return response;
+    }
     let was_ready = registry
         .get(request.node_id)
         .is_some_and(|node| matches!(node.state(), NodeState::Ready | NodeState::Draining));
@@ -1380,6 +1515,109 @@ async fn record_heartbeat(
 
     Json(Acknowledgement {
         metadata: ResponseMetadata::for_request(request_metadata),
+    })
+    .into_response()
+}
+
+/// The refusal for a caller that is not the node it names, or `None` if it
+/// is. Nothing is checked on a controller that has no authentication.
+fn identity_error(
+    state: &ControllerState,
+    principal: Option<Principal>,
+    node_id: NodeId,
+    metadata: meld_core::RequestMetadata,
+) -> Option<Response> {
+    if !state.node_identity_required {
+        return None;
+    }
+    match principal {
+        Some(Principal::Node { id, .. }) if id == node_id => None,
+        _ => Some(identity_rejection(node_id, metadata)),
+    }
+}
+
+fn identity_rejection(node_id: NodeId, metadata: meld_core::RequestMetadata) -> Response {
+    (
+        StatusCode::FORBIDDEN,
+        Json(ProtocolErrorResponse {
+            metadata: ResponseMetadata::for_request(metadata),
+            error: ProtocolError::NodeIdentityRejected { node_id },
+        }),
+    )
+        .into_response()
+}
+
+/// The refusal for a node that may not take part, or `None` if it may.
+fn admission_error(
+    node: &RegisteredNode,
+    metadata: meld_core::RequestMetadata,
+) -> Option<Response> {
+    let node_id = node.descriptor().id;
+    let error = match node.admission() {
+        Admission::Approved => return None,
+        Admission::Pending => ProtocolError::NodeNotApproved { node_id },
+        Admission::Revoked => ProtocolError::NodeRevoked { node_id },
+    };
+    Some(
+        (
+            StatusCode::FORBIDDEN,
+            Json(ProtocolErrorResponse {
+                metadata: ResponseMetadata::for_request(metadata),
+                error,
+            }),
+        )
+            .into_response(),
+    )
+}
+
+async fn approve_node(
+    State(state): State<ControllerState>,
+    Path(node_id): Path<NodeId>,
+) -> Response {
+    change_admission(state, node_id, Admission::Approved)
+}
+
+async fn revoke_node(
+    State(state): State<ControllerState>,
+    Path(node_id): Path<NodeId>,
+) -> Response {
+    change_admission(state, node_id, Admission::Revoked)
+}
+
+/// Approves or revokes a node; both directions are idempotent.
+fn change_admission(state: ControllerState, node_id: NodeId, admission: Admission) -> Response {
+    let mut registry = match state.registry_mut() {
+        Ok(registry) => registry,
+        Err(error) => {
+            tracing::error!(%node_id, %error, "node registry lock is poisoned");
+            return api_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "controller state is unavailable",
+            );
+        }
+    };
+    let changed = match admission {
+        Admission::Revoked => registry.revoke(node_id),
+        _ => registry.approve(node_id),
+    };
+    let node_state = match changed {
+        Ok(node_state) => node_state,
+        Err(NodeRegistryError::NodeNotFound(node_id)) => {
+            return api_error(
+                StatusCode::NOT_FOUND,
+                format!("node {node_id} was not found"),
+            );
+        }
+    };
+    drop(registry);
+    // A waiting poll must see the change: a revoked node is turned away, and
+    // an approved one may have work to take.
+    state.notify_command_update();
+
+    tracing::info!(%node_id, ?admission, state = ?node_state, "node admission changed");
+    Json(NodeStateResponse {
+        node_id,
+        state: node_state,
     })
     .into_response()
 }
@@ -2891,6 +3129,7 @@ mod tests {
                 protocol_version,
             },
             node: descriptor(NodeId::generate()),
+            credential: meld_core::credential_digest("a-test-secret"),
         }
     }
 
@@ -3510,6 +3749,706 @@ mod tests {
 
             let third = state_over(&directory);
             assert_eq!(get_job_status(third, job_id).await.state, JobState::Running);
+        }
+    }
+
+    mod identity {
+        use meld_core::{NodeSecret, SecretToken};
+        use tempfile::TempDir;
+
+        use super::*;
+        use crate::auth::Authenticator;
+
+        const CLIENT: &str = "client-token-0123456789";
+        const ENROLLMENT: &str = "enroll-token-0123456789";
+
+        fn authenticator() -> Authenticator {
+            Authenticator::enabled(
+                &SecretToken::new(CLIENT).expect("valid token"),
+                &SecretToken::new(ENROLLMENT).expect("valid token"),
+            )
+            .expect("distinct tokens")
+        }
+
+        fn json_request<T: serde::Serialize>(
+            method: &str,
+            uri: &str,
+            bearer: &str,
+            body: &T,
+        ) -> Request<Body> {
+            Request::builder()
+                .method(method)
+                .uri(uri)
+                .header(header::CONTENT_TYPE, "application/json")
+                .header(header::AUTHORIZATION, format!("Bearer {bearer}"))
+                .body(Body::from(
+                    serde_json::to_vec(body).expect("request should serialize"),
+                ))
+                .expect("HTTP request should be valid")
+        }
+
+        async fn call(app: &Router, request: Request<Body>) -> Response {
+            app.clone()
+                .oneshot(request)
+                .await
+                .expect("request should be handled")
+        }
+
+        async fn register_as(
+            app: &Router,
+            node_id: NodeId,
+            credential: &NodeSecret,
+            bearer: &str,
+        ) -> Response {
+            call(
+                app,
+                json_request(
+                    "POST",
+                    REGISTER_NODE_PATH,
+                    bearer,
+                    &RegisterNodeRequest {
+                        metadata: RequestMetadata::new(),
+                        node: descriptor(node_id),
+                        credential: credential.digest(),
+                    },
+                ),
+            )
+            .await
+        }
+
+        async fn operator(app: &Router, action: &str, node_id: NodeId) {
+            let response = call(
+                app,
+                json_request(
+                    "POST",
+                    &format!("/v1/nodes/{node_id}/{action}"),
+                    CLIENT,
+                    &serde_json::json!({}),
+                ),
+            )
+            .await;
+            assert_eq!(response.status(), StatusCode::OK, "{action}");
+        }
+
+        /// A node that has joined and been approved.
+        async fn joined(app: &Router, secret: &NodeSecret) -> NodeId {
+            let node_id = NodeId::generate();
+            let response = register_as(app, node_id, secret, ENROLLMENT).await;
+            assert_eq!(response.status(), StatusCode::OK);
+            operator(app, "approve", node_id).await;
+            node_id
+        }
+
+        async fn heartbeat_as(app: &Router, node_id: NodeId, secret: &NodeSecret) -> Response {
+            call(
+                app,
+                json_request(
+                    "POST",
+                    HEARTBEAT_PATH,
+                    secret.expose(),
+                    &HeartbeatRequest {
+                        metadata: RequestMetadata::new(),
+                        node_id,
+                        snapshot: snapshot(),
+                    },
+                ),
+            )
+            .await
+        }
+
+        async fn rejected_identity(response: Response) -> ProtocolError {
+            assert_eq!(response.status(), StatusCode::FORBIDDEN);
+            let body = to_bytes(response.into_body(), usize::MAX)
+                .await
+                .expect("response body should be readable");
+            serde_json::from_slice::<ProtocolErrorResponse>(&body)
+                .expect("a refusal carries a protocol error")
+                .error
+        }
+
+        fn app() -> (Router, ControllerState) {
+            let state = ControllerState::new();
+            (router_with_auth(state.clone(), authenticator()), state)
+        }
+
+        #[tokio::test]
+        async fn a_node_cannot_act_as_another_node() {
+            let (app, _) = app();
+            let (mine, theirs) = (NodeSecret::generate(), NodeSecret::generate());
+            let _mine = joined(&app, &mine).await;
+            let victim = joined(&app, &theirs).await;
+
+            // Heartbeat, poll and report, each naming the victim.
+            let response = heartbeat_as(&app, victim, &mine).await;
+            assert_eq!(
+                rejected_identity(response).await,
+                ProtocolError::NodeIdentityRejected { node_id: victim }
+            );
+            let response = call(
+                &app,
+                json_request(
+                    "POST",
+                    POLL_NODE_COMMAND_PATH,
+                    mine.expose(),
+                    &PollNodeCommandRequest {
+                        metadata: RequestMetadata::new(),
+                        node_id: victim,
+                        active_execution_ids: vec![],
+                    },
+                ),
+            )
+            .await;
+            assert_eq!(
+                rejected_identity(response).await,
+                ProtocolError::NodeIdentityRejected { node_id: victim }
+            );
+            let response = call(
+                &app,
+                json_request(
+                    "POST",
+                    REPORT_EXECUTION_EVENT_PATH,
+                    mine.expose(),
+                    &ReportExecutionEventRequest {
+                        metadata: RequestMetadata::new(),
+                        node_id: victim,
+                        execution_id: meld_core::ExecutionId::generate(),
+                        event: ExecutionEvent::Accepted,
+                    },
+                ),
+            )
+            .await;
+            assert_eq!(
+                rejected_identity(response).await,
+                ProtocolError::NodeIdentityRejected { node_id: victim }
+            );
+
+            // The victim itself is not affected.
+            let response = heartbeat_as(&app, victim, &theirs).await;
+            assert_eq!(response.status(), StatusCode::OK);
+        }
+
+        #[tokio::test]
+        async fn the_enrollment_token_cannot_take_over_a_registered_node() {
+            let (app, state) = app();
+            let real = NodeSecret::generate();
+            let node_id = joined(&app, &real).await;
+
+            // Anyone in the cluster holds the enrollment token. It names the
+            // victim's identity, with a secret of the attacker's own.
+            let mut changed = descriptor(node_id);
+            changed.hostname = "attacker".to_owned();
+            let response = call(
+                &app,
+                json_request(
+                    "POST",
+                    REGISTER_NODE_PATH,
+                    ENROLLMENT,
+                    &RegisterNodeRequest {
+                        metadata: RequestMetadata::new(),
+                        node: changed,
+                        credential: NodeSecret::generate().digest(),
+                    },
+                ),
+            )
+            .await;
+            assert_eq!(
+                rejected_identity(response).await,
+                ProtocolError::NodeIdentityRejected { node_id }
+            );
+
+            // Nothing was rewritten, and the real node still works.
+            let hostname = state
+                .registry
+                .read()
+                .expect("registry lock")
+                .get(node_id)
+                .expect("node is registered")
+                .descriptor()
+                .hostname
+                .clone();
+            assert_eq!(hostname, "worker-1");
+            assert_eq!(
+                heartbeat_as(&app, node_id, &real).await.status(),
+                StatusCode::OK
+            );
+        }
+
+        #[tokio::test]
+        async fn a_node_registers_again_with_its_own_secret_alone() {
+            let (app, _) = app();
+            let secret = NodeSecret::generate();
+            let node_id = joined(&app, &secret).await;
+
+            // The enrollment token may have been rotated away by now.
+            let response = register_as(&app, node_id, &secret, secret.expose()).await;
+
+            assert_eq!(response.status(), StatusCode::OK);
+        }
+
+        #[tokio::test]
+        async fn the_enrollment_token_alone_does_not_speak_for_a_node() {
+            let (app, _) = app();
+            let node_id = joined(&app, &NodeSecret::generate()).await;
+
+            let response = call(
+                &app,
+                json_request(
+                    "POST",
+                    HEARTBEAT_PATH,
+                    ENROLLMENT,
+                    &HeartbeatRequest {
+                        metadata: RequestMetadata::new(),
+                        node_id,
+                        snapshot: snapshot(),
+                    },
+                ),
+            )
+            .await;
+
+            assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        }
+
+        #[tokio::test]
+        async fn a_revoked_node_is_told_so_by_its_own_secret() {
+            let (app, _) = app();
+            let secret = NodeSecret::generate();
+            let node_id = joined(&app, &secret).await;
+            operator(&app, "revoke", node_id).await;
+
+            let response = heartbeat_as(&app, node_id, &secret).await;
+
+            assert_eq!(
+                rejected_identity(response).await,
+                ProtocolError::NodeRevoked { node_id }
+            );
+        }
+
+        #[tokio::test]
+        async fn approving_a_revoked_node_lets_it_bind_a_new_secret() {
+            let (app, _) = app();
+            let lost = NodeSecret::generate();
+            let node_id = joined(&app, &lost).await;
+            operator(&app, "revoke", node_id).await;
+            operator(&app, "approve", node_id).await;
+
+            // The old secret is gone with the node's state directory; a new
+            // one is accepted, and the old one is not.
+            let fresh = NodeSecret::generate();
+            let response = register_as(&app, node_id, &fresh, ENROLLMENT).await;
+            assert_eq!(response.status(), StatusCode::OK);
+            assert_eq!(
+                heartbeat_as(&app, node_id, &fresh).await.status(),
+                StatusCode::OK
+            );
+            let response = register_as(&app, node_id, &lost, ENROLLMENT).await;
+            assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        }
+
+        #[tokio::test]
+        async fn the_binding_survives_a_controller_restart() {
+            let directory = TempDir::new().expect("temp dir");
+            let start = |directory: &TempDir| {
+                let store = StateStore::open(&directory.path().join("state.db"))
+                    .expect("state database should open");
+                let state = ControllerState::new()
+                    .with_store(Arc::new(store))
+                    .expect("stored state should restore");
+                router_with_auth(state, authenticator())
+            };
+            let secret = NodeSecret::generate();
+
+            let before = start(&directory);
+            let node_id = joined(&before, &secret).await;
+            drop(before);
+
+            let after = start(&directory);
+            // The node's own secret still works...
+            assert_eq!(
+                heartbeat_as(&after, node_id, &secret).await.status(),
+                StatusCode::OK
+            );
+            // ...and nobody else can bind another one.
+            let response = register_as(&after, node_id, &NodeSecret::generate(), ENROLLMENT).await;
+            assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        }
+
+        #[tokio::test]
+        async fn a_node_stored_without_a_secret_takes_the_first_one_it_presents() {
+            let directory = TempDir::new().expect("temp dir");
+            let node_id = NodeId::generate();
+            // A node as an earlier version stored it: approved, no secret.
+            {
+                let store = StateStore::open(&directory.path().join("state.db"))
+                    .expect("state database should open");
+                let state = ControllerState::new()
+                    .with_store(Arc::new(store))
+                    .expect("empty store restores");
+                state
+                    .registry_mut()
+                    .expect("registry lock")
+                    .register(descriptor(node_id));
+            }
+            let store = StateStore::open(&directory.path().join("state.db"))
+                .expect("state database should open");
+            let state = ControllerState::new()
+                .with_store(Arc::new(store))
+                .expect("stored state should restore");
+            let app = router_with_auth(state, authenticator());
+            let secret = NodeSecret::generate();
+
+            let response = register_as(&app, node_id, &secret, ENROLLMENT).await;
+
+            assert_eq!(response.status(), StatusCode::OK);
+            assert_eq!(
+                heartbeat_as(&app, node_id, &secret).await.status(),
+                StatusCode::OK
+            );
+            // It stays approved: it was already in use.
+            let body = to_bytes(
+                register_as(&app, node_id, &secret, ENROLLMENT)
+                    .await
+                    .into_body(),
+                usize::MAX,
+            )
+            .await
+            .expect("response body should be readable");
+            let response: RegisterNodeResponse =
+                serde_json::from_slice(&body).expect("registration response");
+            assert!(response.admitted);
+        }
+    }
+
+    mod admission {
+        use tempfile::TempDir;
+
+        use super::*;
+
+        fn manual() -> ControllerState {
+            ControllerState::new().with_manual_admission()
+        }
+
+        async fn register(state: &ControllerState, node_id: NodeId) -> (StatusCode, Vec<u8>) {
+            let request = RegisterNodeRequest {
+                metadata: RequestMetadata::new(),
+                node: descriptor(node_id),
+                credential: meld_core::credential_digest("a-test-secret"),
+            };
+            let response = router(state.clone())
+                .oneshot(registration_json_request(request))
+                .await
+                .expect("registration should be handled");
+            let status = response.status();
+            let body = to_bytes(response.into_body(), usize::MAX)
+                .await
+                .expect("response body should be readable");
+            (status, body.to_vec())
+        }
+
+        async fn admitted(state: &ControllerState, node_id: NodeId) -> bool {
+            let (status, body) = register(state, node_id).await;
+            assert_eq!(status, StatusCode::OK);
+            serde_json::from_slice::<RegisterNodeResponse>(&body)
+                .expect("registration response")
+                .admitted
+        }
+
+        async fn approve(state: &ControllerState, node_id: NodeId) -> Response {
+            router(state.clone())
+                .oneshot(post_empty_request(&format!("/v1/nodes/{node_id}/approve")))
+                .await
+                .expect("approve should be handled")
+        }
+
+        async fn revoke(state: &ControllerState, node_id: NodeId) -> Response {
+            router(state.clone())
+                .oneshot(post_empty_request(&format!("/v1/nodes/{node_id}/revoke")))
+                .await
+                .expect("revoke should be handled")
+        }
+
+        async fn heartbeat(state: &ControllerState, node_id: NodeId) -> Response {
+            router(state.clone())
+                .oneshot(heartbeat_json_request(HeartbeatRequest {
+                    metadata: RequestMetadata::new(),
+                    node_id,
+                    snapshot: snapshot(),
+                }))
+                .await
+                .expect("heartbeat should be handled")
+        }
+
+        async fn poll(state: &ControllerState, node_id: NodeId) -> Response {
+            poll_node_command_with_timeout(
+                state.clone(),
+                PollNodeCommandRequest {
+                    metadata: RequestMetadata::new(),
+                    node_id,
+                    active_execution_ids: vec![],
+                },
+                Duration::from_millis(20),
+            )
+            .await
+        }
+
+        async fn refusal(response: Response) -> ProtocolError {
+            assert_eq!(response.status(), StatusCode::FORBIDDEN);
+            let body = to_bytes(response.into_body(), usize::MAX)
+                .await
+                .expect("response body should be readable");
+            serde_json::from_slice::<ProtocolErrorResponse>(&body)
+                .expect("a refusal carries a protocol error")
+                .error
+        }
+
+        fn state_of(state: &ControllerState, node_id: NodeId) -> NodeState {
+            state
+                .registry
+                .read()
+                .expect("registry lock")
+                .get(node_id)
+                .expect("node is registered")
+                .state()
+        }
+
+        #[tokio::test]
+        async fn a_new_node_waits_for_approval_and_is_refused_everything_else() {
+            let state = manual();
+            let node_id = NodeId::generate();
+
+            assert!(!admitted(&state, node_id).await);
+            assert_eq!(state_of(&state, node_id), NodeState::Pending);
+            let waiting = ProtocolError::NodeNotApproved { node_id };
+
+            assert_eq!(refusal(heartbeat(&state, node_id).await).await, waiting);
+            assert_eq!(refusal(poll(&state, node_id).await).await, waiting);
+            let execution_id = meld_core::ExecutionId::generate();
+            let report = router(state.clone())
+                .oneshot(execution_event_json_request(ReportExecutionEventRequest {
+                    metadata: RequestMetadata::new(),
+                    node_id,
+                    execution_id,
+                    event: ExecutionEvent::Accepted,
+                }))
+                .await
+                .expect("event should be handled");
+            assert_eq!(refusal(report).await, waiting);
+
+            // Asking again changes nothing, and the node never became Ready.
+            assert!(!admitted(&state, node_id).await);
+            assert_eq!(state_of(&state, node_id), NodeState::Pending);
+        }
+
+        #[tokio::test]
+        async fn without_manual_admission_a_new_node_is_admitted_at_once() {
+            let state = ControllerState::new();
+            assert!(admitted(&state, NodeId::generate()).await);
+        }
+
+        #[tokio::test]
+        async fn an_approved_node_joins_and_keeps_its_approval_when_it_registers_again() {
+            let state = manual();
+            let node_id = NodeId::generate();
+            assert!(!admitted(&state, node_id).await);
+
+            let response = approve(&state, node_id).await;
+            assert_eq!(response.status(), StatusCode::OK);
+            assert_eq!(heartbeat(&state, node_id).await.status(), StatusCode::OK);
+            assert_eq!(state_of(&state, node_id), NodeState::Ready);
+
+            // A restarted node registers again; it must not go back to waiting.
+            assert!(admitted(&state, node_id).await);
+            assert_eq!(approve(&state, node_id).await.status(), StatusCode::OK);
+            assert_eq!(heartbeat(&state, node_id).await.status(), StatusCode::OK);
+        }
+
+        #[tokio::test]
+        async fn a_node_waiting_for_approval_is_never_given_a_job() {
+            let state = manual();
+            let node_id = NodeId::generate();
+            admitted(&state, node_id).await;
+            let mut spec = job_spec();
+            spec.requirements.memory_bytes = 8_000;
+            let job_id = state
+                .jobs_mut()
+                .expect("job manager lock")
+                .submit(spec)
+                .expect("valid job should be queued");
+
+            poll(&state, node_id).await;
+
+            let status = get_job_status(state.clone(), job_id).await;
+            assert_eq!(status.state, JobState::Queued);
+            assert_eq!(status.queue_reason, Some(QueueReason::NoReadyNodes));
+            assert!(status.execution.is_none());
+        }
+
+        #[tokio::test]
+        async fn a_revoked_node_is_refused_and_cannot_rewrite_its_record() {
+            let state = manual();
+            let node_id = NodeId::generate();
+            admitted(&state, node_id).await;
+            approve(&state, node_id).await;
+            heartbeat(&state, node_id).await;
+
+            let response = revoke(&state, node_id).await;
+            assert_eq!(response.status(), StatusCode::OK);
+            assert_eq!(state_of(&state, node_id), NodeState::Revoked);
+            let revoked = ProtocolError::NodeRevoked { node_id };
+            assert_eq!(refusal(heartbeat(&state, node_id).await).await, revoked);
+            assert_eq!(refusal(poll(&state, node_id).await).await, revoked);
+
+            let mut changed = descriptor(node_id);
+            changed.hostname = "someone-else".to_owned();
+            let response = router(state.clone())
+                .oneshot(registration_json_request(RegisterNodeRequest {
+                    metadata: RequestMetadata::new(),
+                    node: changed,
+                    credential: meld_core::credential_digest("a-test-secret"),
+                }))
+                .await
+                .expect("registration should be handled");
+            assert_eq!(refusal(response).await, revoked);
+            let hostname = state
+                .registry
+                .read()
+                .expect("registry lock")
+                .get(node_id)
+                .expect("node is registered")
+                .descriptor()
+                .hostname
+                .clone();
+            assert_eq!(hostname, "worker-1");
+        }
+
+        #[tokio::test]
+        async fn a_revoked_node_can_be_approved_again() {
+            let state = manual();
+            let node_id = NodeId::generate();
+            admitted(&state, node_id).await;
+            approve(&state, node_id).await;
+            revoke(&state, node_id).await;
+
+            assert_eq!(approve(&state, node_id).await.status(), StatusCode::OK);
+            assert!(admitted(&state, node_id).await);
+            assert_eq!(heartbeat(&state, node_id).await.status(), StatusCode::OK);
+            assert_eq!(state_of(&state, node_id), NodeState::Ready);
+        }
+
+        #[tokio::test]
+        async fn approving_or_revoking_an_unknown_node_is_not_found() {
+            let state = manual();
+            assert_eq!(
+                approve(&state, NodeId::generate()).await.status(),
+                StatusCode::NOT_FOUND
+            );
+            assert_eq!(
+                revoke(&state, NodeId::generate()).await.status(),
+                StatusCode::NOT_FOUND
+            );
+        }
+
+        #[tokio::test]
+        async fn revoking_a_node_gives_up_on_what_it_was_running() {
+            let state = ControllerState::new();
+            let node_id = NodeId::generate();
+            let (job_id, execution_id) = assigned_execution(&state, node_id);
+            for event in [ExecutionEvent::Accepted, ExecutionEvent::Running] {
+                assert_eq!(
+                    report_event(state.clone(), node_id, execution_id, event).await,
+                    StatusCode::OK
+                );
+            }
+            // Its heartbeats were fine a moment ago; revoking is what silences it.
+            let soon = Instant::now() + Duration::from_secs(60);
+            let (lost, _) = state
+                .give_up_on_silent_nodes(soon, Duration::from_secs(30))
+                .expect("giving up");
+            assert!(lost.is_empty(), "a live node is not given up on");
+
+            revoke(&state, node_id).await;
+            let (lost, _) = state
+                .give_up_on_silent_nodes(soon, Duration::from_secs(30))
+                .expect("giving up");
+
+            assert_eq!(lost, vec![execution_id]);
+            assert_eq!(
+                get_job_status(state.clone(), job_id).await.state,
+                JobState::Lost
+            );
+            // Its late report is not listened to either.
+            assert_eq!(
+                report_event(
+                    state,
+                    node_id,
+                    execution_id,
+                    ExecutionEvent::Finished {
+                        result: ExecutionResult { exit_code: Some(0) },
+                        output: ExecutionOutput::default(),
+                        outputs: vec![],
+                    }
+                )
+                .await,
+                StatusCode::FORBIDDEN
+            );
+        }
+
+        #[tokio::test]
+        async fn a_poll_that_is_waiting_when_the_node_is_revoked_is_turned_away() {
+            let state = ControllerState::new();
+            let node_id = NodeId::generate();
+            register_ready_node(&state, node_id);
+
+            let waiting = tokio::spawn(poll_node_command_with_timeout(
+                state.clone(),
+                PollNodeCommandRequest {
+                    metadata: RequestMetadata::new(),
+                    node_id,
+                    active_execution_ids: vec![],
+                },
+                Duration::from_secs(30),
+            ));
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            revoke(&state, node_id).await;
+
+            let response = tokio::time::timeout(Duration::from_secs(5), waiting)
+                .await
+                .expect("the poll should end when the node is revoked")
+                .expect("the poll task should not panic");
+            assert_eq!(
+                refusal(response).await,
+                ProtocolError::NodeRevoked { node_id }
+            );
+        }
+
+        #[tokio::test]
+        async fn admission_survives_a_controller_restart() {
+            let directory = TempDir::new().expect("temp dir");
+            let state_over = |directory: &TempDir| {
+                let store = StateStore::open(&directory.path().join("state.db"))
+                    .expect("state database should open");
+                manual()
+                    .with_store(Arc::new(store))
+                    .expect("stored state should restore")
+            };
+            let (waiting, approved, revoked) =
+                (NodeId::generate(), NodeId::generate(), NodeId::generate());
+
+            let before = state_over(&directory);
+            for node_id in [waiting, approved, revoked] {
+                admitted(&before, node_id).await;
+            }
+            approve(&before, approved).await;
+            approve(&before, revoked).await;
+            revoke(&before, revoked).await;
+            drop(before);
+
+            let after = state_over(&directory);
+            assert_eq!(state_of(&after, waiting), NodeState::Pending);
+            // Restored nodes are silent until they report; what matters is
+            // that approval is not lost, so they can.
+            assert_eq!(heartbeat(&after, approved).await.status(), StatusCode::OK);
+            assert_eq!(state_of(&after, revoked), NodeState::Revoked);
+            assert!(!admitted(&after, waiting).await);
         }
     }
 

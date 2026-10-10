@@ -8,9 +8,9 @@ Meld は、自宅や小規模な環境にある複数のコンピューターを
 
 ## 現在の状態
 
-Phase 0からPhase 6までが完了し、Phase 7(セキュリティと実行隔離)を進めています。認証(7a)まで実装済みです。
+Phase 0からPhase 6までが完了し、Phase 7(セキュリティと実行隔離)を進めています。認証(7a)、nodeの承認(7b-1)、node専用の秘密(7b-2a)、通信の暗号化(7c)まで実装済みです。
 
-- `meld-controller`、`meld-node`、`meld-core`、`meld-cli` の4 crateでvirtual workspaceを構成しています。
+- `meld-controller`、`meld-node`、`meld-core`、`meld-cli`、`meld-tls` の5 crateでvirtual workspaceを構成しています。
 - 共有domain model、job / execution状態遷移、in-memory Node RegistryとJob Manager、least-loaded Schedulerを実装済みです。
 - nodeはHTTP/JSONでcontrollerへ登録し、永続化したidentity、capacity、resource snapshot、heartbeatを報告します。
 - controllerはheartbeat timeoutによる`Unreachable`判定と、再接続・同一identityでの再登録を扱います。
@@ -26,7 +26,7 @@ Phase 0からPhase 6までが完了し、Phase 7(セキュリティと実行隔�
   - ファイルは内容のsha256で識別し、controllerが持たない内容だけを転送します。nodeはローカルcacheで再利用します。受信側は常にhashとサイズを検証します。
   - 転送の失敗は、jobの失敗と理由(`meld status`の`data_failure`)として表示されます。
 - Phase 6の永続化と障害復旧として、controllerの状態はSQLiteに保存され、再起動後に復元されます。node消失は`Lost`として扱い、`meld retry`と、冪等と宣言したjobの自動retryがあります。
-- Phase 7の認証として、controllerはclient用とnode用の別々のトークンで呼び出し元を確認します。通信はまだ暗号化されないため、信頼された開発用LANでのみ使用してください。
+- Phase 7の認証として、controllerはclient用とnode用の別々のトークンで呼び出し元を確認し、認証が有効なときは通信を暗号化します。
 
 ## 使い方
 
@@ -38,6 +38,8 @@ meld status <job-id>
 meld logs <job-id>
 meld fetch <job-id> --out-dir ./results
 meld cancel <job-id>
+meld approve <node-id>
+meld revoke <node-id>
 ```
 
 `--input`にディレクトリを渡すと、中のファイルをすべて、そのディレクトリ名の下へ送ります。`SRC=DEST`で配置先を指定できます。`jobs`のような一覧表示は、まだありません。
@@ -51,18 +53,42 @@ meld cancel <job-id>
 | controller | `MELD_BLOB_QUOTA_BYTES` | 16GiB | 保管する内容の合計 |
 | controller | `MELD_OUTPUT_RETENTION_SECS` | 86400 | 完了したjobの出力を削除しない期間 |
 | node | `MELD_CACHE_MAX_BYTES` | 8GiB | 入力のcacheの上限 |
+| `meld`、node | `MELD_CONTROLLER_FINGERPRINT` | なし | 信頼するcontrollerの証明書のsha256(認証が有効なcontrollerへ接続するとき) |
 | controller | `MELD_CLIENT_TOKEN` | なし | `meld`が提示するトークン(controllerと`meld`の両方に設定) |
-| controller | `MELD_NODE_TOKEN` | なし | nodeが提示するトークン(controllerと各nodeに設定) |
+| controller | `MELD_NODE_TOKEN` | なし | nodeが参加するときのトークン(controllerと各nodeに設定) |
 
 ### 認証
 
 トークンは16文字以上の、空白を含まない表示可能なASCII文字列です。`meld`は`MELD_CLIENT_TOKEN`、nodeは`MELD_NODE_TOKEN`を環境変数から読みます(コマンドラインに出さないため、引数では渡せません)。
 
 - 両方のトークンを設定すると、controllerは全APIで`Authorization: Bearer <token>`を要求します。片方だけの設定と、同じ値の設定は起動時に拒否します。
-- clientのトークンではjobの投入・照会・cancelなど、nodeのトークンではnodeの登録・heartbeat・割り当ての取得・結果の報告ができます。互いの操作はできません(403)。ファイルの転送だけは両方に許可します。
+- clientのトークンではjobの投入・照会・cancel・nodeの承認など、`meld`の操作ができます。`MELD_NODE_TOKEN`は、nodeが参加(登録)するためのトークンで、これでできるのは登録だけです。登録したnodeは、自分だけの秘密(state dirの`node-secret`)で、そのnodeとして動きます。他のnodeになりすますことはできません(403)。ファイルの転送だけは、clientと、承認済みのnodeに許可します。
+- `node-secret`は消さないでください。失うと、controllerに別の秘密として断られます。その場合は`meld revoke <node-id>`、`meld approve <node-id>`のあとでnodeを再起動します。
 - 未設定のままloopback以外のアドレス(`MELD_CONTROLLER_ADDR=0.0.0.0:3000`など)で待ち受けようとすると、controllerは起動を拒否します。loopbackでは警告を出して認証なしで動きます。
 - トークンの変更は、controllerとすべてのnode、`meld`の設定を揃えて再起動します。トークンが合わないnodeは終了します。
-- 通信は暗号化されません。トークンは平文で送られるため、盗聴できるネットワークでは守りになりません。暗号化は7cで扱います。
+- 認証が有効なとき、新しいnodeは承認待ち(`pending`)で参加します。`meld nodes`でIDを確かめ、`meld approve <node-id>`で承認します。承認するまで、nodeはjobを受け取りません。`meld revoke <node-id>`で参加を取り消すと、そのnodeは終了し、実行中だったjobは`lost`になります。認証が無効なとき(loopbackの開発用途)は、すべて自動で承認します。
+
+### 暗号化
+
+認証が有効なcontrollerは、TLSだけで待ち受けます。
+
+1. controllerを起動すると、初回に自己署名証明書を作り、フィンガープリントを表示します(`<state dir>/tls-fingerprint`にも書きます)。
+2. `meld`とnodeに、そのフィンガープリントと`https://`のURLを設定します。
+
+```text
+# controller
+MELD_CLIENT_TOKEN=... MELD_NODE_TOKEN=... MELD_CONTROLLER_ADDR=0.0.0.0:3000 meld-controller
+#   encrypted connections only; give clients and nodes MELD_CONTROLLER_FINGERPRINT=<64桁>
+
+# meld と node
+export MELD_CONTROLLER_URL=https://controller.lan:3000
+export MELD_CONTROLLER_FINGERPRINT=<64桁>
+```
+
+- フィンガープリントが一致する証明書だけを信頼します。名前は見ないので、IPアドレスでも接続できます。
+- `tls-cert.pem`と`tls-key.pem`を自分で置くと、それを使います。
+- 証明書を作り直す(`tls-*`を消す)と、フィンガープリントが変わります。すべての`meld`とnodeの設定を替えてください。
+- トークンがあるのにloopback以外へ`http://`で接続すると、警告します。トークンは平文で流れます。
 
 将来的には、利用者が物理的な実行先を毎回指定せず、データの所在も考慮して実行先が決まる状態を目指します。
 
@@ -102,6 +128,8 @@ meld/
 └── crates/
     ├── meld-controller/
     ├── meld-node/
+    ├── meld-cli/
+    ├── meld-tls/      通信の暗号化と、証明書の固定
     └── meld-core/
 ```
 

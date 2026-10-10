@@ -7,7 +7,7 @@ use std::{
     time::Instant,
 };
 
-use meld_core::{NodeDescriptor, NodeId, NodeState, ResourceSnapshot};
+use meld_core::{Admission, NodeDescriptor, NodeId, NodeState, ResourceSnapshot, Sha256Digest};
 use serde::{Deserialize, Serialize};
 
 use crate::store::{Change, Kind, Persist, StateStore, StoreError, decode, encode};
@@ -16,7 +16,14 @@ use crate::store::{Change, Kind, Persist, StateStore, StoreError, decode, encode
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RegisteredNode {
     descriptor: NodeDescriptor,
-    /// Liveness observed from heartbeats; never `Draining`.
+    /// The operator's decision on whether the node takes part. It outranks
+    /// liveness: a node that is not approved is never schedulable.
+    admission: Admission,
+    /// Digest of the secret that speaks for this node, bound when the node
+    /// first registered. `None` for a node stored before secrets existed,
+    /// which takes the first one it presents.
+    credential: Option<Sha256Digest>,
+    /// Liveness observed from heartbeats; never `Draining`, `Pending` or `Revoked`.
     state: NodeState,
     /// Operator intent. Kept separately so it survives heartbeats, timeouts
     /// and re-registration instead of being overwritten by liveness changes.
@@ -30,12 +37,32 @@ impl RegisteredNode {
         &self.descriptor
     }
 
-    /// Effective state: a live node the operator is draining reports `Draining`.
+    /// Effective state: a node that is not approved reports why, and a live
+    /// node the operator is draining reports `Draining`.
     pub const fn state(&self) -> NodeState {
-        match self.state {
-            NodeState::Ready if self.draining => NodeState::Draining,
-            state => state,
+        match (self.admission, self.state) {
+            (Admission::Pending, _) => NodeState::Pending,
+            (Admission::Revoked, _) => NodeState::Revoked,
+            (Admission::Approved, NodeState::Ready) if self.draining => NodeState::Draining,
+            (Admission::Approved, state) => state,
         }
+    }
+
+    pub const fn admission(&self) -> Admission {
+        self.admission
+    }
+
+    /// Whether `presented` is the digest of this node's secret.
+    pub fn has_credential(&self, presented: &Sha256Digest) -> bool {
+        self.credential
+            .as_ref()
+            .is_some_and(|bound| digests_equal(bound, presented))
+    }
+
+    /// Whether heartbeats have stopped, whatever the operator decided. The
+    /// executions of a revoked node are given up on by this, not by `state`.
+    pub const fn is_silent(&self) -> bool {
+        matches!(self.state, NodeState::Unreachable)
     }
 
     pub const fn snapshot(&self) -> Option<ResourceSnapshot> {
@@ -65,7 +92,40 @@ pub struct NodeRegistry {
 struct StoredNode {
     descriptor: NodeDescriptor,
     draining: bool,
+    /// Absent in records written before nodes needed approval, which were
+    /// all in use.
+    #[serde(default = "approved")]
+    admission: Admission,
+    #[serde(default)]
+    credential: Option<Sha256Digest>,
 }
+
+const fn approved() -> Admission {
+    Admission::Approved
+}
+
+/// Compares without stopping at the first difference.
+pub(crate) fn digests_equal(left: &Sha256Digest, right: &Sha256Digest) -> bool {
+    let (left, right) = (left.as_str().as_bytes(), right.as_str().as_bytes());
+    left.len() == right.len()
+        && left
+            .iter()
+            .zip(right)
+            .fold(0u8, |difference, (left, right)| difference | (left ^ right))
+            == 0
+}
+
+/// A node tried to register under an identity bound to another secret.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CredentialMismatch(pub NodeId);
+
+impl fmt::Display for CredentialMismatch {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(formatter, "node {} is bound to a different secret", self.0)
+    }
+}
+
+impl Error for CredentialMismatch {}
 
 impl NodeRegistry {
     pub fn new() -> Self {
@@ -90,6 +150,8 @@ impl NodeRegistry {
                 stored.descriptor.id,
                 RegisteredNode {
                     descriptor: stored.descriptor,
+                    admission: stored.admission,
+                    credential: stored.credential,
                     state: NodeState::Unreachable,
                     draining: stored.draining,
                     snapshot: None,
@@ -113,6 +175,8 @@ impl NodeRegistry {
                     encode(&StoredNode {
                         descriptor: node.descriptor.clone(),
                         draining: node.draining,
+                        admission: node.admission,
+                        credential: node.credential.clone(),
                     }),
                 )
             })
@@ -129,23 +193,109 @@ impl NodeRegistry {
     /// Registers a node as joining, replacing stale data for the same identity.
     ///
     /// A drain requested for this identity is kept, so restarting a node does
-    /// not silently put it back into scheduling.
+    /// not silently put it back into scheduling. So is the admission: only
+    /// a node seen for the first time starts as `first_admission`.
     pub fn register(&mut self, descriptor: NodeDescriptor) {
-        let draining = self
+        self.register_as(descriptor, Admission::Approved);
+    }
+
+    pub fn register_as(&mut self, descriptor: NodeDescriptor, first_admission: Admission) {
+        self.insert(descriptor, first_admission, None);
+    }
+
+    /// Registers a node that speaks with `credential`.
+    ///
+    /// The first credential seen for an identity is bound to it. Later
+    /// registrations must present the same one, so that holding the
+    /// controller's shared token is not enough to take over a node.
+    pub fn register_with(
+        &mut self,
+        descriptor: NodeDescriptor,
+        first_admission: Admission,
+        credential: Sha256Digest,
+    ) -> Result<(), CredentialMismatch> {
+        if let Some(bound) = self
             .nodes
             .get(&descriptor.id)
-            .is_some_and(|node| node.draining);
+            .and_then(|node| node.credential.as_ref())
+            && !digests_equal(bound, &credential)
+        {
+            return Err(CredentialMismatch(descriptor.id));
+        }
+        self.insert(descriptor, first_admission, Some(credential));
+        Ok(())
+    }
+
+    fn insert(
+        &mut self,
+        descriptor: NodeDescriptor,
+        first_admission: Admission,
+        credential: Option<Sha256Digest>,
+    ) {
+        let previous = self.nodes.get(&descriptor.id);
+        let draining = previous.is_some_and(|node| node.draining);
+        let admission = previous.map_or(first_admission, |node| node.admission);
+        let credential = credential.or_else(|| previous.and_then(|node| node.credential.clone()));
         self.dirty.insert(descriptor.id);
         self.nodes.insert(
             descriptor.id,
             RegisteredNode {
                 descriptor,
+                admission,
+                credential,
                 state: NodeState::Joining,
                 draining,
                 snapshot: None,
                 last_heartbeat_at: None,
             },
         );
+    }
+
+    /// The node that speaks with `presented`, whatever its admission.
+    pub fn find_by_credential(&self, presented: &Sha256Digest) -> Option<&RegisteredNode> {
+        self.nodes
+            .values()
+            .find(|node| node.has_credential(presented))
+    }
+
+    /// Lets a node take part, whether it is waiting or was revoked.
+    /// Approving an approved node changes nothing.
+    pub fn approve(&mut self, node_id: NodeId) -> Result<NodeState, NodeRegistryError> {
+        let node = self
+            .nodes
+            .get_mut(&node_id)
+            .ok_or(NodeRegistryError::NodeNotFound(node_id))?;
+        if node.admission != Admission::Approved {
+            if node.admission == Admission::Revoked {
+                // Taking a node back is how one that lost its secret is
+                // recovered, so it may bind a new one.
+                node.credential = None;
+            }
+            node.admission = Admission::Approved;
+            // Nothing was observed while it was kept out.
+            node.state = NodeState::Joining;
+            node.snapshot = None;
+            self.dirty.insert(node_id);
+        }
+        Ok(node.state())
+    }
+
+    /// Removes a node from the cluster. Its liveness stops counting at once,
+    /// so what it was running is given up on like any silent node's.
+    pub fn revoke(&mut self, node_id: NodeId) -> Result<NodeState, NodeRegistryError> {
+        let node = self
+            .nodes
+            .get_mut(&node_id)
+            .ok_or(NodeRegistryError::NodeNotFound(node_id))?;
+        if node.admission != Admission::Revoked {
+            node.admission = Admission::Revoked;
+            // Its secret is kept: the node must still be told it was revoked,
+            // and nobody else may bind one to this identity meanwhile.
+            node.state = NodeState::Unreachable;
+            node.snapshot = None;
+            self.dirty.insert(node_id);
+        }
+        Ok(node.state())
     }
 
     /// Stops (or resumes) new placements on a node and returns its effective state.
@@ -330,6 +480,71 @@ mod tests {
             .expect_err("unknown node must be rejected");
 
         assert_eq!(error, NodeRegistryError::NodeNotFound(node_id));
+    }
+
+    #[test]
+    fn a_node_stored_before_approval_existed_is_approved() {
+        let descriptor = descriptor();
+        let node_id = descriptor.id;
+        let store = StateStore::open_in_memory().expect("in-memory store");
+        // The record as an earlier version wrote it: no `admission`.
+        let legacy = serde_json::json!({ "descriptor": descriptor, "draining": false });
+        store
+            .apply(&[Change::put(Kind::Node, node_id, legacy.to_string())])
+            .expect("legacy record is stored");
+
+        let registry = NodeRegistry::restore(&store).expect("legacy record restores");
+
+        assert_eq!(
+            registry.get(node_id).map(RegisteredNode::admission),
+            Some(Admission::Approved)
+        );
+    }
+
+    #[test]
+    fn admission_is_kept_when_a_node_registers_again() {
+        let descriptor = descriptor();
+        let node_id = descriptor.id;
+        let mut registry = NodeRegistry::new();
+        registry.register_as(descriptor.clone(), Admission::Pending);
+        assert_eq!(
+            registry.get(node_id).map(RegisteredNode::state),
+            Some(NodeState::Pending)
+        );
+
+        registry.approve(node_id).expect("known node");
+        // Registering again names a different first admission; it only
+        // applies to a node that was never seen.
+        registry.register_as(descriptor.clone(), Admission::Pending);
+        assert_eq!(
+            registry.get(node_id).map(RegisteredNode::admission),
+            Some(Admission::Approved)
+        );
+
+        registry.revoke(node_id).expect("known node");
+        registry.register_as(descriptor, Admission::Approved);
+        assert_eq!(
+            registry.get(node_id).map(RegisteredNode::admission),
+            Some(Admission::Revoked)
+        );
+    }
+
+    #[test]
+    fn revoking_a_live_node_makes_it_silent_and_drops_what_was_observed() {
+        let descriptor = descriptor();
+        let node_id = descriptor.id;
+        let mut registry = NodeRegistry::new();
+        registry.register(descriptor);
+        registry
+            .record_heartbeat(node_id, snapshot())
+            .expect("registered node should accept heartbeat");
+
+        registry.revoke(node_id).expect("known node");
+
+        let node = registry.get(node_id).expect("node stays known");
+        assert_eq!(node.state(), NodeState::Revoked);
+        assert!(node.is_silent());
+        assert_eq!(node.snapshot(), None);
     }
 
     fn descriptor() -> NodeDescriptor {

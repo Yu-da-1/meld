@@ -5,6 +5,7 @@ use meld_core::{
     JobStatusResponse, ListNodesResponse, MissingInputsResponse, NodeId, NodeStateResponse,
     RetryJobRequest, RetryJobResponse, SecretToken, Sha256Digest, SubmitJobResponse,
 };
+use meld_tls::{Fingerprint, pinned_client_config};
 use reqwest::{
     Body, Client, ClientBuilder, Response, StatusCode, Url,
     header::{AUTHORIZATION, CONTENT_LENGTH, HeaderMap, HeaderValue},
@@ -29,26 +30,33 @@ pub struct ControllerClient {
 impl ControllerClient {
     #[cfg(test)]
     pub fn new(controller_url: &str) -> Result<Self, ControllerClientError> {
-        Self::with_token(controller_url, None)
+        Self::with_security(controller_url, None, None)
     }
 
-    /// A client that presents `token` on every request.
-    pub fn with_token(
+    /// A client that presents `token` on every request, and over TLS accepts
+    /// only a controller whose certificate has `fingerprint`, if one is given.
+    pub fn with_security(
         controller_url: &str,
         token: Option<&SecretToken>,
+        fingerprint: Option<&Fingerprint>,
     ) -> Result<Self, ControllerClientError> {
         let normalized_url = format!("{}/", controller_url.trim_end_matches('/'));
         let controller_url = Url::parse(&normalized_url)
             .map_err(|error| ControllerClientError::InvalidUrl(error.to_string()))?;
-        let http = authenticated(Client::builder().timeout(REQUEST_TIMEOUT), token)?
-            .build()
-            .map_err(ControllerClientError::Request)?;
+        let http = authenticated(
+            Client::builder().timeout(REQUEST_TIMEOUT),
+            token,
+            fingerprint,
+        )?
+        .build()
+        .map_err(ControllerClientError::Request)?;
 
         let blob_http = authenticated(
             Client::builder()
                 .connect_timeout(BLOB_CONNECT_TIMEOUT)
                 .read_timeout(BLOB_READ_TIMEOUT),
             token,
+            fingerprint,
         )?
         .build()
         .map_err(ControllerClientError::Request)?;
@@ -209,6 +217,20 @@ impl ControllerClient {
         self.post_node_action(node_id, "resume").await
     }
 
+    pub async fn approve(
+        &self,
+        node_id: NodeId,
+    ) -> Result<NodeStateResponse, ControllerClientError> {
+        self.post_node_action(node_id, "approve").await
+    }
+
+    pub async fn revoke(
+        &self,
+        node_id: NodeId,
+    ) -> Result<NodeStateResponse, ControllerClientError> {
+        self.post_node_action(node_id, "revoke").await
+    }
+
     async fn post_node_action(
         &self,
         node_id: NodeId,
@@ -255,8 +277,12 @@ where
 fn authenticated(
     builder: ClientBuilder,
     token: Option<&SecretToken>,
+    fingerprint: Option<&Fingerprint>,
 ) -> Result<ClientBuilder, ControllerClientError> {
-    let builder = builder.redirect(Policy::none());
+    let mut builder = builder.redirect(Policy::none());
+    if let Some(fingerprint) = fingerprint {
+        builder = builder.use_preconfigured_tls(pinned_client_config(fingerprint));
+    }
     let Some(token) = token else {
         return Ok(builder);
     };
@@ -286,7 +312,11 @@ impl fmt::Display for ControllerClientError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::InvalidUrl(error) => write!(formatter, "invalid controller URL: {error}"),
-            Self::Request(error) => write!(formatter, "controller request failed: {error}"),
+            Self::Request(error) => write!(
+                formatter,
+                "controller request failed: {}",
+                meld_core::error_chain(error)
+            ),
             Self::Rejected { status, message } => {
                 write!(
                     formatter,

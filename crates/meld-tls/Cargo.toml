@@ -1,0 +1,15 @@
+[package]
+name = "meld-tls"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+meld-core = { path = "../meld-core" }
+rcgen = { version = "0.14", default-features = false, features = ["crypto", "pem", "ring"] }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
+sha2 = "0.10"
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12"] }
+
+[dev-dependencies]
+tempfile = "3"
+tokio = { version = "1", features = ["io-util", "macros", "net", "rt", "time"] }

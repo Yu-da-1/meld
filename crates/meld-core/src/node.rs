@@ -4,10 +4,28 @@ use serde::{Deserialize, Serialize};
 
 use crate::{NodeId, ResourceCapacity};
 
+/// Whether the operator has let a node take part in the cluster.
+///
+/// This is a decision, not an observation, and is kept apart from whether
+/// the node is alive.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Admission {
+    /// Known to the controller, but waiting for an operator to approve it.
+    Pending,
+    Approved,
+    /// Removed by an operator. It may be approved again.
+    Revoked,
+}
+
 /// Controller-observed availability of a node.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum NodeState {
+    /// Not yet approved by an operator. It receives no work.
+    Pending,
+    /// Revoked by an operator. It receives no work and is not listened to.
+    Revoked,
     /// Registered but not yet confirmed by a heartbeat.
     Joining,
     Ready,

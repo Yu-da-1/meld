@@ -8,4 +8,5 @@ pub mod job_manager;
 pub mod node_registry;
 pub mod scheduler;
 pub mod store;
+pub mod tls;
 mod tracked;
