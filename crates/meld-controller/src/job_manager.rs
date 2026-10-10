@@ -10,7 +10,8 @@ use std::{
 use meld_core::{
     DataFailure, Execution, ExecutionAssignment, ExecutionCompletionError, ExecutionId,
     ExecutionOutput, ExecutionResult, ExecutionState, InvalidStateTransition, Job, JobId, JobSpec,
-    JobSpecValidationError, JobState, NodeAssessment, NodeId, OutputFile, RetryCause, Sha256Digest,
+    JobSpecValidationError, JobState, LimitBreach, NodeAssessment, NodeId, OutputFile, RetryCause,
+    Sha256Digest,
 };
 
 use crate::{
@@ -61,6 +62,8 @@ pub struct JobManager {
     outputs: Tracked<ExecutionId, ExecutionOutput>,
     /// Why an execution failed to move its job's data.
     data_failures: Tracked<ExecutionId, DataFailure>,
+    /// Why a node stopped an execution that was still running.
+    limit_breaches: Tracked<ExecutionId, LimitBreach>,
     /// Files each execution left behind for collection.
     output_files: Tracked<ExecutionId, Vec<OutputFile>>,
     /// When each execution's outputs were recorded, to bound how long they are kept.
@@ -1131,6 +1134,32 @@ impl JobManager {
 
     pub fn data_failure(&self, execution_id: ExecutionId) -> Option<&DataFailure> {
         self.data_failures.get(&execution_id)
+    }
+
+    /// Records that the node stopped the execution for using more than it
+    /// reserved. The execution fails, and is not run again by itself: the same
+    /// job would only be stopped for the same reason.
+    ///
+    /// The reason is kept for the first report only, so a repeated report
+    /// changes nothing.
+    pub fn fail_execution_limit(
+        &mut self,
+        execution_id: ExecutionId,
+        breach: LimitBreach,
+        output: ExecutionOutput,
+    ) -> Result<(), JobManagerError> {
+        // A process that was stopped has no exit code of its own.
+        self.finish_execution_with_output(
+            execution_id,
+            ExecutionResult { exit_code: None },
+            output,
+        )?;
+        self.limit_breaches.entry(execution_id).or_insert(breach);
+        Ok(())
+    }
+
+    pub fn limit_breach(&self, execution_id: ExecutionId) -> Option<&LimitBreach> {
+        self.limit_breaches.get(&execution_id)
     }
 
     pub fn output_files(&self, execution_id: ExecutionId) -> &[OutputFile] {

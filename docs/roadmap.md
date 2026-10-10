@@ -348,7 +348,7 @@ processやnetworkの障害を状態として扱い、controller再起動後に�
 - CLI利用者の認証と認可
 - secretの安全な受け渡し
 - command allow/deny policyの検討
-- nativeで動くjobのCPU、memoryの制限
+- nativeで動くjobのmemoryの制限(CPUは対象外。7dの「見送ったこと」)
 
 container executorは、このphaseでは行いません(下の「見送ったこと」)。
 
@@ -357,7 +357,7 @@ container executorは、このphaseでは行いません(下の「見送った�
 - 未承認nodeがclusterへ参加できない。
 - 未承認clientがjobを投入できない。
 - 通信が暗号化され、identityを検証できる。
-- 予約を超えてCPUやmemoryを使うjobを、対応するOSで抑えられる。対応しないOSでは、できないことが明示される。
+- 予約を超えてmemoryを使うjobを、そのjobだけ止められ、理由が利用者に示される。CPUは制限しないことが明示されている。
 - 実行権限と残存ファイルのcleanup方針が文書化・testされている。
 
 ### 進め方
@@ -371,7 +371,7 @@ container executorは、このphaseでは行いません(下の「見送った�
 | 7b-2a | node専用の秘密(個別の失効を有効にし、他のnodeになりすませなくする) | 完了 |
 | 7b-2b | 事前登録用の、一回限りの参加トークン | 見送り |
 | 7c | TLSによる暗号化とcontrollerの検証(自己署名証明書とフィンガープリントの固定) | 完了 |
-| 7d | nativeで動くjobの資源制限(Linuxはcgroup、WindowsはJob Object、macOSはできる範囲) | 未着手 |
+| 7d | nativeで動くjobのメモリ制限(測って、超えたら止める) | 完了 |
 | 7e | cleanup方針の文書化、secretの受け渡し | 未着手 |
 
 ### 見送ったこと
@@ -436,6 +436,31 @@ nodeが別のnodeになりすませないようにしました。
 - 7b-2a以前に保存されたnodeは、最初に提示された秘密を結び付けます。更新後、そのnodeが再接続するまでの間は、参加用トークンを持つ者が先に結び付けられます。
 - 承認は、運用者がIDを確かめて行います。ただし、そのIDの持ち主が本物かは、結び付きより前には確かめられません。
 - 参加用トークンはcluster全体で共有です。`MELD_NODE_TOKEN`を替えるには、controllerと、これから参加するnodeの設定を揃えます。登録済みのnodeは、自分の秘密で動き続けられます。
+
+### 7dの現在地
+
+予約を超えてメモリを使ったjobを、そのjob単独で止めます。
+
+- 目的: 予約は帳簿上の約束で、jobが守らなくても検出されませんでした。1つのjobがメモリを使い切ると、同じnodeの無関係なjobとnode自身が巻き込まれて`lost`になります。申告を超えたjobだけを失敗にして、他のjobとnodeを守り、原因を示します。
+- 方式: OSの強制(cgroupやJob Object)ではなく、nodeが測って止めます。OSごとに実装が違わず、特別な権限もいりません。実行中のjobのprocess木(子孫を含む)の常駐メモリを1秒ごとに合計し、上限を超えたら、そのjobのprocess groupを止めます。
+- 上限: 予約量の110%です(`MEMORY_LIMIT_MARGIN_PERCENT`)。申告どおりに使うjobが、processの基本的な消費で止まらないための余裕です。申告を省いた既定の予約(256MiB)でも止めます。予約が約束になるためで、足りないjobは`--memory`で大きくします。
+- 結果: 失敗(`failed`)で、`exit_code`はありません。`meld status`に`limit: memory limit exceeded: used ... bytes, over the limit of ... bytes (... reserved, plus 10%); run it again with a larger --memory`と出ます。止められるまでに出力した標準出力と標準エラーは残ります。理由は永続化され、controllerの再起動後も見られます。
+- 再実行: 自動retryしません(`--max-attempts`と`--idempotent`を指定していても)。同じjobは同じ理由で止まるためです。`meld retry`は、利用者が意図して行う操作として残します。
+- protocol: versionを9に上げました。`ExecutionEvent::LimitExceeded`と、状態応答の`limit_breach`を追加しています。
+- test: 単体testで、上限が「予約と1割」になること、process木の合算(子孫を数え、他は数えない)、上限を超えると止まること、子process が持つメモリも数えること、予約の範囲では止まらないこと、止めたあとにprocessが残らないことを確認します。controllerの単体testで、失敗として記録され理由が見えること、同じ報告が重複しても変わらないこと、再実行されないこと、再起動後も残ることを確認します。実processでは、超過したjobが理由つきで失敗し、隣のjobとnodeに影響しないことを確認します。上限超過を無視する変更と、子processを数えない変更で、対応するtestが失敗することを確かめました。
+
+### 見送ったこと(7d)
+
+- CPUの制限: 予約を超えて使っても、他のjobが遅くなるだけで、nodeは落ちません。止めるべき事故ではなく、単純に抑える手段もないため、制限しません。
+- ディスクとネットワークの制限: 対象外です。出力が容量を使い切り得ることは、既知の制約として残ります。
+
+### 既知の制約(7d時点)
+
+- 約1秒の間隔で測るので、その間の急な確保は止められません。そのあいだにnode全体のメモリが尽きる速さで確保するjobは、防げません。
+- 常駐メモリを合算するので、複数のprocessが共有するメモリは、それぞれに数えられます。多数の作業processを立てるjobは、実際より大きく見えることがあります。10%の余裕で吸収できるのは、その一部です。
+- 数えるのは、起動したprocessの子孫です。親から切り離されて別のprocess groupや常駐process(デーモン)になったものは、数えません。
+- 止めるのは、そのjobの処理のprocess groupです(Unix)。Windowsでは、子孫を含めた終了の保証は、これまでのcancelやtimeoutと同じ範囲です。
+- 測るのはnodeの`sysinfo`が返す値です。環境によっては、実際のメモリ使用と差が出ることがあります。
 
 ### 7cの現在地
 

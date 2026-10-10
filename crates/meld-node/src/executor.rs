@@ -9,13 +9,17 @@ use std::{
     time::Duration,
 };
 
-use meld_core::{CapturedStream, ExecutionAssignment, ExecutionOutput, ExecutionResult};
+use meld_core::{
+    CapturedStream, ExecutionAssignment, ExecutionOutput, ExecutionResult, LimitBreach,
+};
 use tokio::{
     io::{AsyncRead, AsyncReadExt},
     process::{Child, ChildStderr, ChildStdout, Command},
     sync::oneshot,
-    time::sleep,
+    time::{MissedTickBehavior, interval, sleep},
 };
+
+use crate::limits::{MemoryMeter, MemoryWatch};
 
 const MAX_CAPTURED_STREAM_BYTES: usize = 1024 * 1024;
 const READ_BUFFER_BYTES: usize = 8 * 1024;
@@ -122,21 +126,25 @@ impl NativeExecution {
     #[cfg(test)]
     pub async fn wait(self) -> io::Result<CompletedExecution> {
         let (sender, receiver) = oneshot::channel();
-        let outcome = self.wait_controlled(receiver, None).await;
+        let outcome = self.wait_controlled(receiver, None, None).await;
         drop(sender);
         match outcome?.0 {
             ControlledExecutionOutcome::Finished(completed) => Ok(completed),
             ControlledExecutionOutcome::Cancelled { .. }
-            | ControlledExecutionOutcome::TimedOut { .. } => {
+            | ControlledExecutionOutcome::TimedOut { .. }
+            | ControlledExecutionOutcome::LimitExceeded { .. } => {
                 unreachable!("wait without control cannot be interrupted")
             }
         }
     }
 
+    /// Waits for the process to end, or stops it: when cancelled, when
+    /// `timeout` passes, or when `memory` says it has used more than it may.
     pub async fn wait_controlled(
         mut self,
         mut cancellation: oneshot::Receiver<()>,
         timeout: Option<Duration>,
+        memory: Option<MemoryWatch>,
     ) -> io::Result<(ControlledExecutionOutcome, Workspace)> {
         let stdout = self
             .stdout
@@ -160,15 +168,33 @@ impl NativeExecution {
             Finished(ExecutionResult),
             Cancelled,
             TimedOut,
+            LimitExceeded(LimitBreach),
         }
 
-        let termination = tokio::select! {
-            biased;
-            status = self.child.wait() => Termination::Finished(ExecutionResult {
-                exit_code: status?.code(),
-            }),
-            _ = &mut cancellation => Termination::Cancelled,
-            _ = &mut timeout_future => Termination::TimedOut,
+        let process_id = self.child.id();
+        let mut meter = MemoryMeter::new();
+        let mut checks = interval(memory.map_or(Duration::from_secs(1), |watch| watch.interval()));
+        checks.set_missed_tick_behavior(MissedTickBehavior::Skip);
+
+        let termination = loop {
+            tokio::select! {
+                biased;
+                status = self.child.wait() => break Termination::Finished(ExecutionResult {
+                    exit_code: status?.code(),
+                }),
+                _ = &mut cancellation => break Termination::Cancelled,
+                _ = &mut timeout_future => break Termination::TimedOut,
+                _ = checks.tick(), if memory.is_some() => {
+                    let breach = memory.zip(process_id).and_then(|(watch, process_id)| {
+                        meter
+                            .tree_bytes(process_id)
+                            .and_then(|used_bytes| watch.breach(used_bytes))
+                    });
+                    if let Some(breach) = breach {
+                        break Termination::LimitExceeded(breach);
+                    }
+                }
+            }
         };
         if !matches!(termination, Termination::Finished(_)) {
             terminate_child(&mut self.child).await?;
@@ -187,6 +213,9 @@ impl NativeExecution {
             }
             Termination::Cancelled => ControlledExecutionOutcome::Cancelled { output },
             Termination::TimedOut => ControlledExecutionOutcome::TimedOut { output },
+            Termination::LimitExceeded(breach) => {
+                ControlledExecutionOutcome::LimitExceeded { output, breach }
+            }
         };
         let workspace = self
             .workspace
@@ -213,8 +242,17 @@ pub struct CompletedExecution {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ControlledExecutionOutcome {
     Finished(CompletedExecution),
-    Cancelled { output: ExecutionOutput },
-    TimedOut { output: ExecutionOutput },
+    Cancelled {
+        output: ExecutionOutput,
+    },
+    TimedOut {
+        output: ExecutionOutput,
+    },
+    /// Stopped because it used more memory than it reserved.
+    LimitExceeded {
+        output: ExecutionOutput,
+        breach: LimitBreach,
+    },
 }
 
 async fn capture_stream(mut stream: impl AsyncRead + Unpin) -> io::Result<CapturedStream> {
@@ -289,6 +327,8 @@ fn signal_process_group(child: &Child) -> io::Result<()> {
 mod tests {
     use meld_core::{ExecutionId, JobId, JobSpec, NodeId, ResourceRequirements};
     use tempfile::tempdir;
+
+    use crate::limits::MemoryWatch;
 
     use super::*;
 
@@ -378,7 +418,7 @@ mod tests {
             .expect("cancellation receiver should be open");
 
         let (outcome, held) = execution
-            .wait_controlled(cancellation, None)
+            .wait_controlled(cancellation, None, None)
             .await
             .expect("cancelled process should be reaped");
 
@@ -412,7 +452,7 @@ mod tests {
         let (_cancel, cancellation) = oneshot::channel();
 
         let (outcome, held) = execution
-            .wait_controlled(cancellation, Some(Duration::from_millis(10)))
+            .wait_controlled(cancellation, Some(Duration::from_millis(10)), None)
             .await
             .expect("timed out process should be reaped");
 
@@ -435,7 +475,7 @@ mod tests {
         let started = std::time::Instant::now();
 
         let (outcome, _held) = execution
-            .wait_controlled(cancellation, Some(Duration::from_millis(10)))
+            .wait_controlled(cancellation, Some(Duration::from_millis(10)), None)
             .await
             .expect("process group should be stopped");
 
@@ -476,7 +516,7 @@ mod tests {
         assert_eq!(fs::read(&marker).expect("staged file"), b"staged");
         let (_cancel, cancellation) = oneshot::channel();
         let (_, held) = execution
-            .wait_controlled(cancellation, None)
+            .wait_controlled(cancellation, None, None)
             .await
             .expect("wait");
         assert_eq!(fs::read(&marker).expect("kept until dropped"), b"staged");
@@ -496,6 +536,116 @@ mod tests {
         drop(workspace);
 
         assert!(!path.exists());
+    }
+
+    /// A shell script that holds about 40 MB, then waits.
+    #[cfg(unix)]
+    const HOLD_MEMORY: &str = "x=$(head -c 40000000 /dev/zero | tr '\\0' x); sleep 30";
+
+    #[cfg(unix)]
+    async fn run_watched(script: &str, reserved_bytes: u64) -> ControlledExecutionOutcome {
+        let state_directory = tempdir().expect("temporary state directory should be created");
+        let executor = NativeExecutor::new(state_directory.path());
+        let assignment = assignment("sh", vec!["-c", script]);
+        let execution = start_in_new_workspace(&executor, &assignment).expect("sh should start");
+        let (_cancel, cancellation) = oneshot::channel();
+        let watch = MemoryWatch::for_reservation(reserved_bytes, Duration::from_millis(50));
+
+        let started = std::time::Instant::now();
+        let (outcome, _held) = tokio::time::timeout(
+            Duration::from_secs(20),
+            execution.wait_controlled(cancellation, None, Some(watch)),
+        )
+        .await
+        .expect("the execution should end by itself")
+        .expect("wait should succeed");
+        // Stopped promptly, not left to run its 30 seconds.
+        assert!(
+            started.elapsed() < Duration::from_secs(15),
+            "took {:?}",
+            started.elapsed()
+        );
+        outcome
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_process_over_its_reservation_is_stopped() {
+        let outcome = run_watched(HOLD_MEMORY, 5 * 1024 * 1024).await;
+
+        let ControlledExecutionOutcome::LimitExceeded { breach, .. } = outcome else {
+            panic!("expected the process to be stopped, got {outcome:?}");
+        };
+        let LimitBreach::Memory {
+            reserved_bytes,
+            limit_bytes,
+            used_bytes,
+        } = breach;
+        assert_eq!(reserved_bytes, 5 * 1024 * 1024);
+        assert!(limit_bytes > reserved_bytes);
+        assert!(used_bytes > limit_bytes, "{used_bytes} <= {limit_bytes}");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn memory_held_by_a_child_counts_against_the_job() {
+        // The parent holds almost nothing; the child holds the memory.
+        let script = format!("( {HOLD_MEMORY} ) & wait");
+
+        let outcome = run_watched(&script, 5 * 1024 * 1024).await;
+
+        assert!(
+            matches!(outcome, ControlledExecutionOutcome::LimitExceeded { .. }),
+            "{outcome:?}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_process_within_its_reservation_runs_to_the_end() {
+        let outcome = run_watched("sleep 1; echo done", 256 * 1024 * 1024).await;
+
+        let ControlledExecutionOutcome::Finished(completed) = outcome else {
+            panic!("expected the process to finish, got {outcome:?}");
+        };
+        assert_eq!(completed.result.exit_code, Some(0));
+        assert_eq!(completed.output.stdout.content, "done\n");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_stopped_process_leaves_nothing_running() {
+        let state_directory = tempdir().expect("temporary state directory should be created");
+        let executor = NativeExecutor::new(state_directory.path());
+        let marker = state_directory.path().join("alive");
+        // Writes a file every moment, for as long as it runs.
+        let script = format!(
+            "{HOLD_MEMORY} & while true; do date >> '{}'; sleep 0.1; done",
+            marker.display()
+        );
+        let assignment = assignment("sh", vec!["-c", &script]);
+        let execution = start_in_new_workspace(&executor, &assignment).expect("sh should start");
+        let (_cancel, cancellation) = oneshot::channel();
+        let watch = MemoryWatch::for_reservation(5 * 1024 * 1024, Duration::from_millis(50));
+
+        // Bounded, so a watch that never fires fails this test instead of
+        // leaving a script running that never ends.
+        let (outcome, _held) = tokio::time::timeout(
+            Duration::from_secs(20),
+            execution.wait_controlled(cancellation, None, Some(watch)),
+        )
+        .await
+        .expect("the execution should be stopped")
+        .expect("wait should succeed");
+        assert!(matches!(
+            outcome,
+            ControlledExecutionOutcome::LimitExceeded { .. }
+        ));
+
+        let size = fs::metadata(&marker).map(|meta| meta.len()).unwrap_or(0);
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        let later = fs::metadata(&marker).map(|meta| meta.len()).unwrap_or(0);
+        assert_eq!(size, later, "the process group kept running");
     }
 
     fn assignment(program: &str, args: Vec<&str>) -> ExecutionAssignment {

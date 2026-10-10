@@ -27,7 +27,7 @@ pub use data::{
 };
 pub use execution::{
     CapturedStream, Execution, ExecutionCompletionError, ExecutionOutput, ExecutionResult,
-    ExecutionState,
+    ExecutionState, LimitBreach, MEMORY_LIMIT_MARGIN_PERCENT, memory_limit_bytes,
 };
 pub use id::{ExecutionId, JobId, MessageId, NodeId};
 pub use job::{Job, JobSpec, JobSpecValidationError, JobState, PlacementConstraints, RetryPolicy};

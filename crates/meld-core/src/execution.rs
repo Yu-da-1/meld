@@ -169,6 +169,51 @@ impl ExecutionState {
     }
 }
 
+/// Extra memory a process may use over what its job reserved, in percent.
+///
+/// A little slack, so that a job that keeps to what it said is not stopped
+/// for the process's own overhead.
+pub const MEMORY_LIMIT_MARGIN_PERCENT: u64 = 10;
+
+/// The most memory a job that reserved `reserved_bytes` may use.
+pub fn memory_limit_bytes(reserved_bytes: u64) -> u64 {
+    let margin = u128::from(reserved_bytes) * u128::from(MEMORY_LIMIT_MARGIN_PERCENT) / 100;
+    // The margin is a tenth of a u64, so it always fits.
+    reserved_bytes.saturating_add(u64::try_from(margin).unwrap_or(u64::MAX))
+}
+
+/// Why a node stopped an execution that was still running.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum LimitBreach {
+    /// The process and its children together used more memory than reserved.
+    Memory {
+        /// What the job asked for.
+        reserved_bytes: u64,
+        /// What the node allowed: the reservation and a small margin.
+        limit_bytes: u64,
+        /// What the processes held when they were stopped.
+        used_bytes: u64,
+    },
+}
+
+impl fmt::Display for LimitBreach {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Memory {
+                reserved_bytes,
+                limit_bytes,
+                used_bytes,
+            } => write!(
+                formatter,
+                "memory limit exceeded: used {used_bytes} bytes, over the limit of \
+                 {limit_bytes} bytes ({reserved_bytes} reserved, plus {MEMORY_LIMIT_MARGIN_PERCENT}%); \
+                 run it again with a larger --memory"
+            ),
+        }
+    }
+}
+
 /// Process result reported by a node.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ExecutionResult {
@@ -214,6 +259,35 @@ impl fmt::Display for ExecutionCompletionError {
 }
 
 impl Error for ExecutionCompletionError {}
+
+#[cfg(test)]
+mod limit_tests {
+    use super::*;
+
+    #[test]
+    fn the_limit_is_the_reservation_and_a_tenth_more() {
+        assert_eq!(memory_limit_bytes(1_000), 1_100);
+        assert_eq!(memory_limit_bytes(256 * 1024 * 1024), 295_279_001);
+        // Small reservations still get their share, rounded down.
+        assert_eq!(memory_limit_bytes(19), 20);
+        assert_eq!(memory_limit_bytes(0), 0);
+        assert_eq!(memory_limit_bytes(u64::MAX), u64::MAX);
+    }
+
+    #[test]
+    fn the_breach_tells_what_happened_and_what_to_do() {
+        let text = LimitBreach::Memory {
+            reserved_bytes: 1_000,
+            limit_bytes: 1_100,
+            used_bytes: 5_000,
+        }
+        .to_string();
+
+        assert!(text.contains("used 5000 bytes"), "{text}");
+        assert!(text.contains("limit of 1100"), "{text}");
+        assert!(text.contains("--memory"), "{text}");
+    }
+}
 
 #[cfg(test)]
 mod tests {

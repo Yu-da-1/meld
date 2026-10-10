@@ -2,6 +2,7 @@ mod collection;
 mod controller_client;
 mod executor;
 mod identity;
+mod limits;
 mod resource_reporter;
 mod staging;
 
@@ -30,6 +31,7 @@ use crate::{
     controller_client::{ControllerClient, ControllerClientError},
     executor::{CompletedExecution, ControlledExecutionOutcome, NativeExecutor, Workspace},
     identity::{load_or_create_node_id, load_or_create_node_secret, state_directory},
+    limits::{MEMORY_CHECK_INTERVAL, MemoryWatch},
     resource_reporter::ResourceReporter,
     staging::{DEFAULT_CACHE_MAX_BYTES, InputCache, stage_inputs},
 };
@@ -447,7 +449,15 @@ async fn run_assignment(
         tracing::error!(%node_id, %execution_id, %error, "failed to report running execution");
     }
 
-    let (outcome, workspace) = match execution.wait_controlled(cancellation, timeout).await {
+    // A job may use what it reserved, and a little more.
+    let memory = MemoryWatch::for_reservation(
+        assignment.spec.requirements.memory_bytes,
+        MEMORY_CHECK_INTERVAL,
+    );
+    let (outcome, workspace) = match execution
+        .wait_controlled(cancellation, timeout, Some(memory))
+        .await
+    {
         Ok((outcome, workspace)) => (outcome, Some(workspace)),
         Err(error) => {
             tracing::error!(%node_id, %execution_id, %error, "failed to wait for execution process");
@@ -469,6 +479,10 @@ async fn run_assignment(
         }
         ControlledExecutionOutcome::TimedOut { output } => {
             (ExecutionEvent::TimedOut { output }, None)
+        }
+        ControlledExecutionOutcome::LimitExceeded { output, breach } => {
+            tracing::warn!(%node_id, %execution_id, %breach, "execution stopped");
+            (ExecutionEvent::LimitExceeded { breach, output }, None)
         }
     };
     // Whatever the process left behind has been collected or is not wanted.

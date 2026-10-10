@@ -8,7 +8,7 @@ Meld は、自宅や小規模な環境にある複数のコンピューターを
 
 ## 現在の状態
 
-Phase 0からPhase 6までが完了し、Phase 7(セキュリティと実行隔離)を進めています。認証(7a)、nodeの承認(7b-1)、node専用の秘密(7b-2a)、通信の暗号化(7c)まで実装済みです。
+Phase 0からPhase 6までが完了し、Phase 7(セキュリティと実行隔離)を進めています。認証(7a)、nodeの承認(7b-1)、node専用の秘密(7b-2a)、通信の暗号化(7c)、jobのメモリ制限(7d)まで実装済みです。
 
 - `meld-controller`、`meld-node`、`meld-core`、`meld-cli`、`meld-tls` の5 crateでvirtual workspaceを構成しています。
 - 共有domain model、job / execution状態遷移、in-memory Node RegistryとJob Manager、least-loaded Schedulerを実装済みです。
@@ -41,6 +41,8 @@ meld cancel <job-id>
 meld approve <node-id>
 meld revoke <node-id>
 ```
+
+`--memory`で指定した量は、nodeに予約され、jobが使ってよい量にもなります。超えて使うと(予約の110%まで余裕があります)、そのjobだけが止められて失敗し、`meld status`に理由が出ます。指定しないと既定の256MiBです。
 
 `--input`にディレクトリを渡すと、中のファイルをすべて、そのディレクトリ名の下へ送ります。`SRC=DEST`で配置先を指定できます。`jobs`のような一覧表示は、まだありません。
 

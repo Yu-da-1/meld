@@ -547,6 +547,19 @@ async fn report_execution_event(
             ExecutionEvent::TimedOut { output } => {
                 jobs.mark_execution_timed_out(request.execution_id, output)
             }
+            // The job's own timeout was already asking for it to end.
+            ExecutionEvent::LimitExceeded { output, .. } if job_timeout_requested => {
+                jobs.confirm_job_timeout_with_output(request.execution_id, output)
+            }
+            ExecutionEvent::LimitExceeded { breach, output } => {
+                tracing::warn!(
+                    node_id = %request.node_id,
+                    execution_id = %request.execution_id,
+                    %breach,
+                    "execution was stopped for exceeding its reservation"
+                );
+                jobs.fail_execution_limit(request.execution_id, breach, output)
+            }
         };
 
     if let Err(error) = transition {
@@ -931,6 +944,7 @@ async fn job_status(State(state): State<ControllerState>, Path(job_id): Path<Job
         .collect();
     let latest_execution_id = execution.map(|view| view.execution_id);
     let data_failure = latest_execution_id.and_then(|id| jobs.data_failure(id).cloned());
+    let limit_breach = latest_execution_id.and_then(|id| jobs.limit_breach(id).copied());
     let outputs = latest_execution_id
         .map(|id| jobs.output_files(id).to_vec())
         .unwrap_or_default();
@@ -993,6 +1007,7 @@ async fn job_status(State(state): State<ControllerState>, Path(job_id): Path<Job
         execution,
         attempts,
         data_failure,
+        limit_breach,
         outputs,
         placement,
     })
@@ -3749,6 +3764,152 @@ mod tests {
 
             let third = state_over(&directory);
             assert_eq!(get_job_status(third, job_id).await.state, JobState::Running);
+        }
+    }
+
+    mod limits {
+        use meld_core::{ExecutionOutput, LimitBreach, RetryPolicy};
+        use tempfile::TempDir;
+
+        use super::*;
+
+        fn breach() -> LimitBreach {
+            LimitBreach::Memory {
+                reserved_bytes: 8_000,
+                limit_bytes: 8_800,
+                used_bytes: 20_000,
+            }
+        }
+
+        fn output() -> ExecutionOutput {
+            ExecutionOutput {
+                stdout: meld_core::CapturedStream {
+                    content: "partial".to_owned(),
+                    truncated: false,
+                    lossy: false,
+                },
+                stderr: meld_core::CapturedStream::default(),
+            }
+        }
+
+        async fn run(
+            state: &ControllerState,
+            node_id: NodeId,
+            execution_id: meld_core::ExecutionId,
+        ) {
+            for event in [ExecutionEvent::Accepted, ExecutionEvent::Running] {
+                assert_eq!(
+                    report_event(state.clone(), node_id, execution_id, event).await,
+                    StatusCode::OK
+                );
+            }
+        }
+
+        fn stopped() -> ExecutionEvent {
+            ExecutionEvent::LimitExceeded {
+                breach: breach(),
+                output: output(),
+            }
+        }
+
+        #[tokio::test]
+        async fn an_execution_stopped_for_its_memory_fails_the_job_and_says_why() {
+            let state = ControllerState::new();
+            let node_id = NodeId::generate();
+            let (job_id, execution_id) = assigned_execution(&state, node_id);
+            run(&state, node_id, execution_id).await;
+
+            let status = report_event(state.clone(), node_id, execution_id, stopped()).await;
+
+            assert_eq!(status, StatusCode::OK);
+            let job = get_job_status(state.clone(), job_id).await;
+            assert_eq!(job.state, JobState::Failed);
+            assert_eq!(job.limit_breach, Some(breach()));
+            let execution = job.execution.expect("the execution is shown");
+            assert_eq!(execution.state, ExecutionState::Failed);
+            assert_eq!(
+                execution.result,
+                Some(meld_core::ExecutionResult { exit_code: None })
+            );
+            // What it printed before it was stopped is not lost.
+            let jobs = state.jobs.read().expect("job manager lock");
+            assert_eq!(jobs.execution_output(execution_id), Some(&output()));
+        }
+
+        #[tokio::test]
+        async fn the_same_report_twice_changes_nothing() {
+            let state = ControllerState::new();
+            let node_id = NodeId::generate();
+            let (job_id, execution_id) = assigned_execution(&state, node_id);
+            run(&state, node_id, execution_id).await;
+
+            for _ in 0..2 {
+                assert_eq!(
+                    report_event(state.clone(), node_id, execution_id, stopped()).await,
+                    StatusCode::OK
+                );
+            }
+
+            let job = get_job_status(state, job_id).await;
+            assert_eq!(job.state, JobState::Failed);
+            assert_eq!(job.attempts.len(), 1);
+        }
+
+        #[tokio::test]
+        async fn a_stopped_job_is_not_run_again_even_if_it_may_be_retried() {
+            let state = ControllerState::new();
+            let node_id = NodeId::generate();
+            register_ready_node(&state, node_id);
+            let mut spec = job_spec();
+            spec.requirements.memory_bytes = 8_000;
+            spec.retry = RetryPolicy {
+                max_attempts: 3,
+                idempotent: true,
+            };
+            let execution_id;
+            let job_id;
+            {
+                let registry = state.registry.read().expect("registry lock");
+                let mut jobs = state.jobs.write().expect("job manager lock");
+                job_id = jobs.submit(spec).expect("valid job should be queued");
+                execution_id = jobs
+                    .schedule_next(&Scheduler::new(), &registry)
+                    .expect("queued job should be schedulable")
+                    .expect("one job should be queued");
+            }
+            run(&state, node_id, execution_id).await;
+
+            report_event(state.clone(), node_id, execution_id, stopped()).await;
+
+            // The same job would be stopped for the same reason.
+            let job = get_job_status(state, job_id).await;
+            assert_eq!(job.state, JobState::Failed);
+            assert_eq!(job.retry, None);
+            assert_eq!(job.attempts.len(), 1);
+        }
+
+        #[tokio::test]
+        async fn the_reason_survives_a_controller_restart() {
+            let directory = TempDir::new().expect("temp dir");
+            let open = |directory: &TempDir| {
+                let store = StateStore::open(&directory.path().join("state.db"))
+                    .expect("state database should open");
+                ControllerState::new()
+                    .with_store(Arc::new(store))
+                    .expect("stored state should restore")
+            };
+            let node_id = NodeId::generate();
+            let before = open(&directory);
+            let (job_id, execution_id) = assigned_execution(&before, node_id);
+            run(&before, node_id, execution_id).await;
+            report_event(before.clone(), node_id, execution_id, stopped()).await;
+            drop(before);
+
+            let after = open(&directory);
+
+            let job = get_job_status(after, job_id).await;
+            assert_eq!(job.state, JobState::Failed);
+            assert_eq!(job.limit_breach, Some(breach()));
         }
     }
 

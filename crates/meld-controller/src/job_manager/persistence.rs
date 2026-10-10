@@ -61,6 +61,7 @@ impl JobManager {
 
         load_by_id(store, Kind::Output, &mut manager.outputs)?;
         load_by_id(store, Kind::DataFailure, &mut manager.data_failures)?;
+        load_by_id(store, Kind::LimitBreach, &mut manager.limit_breaches)?;
         load_by_id(store, Kind::OutputFiles, &mut manager.output_files)?;
         load_by_id(store, Kind::Placement, &mut manager.placements)?;
         load_instants(
@@ -132,6 +133,7 @@ impl JobManager {
             || self.executions.dirty().next().is_some()
             || self.outputs.dirty().next().is_some()
             || self.data_failures.dirty().next().is_some()
+            || self.limit_breaches.dirty().next().is_some()
             || self.output_files.dirty().next().is_some()
             || self.outputs_recorded_at.dirty().next().is_some()
             || self.cancellation_requests.dirty().next().is_some()
@@ -168,6 +170,12 @@ impl JobManager {
             encode(value)
         });
         collect(&mut changes, Kind::DataFailure, &self.data_failures, encode);
+        collect(
+            &mut changes,
+            Kind::LimitBreach,
+            &self.limit_breaches,
+            encode,
+        );
         collect(&mut changes, Kind::OutputFiles, &self.output_files, encode);
         collect(&mut changes, Kind::Placement, &self.placements, |value| {
             encode(value)
@@ -217,6 +225,7 @@ impl JobManager {
         self.executions.clear_dirty();
         self.outputs.clear_dirty();
         self.data_failures.clear_dirty();
+        self.limit_breaches.clear_dirty();
         self.output_files.clear_dirty();
         self.placements.clear_dirty();
         self.auto_retries.clear_dirty();

@@ -48,7 +48,8 @@ struct RunArgs {
     #[arg(long, default_value_t = 1, value_parser = clap::value_parser!(u32).range(1..))]
     cpu: u32,
 
-    /// Minimum memory required (for example: 512MiB or 8GB).
+    /// Memory the job may use (for example: 512MiB or 8GB). It is reserved on
+    /// the node, and the job is stopped if it uses more than this, plus 10%.
     #[arg(long, default_value = DEFAULT_MEMORY, value_parser = parse_memory)]
     memory: u64,
 
@@ -344,6 +345,9 @@ async fn show_status(client: &ControllerClient, job_id: JobId) -> Result<(), Box
     }
     if let Some(failure) = &response.data_failure {
         println!("data_failure: {failure}");
+    }
+    if let Some(breach) = &response.limit_breach {
+        println!("limit: {breach}");
     }
     let constraints = &response.spec.constraints;
     if let Some(operating_system) = &constraints.operating_system {

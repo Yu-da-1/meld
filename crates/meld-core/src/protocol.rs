@@ -3,12 +3,12 @@
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    DataFailure, ExecutionId, ExecutionOutput, ExecutionResult, JobId, JobSpec, MessageId,
-    NodeDescriptor, NodeId, OutputFile, ResourceSnapshot, Sha256Digest,
+    DataFailure, ExecutionId, ExecutionOutput, ExecutionResult, JobId, JobSpec, LimitBreach,
+    MessageId, NodeDescriptor, NodeId, OutputFile, ResourceSnapshot, Sha256Digest,
 };
 
 /// Protocol version implemented by this build.
-pub const CURRENT_PROTOCOL_VERSION: ProtocolVersion = ProtocolVersion::new(8);
+pub const CURRENT_PROTOCOL_VERSION: ProtocolVersion = ProtocolVersion::new(9);
 
 /// Version of the controller-node message contract.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -205,6 +205,11 @@ pub enum ExecutionEvent {
         output: ExecutionOutput,
     },
     TimedOut {
+        output: ExecutionOutput,
+    },
+    /// The node stopped the process for using more than the job reserved.
+    LimitExceeded {
+        breach: LimitBreach,
         output: ExecutionOutput,
     },
 }

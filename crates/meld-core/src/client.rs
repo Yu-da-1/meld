@@ -4,7 +4,8 @@ use serde::{Deserialize, Serialize};
 
 use crate::{
     DataFailure, ExecutionId, ExecutionOutput, ExecutionResult, ExecutionState, JobId, JobSpec,
-    JobState, NodeDescriptor, NodeId, NodeState, OutputFile, ResourceSnapshot, Sha256Digest,
+    JobState, LimitBreach, NodeDescriptor, NodeId, NodeState, OutputFile, ResourceSnapshot,
+    Sha256Digest,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -113,6 +114,9 @@ pub struct JobStatusResponse {
     /// Why the latest execution failed to move the job's data, if it did.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub data_failure: Option<DataFailure>,
+    /// Why the node stopped the latest execution, if it did.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub limit_breach: Option<LimitBreach>,
     /// Files the latest execution left for collection.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub outputs: Vec<OutputFile>,
