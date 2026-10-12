@@ -65,8 +65,10 @@ Be clear about these before relying on it:
 - **Moves data through one place.** Every file goes through the controller. There is
   no awareness of where data already lives.
 
-Tested on one machine with separate processes standing in for a cluster. Real
-multi-machine and Windows runs have not been verified yet.
+**What has been tested:** automated end-to-end tests that start a real controller,
+nodes and client on one machine, and a manual run with the controller on macOS and a
+node on Linux (WSL) over a real LAN. **Not yet verified:** native Windows, more than
+one node placed across machines, and long-running use.
 
 ## Quick start
 
