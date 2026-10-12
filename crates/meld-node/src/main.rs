@@ -78,6 +78,16 @@ async fn main() -> Result<(), Box<dyn Error>> {
     )?;
     let state_directory = state_directory()?;
     let executor = NativeExecutor::new(&state_directory);
+    match executor.remove_stale_workspaces() {
+        Ok(0) => {}
+        Ok(removed) => {
+            tracing::info!(removed, "removed workspaces left by an earlier run");
+        }
+        Err(error) => {
+            // Not worth refusing to start for: it only leaves files behind.
+            tracing::warn!(%error, "could not look for workspaces left by an earlier run");
+        }
+    }
     let cache = InputCache::new(&state_directory, cache_max_bytes_from_env()?)?;
 
     if let Err(error) = run_node(

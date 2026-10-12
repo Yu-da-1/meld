@@ -8,7 +8,7 @@ use std::{
 };
 
 use directories::BaseDirs;
-use meld_core::{NodeId, NodeSecret};
+use meld_core::{NodeId, NodeSecret, create_private_directory};
 
 const STATE_DIR_ENV: &str = "MELD_STATE_DIR";
 const NODE_ID_FILE: &str = "node-id";
@@ -51,7 +51,7 @@ pub(crate) fn state_directory() -> io::Result<PathBuf> {
 }
 
 fn load_or_create_at(state_directory: &Path) -> io::Result<NodeId> {
-    fs::create_dir_all(state_directory)
+    create_private_directory(state_directory)
         .map_err(|error| with_path("create state directory", state_directory, error))?;
 
     let lock_path = state_directory.join(IDENTITY_LOCK_FILE);
@@ -75,7 +75,7 @@ fn load_or_create_at(state_directory: &Path) -> io::Result<NodeId> {
 }
 
 fn load_or_create_secret_at(state_directory: &Path) -> io::Result<NodeSecret> {
-    fs::create_dir_all(state_directory)
+    create_private_directory(state_directory)
         .map_err(|error| with_path("create state directory", state_directory, error))?;
 
     // The same lock as the identity, so two processes do not both make one.

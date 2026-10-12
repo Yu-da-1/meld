@@ -8,7 +8,7 @@ Meld は、自宅や小規模な環境にある複数のコンピューターを
 
 ## 現在の状態
 
-Phase 0からPhase 6までが完了し、Phase 7(セキュリティと実行隔離)を進めています。認証(7a)、nodeの承認(7b-1)、node専用の秘密(7b-2a)、通信の暗号化(7c)、jobのメモリ制限(7d)まで実装済みです。
+Phase 0からPhase 7までが完了しています。認証(7a)、nodeの承認(7b-1)、node専用の秘密(7b-2a)、通信の暗号化(7c)、jobのメモリ制限(7d)、残るデータと権限の整理(7e)まで実装済みで、Phase 7は完了しています。
 
 - `meld-controller`、`meld-node`、`meld-core`、`meld-cli`、`meld-tls` の5 crateでvirtual workspaceを構成しています。
 - 共有domain model、job / execution状態遷移、in-memory Node RegistryとJob Manager、least-loaded Schedulerを実装済みです。
@@ -91,6 +91,13 @@ export MELD_CONTROLLER_FINGERPRINT=<64桁>
 - `tls-cert.pem`と`tls-key.pem`を自分で置くと、それを使います。
 - 証明書を作り直す(`tls-*`を消す)と、フィンガープリントが変わります。すべての`meld`とnodeの設定を替えてください。
 - トークンがあるのにloopback以外へ`http://`で接続すると、警告します。トークンは平文で流れます。
+
+### 運用上の注意
+
+- jobは、nodeを動かしているユーザーの権限で動き、jobどうしを隔離しません。信頼できるjobだけを動かしてください。
+- jobの仕様(コマンドと引数)、入力ファイル、出力ファイルは、暗号化されずに保管され、clientのトークンを持つ人が読めます。パスワードやAPIキーを渡さないでください。
+- controllerとnodeは、専用の一般ユーザーで動かしてください。state dirは、新しく作るときに所有者だけが読める権限になります。
+- jobが残すものと、いつ消えるかは、[Roadmap](docs/roadmap.md)のPhase 7(7e)にまとめています。
 
 将来的には、利用者が物理的な実行先を毎回指定せず、データの所在も考慮して実行先が決まる状態を目指します。
 

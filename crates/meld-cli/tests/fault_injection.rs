@@ -310,3 +310,64 @@ fn post_event(url: &str, node_id: NodeId, execution_id: ExecutionId, event: Exec
         .and_then(|code| code.parse().ok())
         .unwrap_or_else(|| panic!("no status in response: {response}"))
 }
+
+#[test]
+fn a_node_that_was_killed_clears_the_workspace_it_left_behind_when_it_starts_again() {
+    let mut cluster = Cluster::start_with(FAST_FAILURE_DETECTION);
+    let node = cluster.add_node();
+    let executions = cluster.node_directory(node).join("executions");
+    let job = cluster.run_script(&[], "echo private > secret.txt; sleep 30");
+    wait_running(&cluster, &job);
+    let left = |directory: &std::path::Path| {
+        std::fs::read_dir(directory)
+            .map(|entries| entries.count())
+            .unwrap_or(0)
+    };
+    assert_eq!(left(&executions), 1, "a running job has a workspace");
+
+    // Killed, not stopped: nothing in the node gets to clean up.
+    cluster.kill_node(node);
+    assert_eq!(left(&executions), 1, "the workspace outlives the node");
+
+    cluster.start_node(node);
+    let deadline = std::time::Instant::now() + WAIT_LIMIT;
+    while left(&executions) != 0 {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the stale workspace was never removed:\n{}",
+            cluster.logs()
+        );
+        sleep(Duration::from_millis(100));
+    }
+}
+
+#[test]
+fn what_the_controller_and_a_node_keep_is_readable_by_their_owner_only() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let mut cluster = Cluster::start();
+    let node = cluster.add_node();
+    let job = cluster.run_script(&[], "echo hi");
+    cluster.wait_finished(&job);
+    let mode = |path: &std::path::Path| {
+        std::fs::metadata(path)
+            .unwrap_or_else(|error| panic!("{}: {error}", path.display()))
+            .permissions()
+            .mode()
+            & 0o777
+    };
+
+    for directory in [
+        cluster.directory().join("controller"),
+        cluster.node_directory(node),
+        cluster.node_directory(node).join("executions"),
+    ] {
+        assert_eq!(
+            mode(&directory) & 0o077,
+            0,
+            "{} is open to others ({:o})",
+            directory.display(),
+            mode(&directory)
+        );
+    }
+}

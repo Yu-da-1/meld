@@ -7,6 +7,7 @@ mod execution;
 mod id;
 mod job;
 mod node;
+mod private_dir;
 mod protocol;
 mod resource;
 mod transition;
@@ -32,6 +33,7 @@ pub use execution::{
 pub use id::{ExecutionId, JobId, MessageId, NodeId};
 pub use job::{Job, JobSpec, JobSpecValidationError, JobState, PlacementConstraints, RetryPolicy};
 pub use node::{Admission, NodeDescriptor, NodeState};
+pub use private_dir::create_private_directory;
 pub use protocol::{
     Acknowledgement, CURRENT_PROTOCOL_VERSION, ExecutionAssignment, ExecutionEvent,
     HeartbeatRequest, NodeCommand, PollNodeCommandRequest, PollNodeCommandResponse, ProtocolError,

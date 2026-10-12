@@ -11,6 +11,7 @@ use std::{
 
 use meld_core::{
     CapturedStream, ExecutionAssignment, ExecutionOutput, ExecutionResult, LimitBreach,
+    create_private_directory,
 };
 use tokio::{
     io::{AsyncRead, AsyncReadExt},
@@ -36,9 +37,43 @@ impl NativeExecutor {
         }
     }
 
+    /// Removes the workspaces an earlier run of this node left behind, and
+    /// returns how many there were.
+    ///
+    /// A workspace is removed when its execution ends, but not when the node
+    /// is killed or loses power while it runs. Nothing in this process can
+    /// own one yet, and the controller already regards those executions as
+    /// lost, so they are of no use to anyone and may hold large or private
+    /// files. A process of such an execution that is still running is not
+    /// found or stopped by this.
+    pub fn remove_stale_workspaces(&self) -> io::Result<usize> {
+        let entries = match fs::read_dir(&self.executions_directory) {
+            Ok(entries) => entries,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(0),
+            Err(error) => return Err(error),
+        };
+        let mut removed = 0;
+        for entry in entries {
+            let path = entry?.path();
+            // `symlink_metadata`, so a link is removed and never followed.
+            let result = if fs::symlink_metadata(&path)?.is_dir() {
+                fs::remove_dir_all(&path)
+            } else {
+                fs::remove_file(&path)
+            };
+            match result {
+                Ok(()) => removed += 1,
+                Err(error) => {
+                    tracing::warn!(path = %path.display(), %error, "failed to remove a stale workspace");
+                }
+            }
+        }
+        Ok(removed)
+    }
+
     /// Creates the empty directory the process will run in.
     pub fn prepare(&self, assignment: &ExecutionAssignment) -> io::Result<Workspace> {
-        fs::create_dir_all(&self.executions_directory)?;
+        create_private_directory(&self.executions_directory)?;
         let path = self
             .executions_directory
             .join(assignment.execution_id.to_string());
@@ -646,6 +681,77 @@ mod tests {
         tokio::time::sleep(Duration::from_millis(500)).await;
         let later = fs::metadata(&marker).map(|meta| meta.len()).unwrap_or(0);
         assert_eq!(size, later, "the process group kept running");
+    }
+
+    #[test]
+    fn workspaces_left_by_an_earlier_run_are_removed_and_nothing_else() {
+        let state_directory = tempdir().expect("temporary state directory should be created");
+        let executor = NativeExecutor::new(state_directory.path());
+        let executions = state_directory.path().join("executions");
+        for name in ["one", "two"] {
+            fs::create_dir_all(executions.join(name).join("deep")).expect("stale workspace");
+            fs::write(executions.join(name).join("deep/file"), b"left behind").expect("file");
+        }
+        fs::write(executions.join("stray-file"), b"x").expect("stray file");
+        // Something that is not the node's to remove stays where it is.
+        let elsewhere = state_directory.path().join("cache");
+        fs::create_dir_all(&elsewhere).expect("cache directory");
+        fs::write(elsewhere.join("kept"), b"x").expect("kept file");
+
+        let removed = executor
+            .remove_stale_workspaces()
+            .expect("stale workspaces are removed");
+
+        assert_eq!(removed, 3);
+        assert_eq!(fs::read_dir(&executions).unwrap().count(), 0);
+        assert!(elsewhere.join("kept").exists());
+    }
+
+    #[test]
+    fn there_is_nothing_to_remove_before_the_first_execution() {
+        let state_directory = tempdir().expect("temporary state directory should be created");
+        let executor = NativeExecutor::new(state_directory.path());
+
+        assert_eq!(executor.remove_stale_workspaces().expect("no directory"), 0);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_link_in_the_executions_directory_is_removed_not_followed() {
+        let state_directory = tempdir().expect("temporary state directory should be created");
+        let executor = NativeExecutor::new(state_directory.path());
+        let executions = state_directory.path().join("executions");
+        fs::create_dir_all(&executions).expect("executions directory");
+        let precious = state_directory.path().join("precious");
+        fs::create_dir(&precious).expect("precious directory");
+        fs::write(precious.join("file"), b"keep me").expect("precious file");
+        std::os::unix::fs::symlink(&precious, executions.join("link")).expect("symlink");
+
+        executor.remove_stale_workspaces().expect("cleanup");
+
+        assert!(!executions.join("link").exists());
+        assert_eq!(fs::read(precious.join("file")).unwrap(), b"keep me");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn the_directory_workspaces_live_in_is_private() {
+        use std::os::unix::fs::PermissionsExt;
+        let state_directory = tempdir().expect("temporary state directory should be created");
+        let executor = NativeExecutor::new(state_directory.path());
+
+        let workspace = executor
+            .prepare(&assignment("true", vec![]))
+            .expect("workspace");
+
+        // Nobody else can enter it, so what jobs leave in their workspaces
+        // cannot be read by other users of the machine.
+        let mode = fs::metadata(state_directory.path().join("executions"))
+            .unwrap()
+            .permissions()
+            .mode();
+        assert_eq!(mode & 0o077, 0);
+        assert!(workspace.path().is_dir());
     }
 
     fn assignment(program: &str, args: Vec<&str>) -> ExecutionAssignment {

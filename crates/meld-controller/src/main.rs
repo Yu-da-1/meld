@@ -19,7 +19,7 @@ use meld_controller::{
     store::StateStore,
     tls::TlsListener,
 };
-use meld_core::{CLIENT_TOKEN_ENV, NODE_TOKEN_ENV, SecretToken};
+use meld_core::{CLIENT_TOKEN_ENV, NODE_TOKEN_ENV, SecretToken, create_private_directory};
 use meld_tls::ServerIdentity;
 use tokio::net::TcpListener;
 use tokio::time::{MissedTickBehavior, interval};
@@ -58,6 +58,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
     )?);
     let blob_limits = blob_limits_from_env()?;
     let state_directory = state_directory()?;
+    create_private_directory(&state_directory)?;
     let blobs = BlobStore::new(&state_directory, blob_limits)?;
     let output_retention = Duration::from_secs(positive_u64_from_env(
         OUTPUT_RETENTION_ENV,
