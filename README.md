@@ -1,173 +1,207 @@
 # Meld
 
-> Turn your computers into one logical compute environment.
+**Run commands on the other computers in your home or lab, and get the results back.**
 
-Meld は、自宅や小規模な環境にある複数のコンピューターをまとめ、利用者からはひとつの論理的な計算環境として扱えるようにする分散コンピューティング基盤です。
+[日本語](README.ja.md)
 
-最初の目標は「複数台の資源を完全に透過的な1台のOSとして見せること」ではありません。まずは、参加ノードを把握し、利用可能な資源に応じて実行先を選び、ジョブを安全に実行して結果を確認できる、小さく理解可能なシステムを作ります。その土台を固めた後に、データ配置、キャッシュ、障害復旧などを段階的に追加します。
+Meld joins a handful of computers on a trusted network into one place to run jobs.
+You describe a command and what it needs; Meld picks a machine with room for it,
+runs it there, and gives you the output, the exit code and any files it made.
 
-## 現在の状態
-
-Phase 0からPhase 7までが完了しています。認証(7a)、nodeの承認(7b-1)、node専用の秘密(7b-2a)、通信の暗号化(7c)、jobのメモリ制限(7d)、残るデータと権限の整理(7e)まで実装済みで、Phase 7は完了しています。
-
-- `meld-controller`、`meld-node`、`meld-core`、`meld-cli`、`meld-tls` の5 crateでvirtual workspaceを構成しています。
-- 共有domain model、job / execution状態遷移、in-memory Node RegistryとJob Manager、least-loaded Schedulerを実装済みです。
-- nodeはHTTP/JSONでcontrollerへ登録し、永続化したidentity、capacity、resource snapshot、heartbeatを報告します。
-- controllerはheartbeat timeoutによる`Unreachable`判定と、再接続・同一identityでの再登録を扱います。
-- `meld run / status / logs / cancel`でnative processのremote execution、log回収、cancel、timeoutを扱えます。
-- Phase 4のスケジューリングと資源会計として、次の機能が動作します。
-  - nodeごとの予約済みCPU・メモリを合計し、capacityを超える配置を防ぎます。1つのnodeで複数jobを同時に実行できます(`MELD_MAX_CONCURRENT_EXECUTIONS`、既定はCPU数)。
-  - `meld drain / resume`で新規配置を止めたり再開したりできます。実行中のjobは完走します。
-  - `meld run --os / --arch / --require`で実行先のOS、architecture、capability(`MELD_CAPABILITIES`)を指定できます。
-  - 複数のnodeが候補のとき、予約率が最も低いnodeを選びます。`meld status`にnodeごとの判定理由が表示されます。
-  - 原則FIFOです。制約を満たすnodeがない、または合計容量を超えるjobは、後続のjobを止めません。
-- Phase 5のデータ移動として、ファイルを渡して成果物を受け取れます。
-  - `meld run --input SRC[=DEST] --output PATH -- <command>`で、手元のファイルやディレクトリをjobの作業ディレクトリへ送り、jobが作ったファイルを宣言できます。`meld fetch <job-id>`で回収します。
-  - ファイルは内容のsha256で識別し、controllerが持たない内容だけを転送します。nodeはローカルcacheで再利用します。受信側は常にhashとサイズを検証します。
-  - 転送の失敗は、jobの失敗と理由(`meld status`の`data_failure`)として表示されます。
-- Phase 6の永続化と障害復旧として、controllerの状態はSQLiteに保存され、再起動後に復元されます。node消失は`Lost`として扱い、`meld retry`と、冪等と宣言したjobの自動retryがあります。
-- Phase 7の認証として、controllerはclient用とnode用の別々のトークンで呼び出し元を確認し、認証が有効なときは通信を暗号化します。
-
-## 使い方
+> **Status: experimental.** This is a research project, built in small, tested steps.
+> It is meant for a few machines on a network you trust, running code you trust.
+> It is **not** a way to run untrusted code. See [What it is not](#what-it-is-not).
+>
+> Not to be confused with the *Meld* diff and merge tool.
 
 ```text
-meld nodes
-meld run --cpu 4 --memory 8G -- cargo build --release
-meld run --input data.csv --input scripts --output out/result.json -- python3 scripts/analyze.py data.csv
+$ meld run --memory 512MiB -- python3 train.py
+job_id: 734a4410-a96d-4223-8366-a7ae1f1d3469
+state: queued
+
+$ meld status 734a4410-a96d-4223-8366-a7ae1f1d3469
+state: succeeded
+placement:
+  f031d52d-... (workstation): selected: lowest load (6.6% after placement)
+exit_code: 0
+```
+
+## What it does
+
+- **Runs a command on another machine.** `meld run -- <command>`, with `status`,
+  `logs` and `cancel`. Timeouts for a run and for the whole job.
+- **Chooses where.** It places each job on a node with enough free CPU and memory,
+  preferring the least loaded, and can be told to require an OS, an architecture or a
+  capability. `meld status` explains why a job went where it did, or why it waits.
+- **Moves files.** `--input` sends files or directories to the job, `--output` names
+  what it makes, and `meld fetch` brings them back. Content is identified by SHA-256,
+  checked on arrival, and sent only once.
+- **Keeps one job from hurting the others.** A job that uses more memory than it
+  reserved (plus 10%) is stopped on its own, with the reason shown.
+- **Survives failures.** The controller keeps its state across restarts. If a node
+  disappears, its jobs become `lost`, and a job you marked safe to repeat
+  (`--max-attempts N --idempotent`) runs again elsewhere.
+- **Controls who joins.** Clients and nodes authenticate with separate tokens. A new
+  node waits until you `meld approve` it, and cannot pose as another node. Connections
+  are encrypted and the controller is verified by its certificate fingerprint.
+
+## What it is not
+
+Be clear about these before relying on it:
+
+- **Not a sandbox.** A job runs as the user that runs the node, with that user's
+  access. Jobs are not isolated from each other, and can read the node's own secret.
+  Only run code you would run on that machine yourself.
+- **Not a place for secrets.** Commands, arguments and files are stored unencrypted
+  on the controller and can be read by anyone holding the client token. There is no
+  way to pass a secret to a job.
+- **Not highly available.** There is one controller. If it is down, nothing new
+  starts; running jobs continue and are picked up again when it returns.
+- **Not for the internet.** It assumes a network you control. There is no NAT
+  traversal, no discovery and no multi-user permissions.
+- **Not a workflow engine.** Jobs are independent; there are no dependencies between
+  them.
+- **Limited resource control.** Memory is enforced; CPU, disk and network are not.
+- **Moves data through one place.** Every file goes through the controller. There is
+  no awareness of where data already lives.
+
+Tested on one machine with separate processes standing in for a cluster. Real
+multi-machine and Windows runs have not been verified yet.
+
+## Quick start
+
+You need [Rust](https://rustup.rs). The pinned toolchain is picked up automatically.
+
+```sh
+cargo build --release
+# binaries: target/release/{meld, meld-controller, meld-node}
+```
+
+**1. Choose two secrets** (at least 16 characters each, and different):
+
+```sh
+export MELD_CLIENT_TOKEN=$(openssl rand -hex 16)   # for `meld`
+export MELD_NODE_TOKEN=$(openssl rand -hex 16)     # for nodes joining
+```
+
+**2. Start the controller** on one machine:
+
+```sh
+MELD_CONTROLLER_ADDR=0.0.0.0:3000 meld-controller
+# INFO encrypted connections only; give clients and nodes
+#      MELD_CONTROLLER_FINGERPRINT=f6e74019...3b8c
+```
+
+With tokens set, the controller makes itself a certificate on first start and prints
+its fingerprint (also written to `tls-fingerprint` in its state directory). Clients
+and nodes trust only that certificate.
+
+**3. Start a node** on each machine that should run jobs (it can be the same machine):
+
+```sh
+export MELD_CONTROLLER_URL=https://controller.lan:3000
+export MELD_CONTROLLER_FINGERPRINT=f6e74019...3b8c
+export MELD_NODE_TOKEN=...            # same value as the controller's
+meld-node
+```
+
+**4. Use it** from anywhere that has the client token and the fingerprint:
+
+```sh
+export MELD_CONTROLLER_URL=https://controller.lan:3000
+export MELD_CONTROLLER_FINGERPRINT=f6e74019...3b8c
+export MELD_CLIENT_TOKEN=...
+
+meld nodes                     # the new node is "pending"
+meld approve <node-id>         # let it join; it becomes "ready"
+meld run -- sh -c 'echo hello from $(hostname)'
 meld status <job-id>
 meld logs <job-id>
+```
+
+**Send files and get results back:**
+
+```sh
+meld run --input data.txt --output result.txt -- sh -c 'tr a-z A-Z < data.txt > result.txt'
 meld fetch <job-id> --out-dir ./results
-meld cancel <job-id>
-meld approve <node-id>
-meld revoke <node-id>
 ```
 
-`--memory`で指定した量は、nodeに予約され、jobが使ってよい量にもなります。超えて使うと(予約の110%まで余裕があります)、そのjobだけが止められて失敗し、`meld status`に理由が出ます。指定しないと既定の256MiBです。
+Without tokens, the controller listens on `127.0.0.1` only, without encryption or
+approval: convenient for trying it out on one machine, nothing else.
 
-`--input`にディレクトリを渡すと、中のファイルをすべて、そのディレクトリ名の下へ送ります。`SRC=DEST`で配置先を指定できます。`jobs`のような一覧表示は、まだありません。
+## Commands
 
-### 設定
+| Command | What it does |
+|---|---|
+| `meld run [options] -- <command>` | Submit a job |
+| `meld status <job>` | State, placement, attempts, why it waits or failed |
+| `meld logs <job>` | Captured stdout and stderr |
+| `meld fetch <job> --out-dir DIR` | Download the files named with `--output` |
+| `meld cancel <job>` | Stop a job |
+| `meld retry <job>` | Run a failed, timed-out, cancelled or lost job again |
+| `meld nodes` | Nodes, their state, capacity and usage |
+| `meld approve <node>` / `meld revoke <node>` | Let a node join / remove it |
+| `meld drain <node>` / `meld resume <node>` | Stop / resume placing new jobs on a node |
 
-| 対象 | 環境変数 | 既定値 | 内容 |
+Useful `meld run` options: `--cpu`, `--memory` (default 256MiB, also the limit),
+`--timeout`, `--job-timeout`, `--os`, `--arch`, `--require`, `--input`, `--output`,
+`--max-attempts` with `--idempotent`. See `meld run --help`.
+
+## Configuration
+
+Everything is set with environment variables.
+
+| Variable | Used by | Default | Meaning |
 |---|---|---|---|
-| controller | `MELD_CONTROLLER_STATE_DIR` | OSのデータディレクトリ配下 | blobの保管先 |
-| controller | `MELD_MAX_BLOB_BYTES` | 1GiB | 1ファイルの上限 |
-| controller | `MELD_BLOB_QUOTA_BYTES` | 16GiB | 保管する内容の合計 |
-| controller | `MELD_OUTPUT_RETENTION_SECS` | 86400 | 完了したjobの出力を削除しない期間 |
-| node | `MELD_CACHE_MAX_BYTES` | 8GiB | 入力のcacheの上限 |
-| `meld`、node | `MELD_CONTROLLER_FINGERPRINT` | なし | 信頼するcontrollerの証明書のsha256(認証が有効なcontrollerへ接続するとき) |
-| controller | `MELD_CLIENT_TOKEN` | なし | `meld`が提示するトークン(controllerと`meld`の両方に設定) |
-| controller | `MELD_NODE_TOKEN` | なし | nodeが参加するときのトークン(controllerと各nodeに設定) |
+| `MELD_CLIENT_TOKEN` | controller, `meld` | none | Token `meld` presents |
+| `MELD_NODE_TOKEN` | controller, node | none | Token a node presents to join |
+| `MELD_CONTROLLER_URL` | `meld`, node | `http://127.0.0.1:3000` | Where the controller is |
+| `MELD_CONTROLLER_FINGERPRINT` | `meld`, node | none | SHA-256 of the controller's certificate to trust |
+| `MELD_CONTROLLER_ADDR` | controller | `127.0.0.1:3000` | Address to listen on |
+| `MELD_CONTROLLER_STATE_DIR` | controller | OS data dir | Database, files, certificate |
+| `MELD_STATE_DIR` | node | OS data dir | Identity, secret, cache, workspaces |
+| `MELD_HEARTBEAT_INTERVAL_SECS` | node | 5 | How often a node reports in |
+| `MELD_HEARTBEAT_TIMEOUT_SECS` | controller | 15 | Silence before a node is unreachable |
+| `MELD_LOST_GRACE_SECS` | controller | 30 | Further wait before its jobs are given up on |
+| `MELD_MAX_CONCURRENT_EXECUTIONS` | node | CPU count | Jobs a node runs at once |
+| `MELD_CAPABILITIES` | node | none | Labels jobs can require (comma separated) |
+| `MELD_CACHE_MAX_BYTES` | node | 8 GiB | Input cache size, in bytes |
+| `MELD_MAX_BLOB_BYTES`, `MELD_BLOB_QUOTA_BYTES` | controller | 1 GiB, 16 GiB | Largest file; total stored, in bytes |
+| `MELD_OUTPUT_RETENTION_SECS` | controller | 86400 | Time outputs are kept for sure |
 
-### 認証
+Setting only one of the two tokens is an error, and so is giving both the same value.
+A controller that listens beyond the local machine refuses to start without tokens.
 
-トークンは16文字以上の、空白を含まない表示可能なASCII文字列です。`meld`は`MELD_CLIENT_TOKEN`、nodeは`MELD_NODE_TOKEN`を環境変数から読みます(コマンドラインに出さないため、引数では渡せません)。
-
-- 両方のトークンを設定すると、controllerは全APIで`Authorization: Bearer <token>`を要求します。片方だけの設定と、同じ値の設定は起動時に拒否します。
-- clientのトークンではjobの投入・照会・cancel・nodeの承認など、`meld`の操作ができます。`MELD_NODE_TOKEN`は、nodeが参加(登録)するためのトークンで、これでできるのは登録だけです。登録したnodeは、自分だけの秘密(state dirの`node-secret`)で、そのnodeとして動きます。他のnodeになりすますことはできません(403)。ファイルの転送だけは、clientと、承認済みのnodeに許可します。
-- `node-secret`は消さないでください。失うと、controllerに別の秘密として断られます。その場合は`meld revoke <node-id>`、`meld approve <node-id>`のあとでnodeを再起動します。
-- 未設定のままloopback以外のアドレス(`MELD_CONTROLLER_ADDR=0.0.0.0:3000`など)で待ち受けようとすると、controllerは起動を拒否します。loopbackでは警告を出して認証なしで動きます。
-- トークンの変更は、controllerとすべてのnode、`meld`の設定を揃えて再起動します。トークンが合わないnodeは終了します。
-- 認証が有効なとき、新しいnodeは承認待ち(`pending`)で参加します。`meld nodes`でIDを確かめ、`meld approve <node-id>`で承認します。承認するまで、nodeはjobを受け取りません。`meld revoke <node-id>`で参加を取り消すと、そのnodeは終了し、実行中だったjobは`lost`になります。認証が無効なとき(loopbackの開発用途)は、すべて自動で承認します。
-
-### 暗号化
-
-認証が有効なcontrollerは、TLSだけで待ち受けます。
-
-1. controllerを起動すると、初回に自己署名証明書を作り、フィンガープリントを表示します(`<state dir>/tls-fingerprint`にも書きます)。
-2. `meld`とnodeに、そのフィンガープリントと`https://`のURLを設定します。
+## How it works
 
 ```text
-# controller
-MELD_CLIENT_TOKEN=... MELD_NODE_TOKEN=... MELD_CONTROLLER_ADDR=0.0.0.0:3000 meld-controller
-#   encrypted connections only; give clients and nodes MELD_CONTROLLER_FINGERPRINT=<64桁>
-
-# meld と node
-export MELD_CONTROLLER_URL=https://controller.lan:3000
-export MELD_CONTROLLER_FINGERPRINT=<64桁>
+you ──meld──▶  controller  ◀── nodes poll for work ──  node ─▶ runs the process
+                (one)                                  node ─▶ runs the process
 ```
 
-- フィンガープリントが一致する証明書だけを信頼します。名前は見ないので、IPアドレスでも接続できます。
-- `tls-cert.pem`と`tls-key.pem`を自分で置くと、それを使います。
-- 証明書を作り直す(`tls-*`を消す)と、フィンガープリントが変わります。すべての`meld`とnodeの設定を替えてください。
-- トークンがあるのにloopback以外へ`http://`で接続すると、警告します。トークンは平文で流れます。
+- A **node** connects out to the controller, reports its capacity and usage, and asks
+  for work. The controller never connects to a node.
+- The **controller** keeps the record of jobs and nodes, decides placement, and stores
+  files.
+- A **job** has attempts. A retry is a new attempt of the same job, so history is kept.
 
-### 運用上の注意
+Design notes and the roadmap, including what was decided against and why, are in
+[`docs/`](docs/) (currently in Japanese).
 
-- jobは、nodeを動かしているユーザーの権限で動き、jobどうしを隔離しません。信頼できるjobだけを動かしてください。
-- jobの仕様(コマンドと引数)、入力ファイル、出力ファイルは、暗号化されずに保管され、clientのトークンを持つ人が読めます。パスワードやAPIキーを渡さないでください。
-- controllerとnodeは、専用の一般ユーザーで動かしてください。state dirは、新しく作るときに所有者だけが読める権限になります。
-- jobが残すものと、いつ消えるかは、[Roadmap](docs/roadmap.md)のPhase 7(7e)にまとめています。
+## Development
 
-将来的には、利用者が物理的な実行先を毎回指定せず、データの所在も考慮して実行先が決まる状態を目指します。
-
-Meld は各ノードの容量、現在の負荷、必要な機能を考慮して実行先を決定します。データの所在を考慮した配置は、今後のPhaseで扱います。
-
-## 構成
-
-```text
-User / CLI
-    |
-    v
-meld-controller        Control Plane
-    |                   node、resource、job、schedule を管理
-    |
-    +-------------------+-------------------+
-    |                   |                   |
-    v                   v                   v
-meld-node           meld-node           meld-node
-Executor            Executor            Executor
-    |                   |                   |
-    v                   v                   v
-Process             Process             Process
-
-meld-core
-    controller と node が共有する型、protocol、状態表現
+```sh
+cargo test --workspace        # unit and end-to-end tests; the latter start real processes
+cargo clippy --workspace --all-targets
 ```
 
-想定する Rust workspace は次のとおりです。
+The end-to-end tests start a real controller, nodes and `meld`, then kill, freeze and
+restart them. They run on Unix only and take a minute or two.
 
-```text
-meld/
-├── Cargo.toml
-├── README.md
-├── docs/
-│   ├── architecture.md
-│   └── roadmap.md
-└── crates/
-    ├── meld-controller/
-    ├── meld-node/
-    ├── meld-cli/
-    ├── meld-tls/      通信の暗号化と、証明書の固定
-    └── meld-core/
-```
-
-`meld-node` は各物理マシン上で常駐するプロセスです。AI agent との混同を避け、ジョブ実行だけでなく資源監視やローカルデータ管理まで担う「クラスタのノード」という役割を表すため、この名前を採用します。
-
-## 設計方針
-
-- 最小の end-to-end 経路を先に通し、分散システム固有の複雑さを一度に持ち込まない。
-- 論理的な状態と物理的な配置を分ける。
-- 実行先の決定は controller、実行そのものは node に分離する。
-- 最初は単一 controller、信頼されたLAN、native process実行を前提にする。
-- 障害を隠すのではなく、状態遷移として観測可能にする。
-- protocol と domain model を `meld-core` に集め、通信方式とは疎結合にする。
-
-詳細は以下を参照してください。
-
-- [Architecture](docs/architecture.md) — 目的、全体構成、責務、主要な処理フロー
-- [Roadmap](docs/roadmap.md) — 段階的な実装順序と各段階の完了条件
-
-## 当面の非目標
-
-初期段階では、次の機能を完成条件に含めません。
-
-- 分散共有メモリやプロセス移動
-- OS全体を透過的に統合する Single System Image
-- controller の冗長化と強い可用性保証
-- WAN越しのP2P discoveryやNAT traversal
-- 複数テナント、課金、厳密な権限制御
-- 汎用分散ストレージ
-- 高度なGPUスケジューリング
-
-これらを否定するのではなく、基礎となる実行・状態管理・障害検知が安定してから検討します。
+| Crate | Role |
+|---|---|
+| `meld-core` | Shared types, state transitions and the protocol |
+| `meld-controller` | The controller |
+| `meld-node` | The node |
+| `meld-cli` | The `meld` command |
+| `meld-tls` | Encrypted transport and certificate pinning |
