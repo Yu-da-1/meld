@@ -171,6 +171,7 @@ Everything is set with environment variables.
 | `MELD_CACHE_MAX_BYTES` | node | 8 GiB | Input cache size, in bytes |
 | `MELD_MAX_BLOB_BYTES`, `MELD_BLOB_QUOTA_BYTES` | controller | 1 GiB, 16 GiB | Largest file; total stored, in bytes |
 | `MELD_OUTPUT_RETENTION_SECS` | controller | 86400 | Time outputs are kept for sure |
+| `MELD_JOB_RETENTION_SECS` | controller | 86400 | Time a finished job's record is kept; `0` keeps it for good |
 
 Setting only one of the two tokens is an error, and so is giving both the same value.
 A controller that listens beyond the local machine refuses to start without tokens.

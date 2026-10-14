@@ -71,6 +71,9 @@ pub struct JobManager {
     cancellation_requests: Tracked<ExecutionId, ()>,
     job_timeout_requests: Tracked<ExecutionId, ()>,
     job_submitted_at: Tracked<JobId, Instant>,
+    /// When a job was first seen finished, to bound how long its record is
+    /// kept. Present only while the job stays finished.
+    job_finished_at: Tracked<JobId, Instant>,
     pending_jobs: VecDeque<JobId>,
     /// Whether `pending_jobs` changed since it was last written.
     queue_dirty: bool,
@@ -291,6 +294,102 @@ impl JobManager {
                 &self.node_allocations(),
             )
             .assessments)
+    }
+
+    /// Forgets the jobs that finished at least `retention` ago, with their
+    /// attempts and everything recorded about them, and returns them.
+    ///
+    /// Only jobs that are settled are forgotten. A job is settled when it has
+    /// succeeded, failed, been cancelled or timed out *and* every one of its
+    /// attempts has ended. A `Lost` job or attempt is not final, since its node
+    /// may still report how it ended; and a node that reports on an attempt
+    /// the controller no longer knows is turned away, so those stay.
+    ///
+    /// Finishing is noticed here, the first time a sweep sees a job settled,
+    /// so a job's period starts at most one sweep late. A job that is run
+    /// again is no longer settled and starts its period afresh when it ends.
+    pub fn prune_finished(&mut self, now: Instant, retention: Duration) -> Vec<JobId> {
+        let mut newly_settled = Vec::new();
+        let mut reopened = Vec::new();
+        for job in self.jobs.values() {
+            let job_id = job.id();
+            match (
+                self.is_settled(job_id),
+                self.job_finished_at.contains_key(&job_id),
+            ) {
+                (true, false) => newly_settled.push(job_id),
+                (false, true) => reopened.push(job_id),
+                _ => {}
+            }
+        }
+        for job_id in newly_settled {
+            self.job_finished_at.insert(job_id, now);
+        }
+        for job_id in reopened {
+            self.job_finished_at.remove(&job_id);
+        }
+
+        let expired = self
+            .job_finished_at
+            .iter()
+            .filter(|(_, finished_at)| now.saturating_duration_since(**finished_at) >= retention)
+            .map(|(job_id, _)| *job_id)
+            .collect::<Vec<_>>();
+        for job_id in &expired {
+            self.forget_job(*job_id);
+        }
+        expired
+    }
+
+    fn is_settled(&self, job_id: JobId) -> bool {
+        let Some(job) = self.jobs.get(&job_id) else {
+            return false;
+        };
+        matches!(
+            job.state(),
+            JobState::Succeeded | JobState::Failed | JobState::Cancelled | JobState::TimedOut
+        ) && self
+            .execution_ids_by_job
+            .get(&job_id)
+            .into_iter()
+            .flatten()
+            .filter_map(|execution_id| self.executions.get(execution_id))
+            .all(|execution| {
+                matches!(
+                    execution.state(),
+                    ExecutionState::Succeeded
+                        | ExecutionState::Failed
+                        | ExecutionState::Cancelled
+                        | ExecutionState::TimedOut
+                        | ExecutionState::Rejected
+                )
+            })
+    }
+
+    /// Removes a job and every record that hangs off it or its attempts.
+    fn forget_job(&mut self, job_id: JobId) {
+        for execution_id in self
+            .execution_ids_by_job
+            .remove(&job_id)
+            .unwrap_or_default()
+        {
+            self.executions.remove(&execution_id);
+            self.outputs.remove(&execution_id);
+            self.data_failures.remove(&execution_id);
+            self.limit_breaches.remove(&execution_id);
+            self.output_files.remove(&execution_id);
+            self.outputs_recorded_at.remove(&execution_id);
+            self.cancellation_requests.remove(&execution_id);
+            self.job_timeout_requests.remove(&execution_id);
+            self.execution_order.remove(&execution_id);
+            self.unconfirmed.remove(&execution_id);
+        }
+        self.jobs.remove(&job_id);
+        self.job_submitted_at.remove(&job_id);
+        self.job_finished_at.remove(&job_id);
+        self.placements.remove(&job_id);
+        self.auto_retries.remove(&job_id);
+        self.retry_not_before.remove(&job_id);
     }
 
     /// Content that must not be evicted at `now`: the inputs of jobs that have

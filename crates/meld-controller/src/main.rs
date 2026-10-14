@@ -11,7 +11,10 @@ use std::{
 
 use directories::BaseDirs;
 use meld_controller::{
-    api::{ControllerState, ControllerStateError, DEFAULT_OUTPUT_RETENTION, router_with_auth},
+    api::{
+        ControllerState, ControllerStateError, DEFAULT_JOB_RETENTION, DEFAULT_OUTPUT_RETENTION,
+        router_with_auth,
+    },
     auth::Authenticator,
     blob_store::{BlobLimits, BlobStore},
     failure_detector::FailureDetector,
@@ -38,6 +41,9 @@ const STATE_DIR_ENV: &str = "MELD_CONTROLLER_STATE_DIR";
 const MAX_BLOB_BYTES_ENV: &str = "MELD_MAX_BLOB_BYTES";
 const BLOB_QUOTA_BYTES_ENV: &str = "MELD_BLOB_QUOTA_BYTES";
 const OUTPUT_RETENTION_ENV: &str = "MELD_OUTPUT_RETENTION_SECS";
+/// How long the record of a finished job is kept; 0 keeps it for good.
+const JOB_RETENTION_ENV: &str = "MELD_JOB_RETENTION_SECS";
+const JOB_RETENTION_SWEEP_INTERVAL: Duration = Duration::from_secs(10);
 const JOB_TIMEOUT_CHECK_INTERVAL: Duration = Duration::from_millis(100);
 
 #[tokio::main]
@@ -66,6 +72,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
     )?);
     let store = StateStore::open(&state_directory.join(STATE_DB_FILE))?;
     let retry_backoff = retry_backoff_from_env()?;
+    let job_retention = job_retention_from_env()?;
     let authenticator = Authenticator::new(
         SecretToken::from_env(CLIENT_TOKEN_ENV)?,
         SecretToken::from_env(NODE_TOKEN_ENV)?,
@@ -76,6 +83,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
         .with_retry_backoff(retry_backoff)
         .with_blob_store(Arc::new(blobs))
         .with_output_retention(output_retention)
+        .with_job_retention(job_retention)
         .with_store(Arc::new(store))?;
     let listener = TcpListener::bind(&bind_address).await?;
     let address = listener.local_addr()?;
@@ -114,6 +122,8 @@ async fn main() -> Result<(), Box<dyn Error>> {
         max_blob_bytes = blob_limits.max_blob_bytes,
         blob_quota_bytes = blob_limits.quota_bytes,
         output_retention_secs = output_retention.as_secs(),
+        // 0 means records are kept for good.
+        job_retention_secs = job_retention.map_or(0, |retention| retention.as_secs()),
         "controller listening"
     );
 
@@ -135,7 +145,8 @@ async fn main() -> Result<(), Box<dyn Error>> {
             FailureDetector::new(heartbeat_timeout),
             heartbeat_timeout + lost_grace,
         ) => result?,
-        result = monitor_job_timeouts(state) => result?,
+        result = monitor_job_timeouts(state.clone()) => result?,
+        result = monitor_job_retention(state) => result?,
     }
     Ok(())
 }
@@ -152,6 +163,23 @@ async fn monitor_job_timeouts(state: ControllerState) -> Result<(), ControllerSt
         }
         for job_id in state.release_due_retries(now)? {
             tracing::info!(%job_id, "automatic retry is due");
+        }
+    }
+}
+
+/// Forgets finished jobs once their retention has passed.
+async fn monitor_job_retention(state: ControllerState) -> Result<(), ControllerStateError> {
+    let mut ticker = interval(JOB_RETENTION_SWEEP_INTERVAL);
+    ticker.set_missed_tick_behavior(MissedTickBehavior::Skip);
+
+    loop {
+        ticker.tick().await;
+        let forgotten = state.prune_finished_jobs(Instant::now())?;
+        if !forgotten.is_empty() {
+            tracing::info!(
+                forgotten = forgotten.len(),
+                "forgot finished jobs whose retention passed"
+            );
         }
     }
 }
@@ -199,6 +227,30 @@ fn retry_backoff_from_env() -> io::Result<RetryBackoff> {
         ));
     }
     Ok(backoff)
+}
+
+/// `None` when records are to be kept for good (the variable is 0).
+fn job_retention_from_env() -> io::Result<Option<Duration>> {
+    match env::var(JOB_RETENTION_ENV) {
+        Ok(value) => parse_job_retention(&value),
+        Err(env::VarError::NotPresent) => Ok(Some(DEFAULT_JOB_RETENTION)),
+        Err(env::VarError::NotUnicode(_)) => Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("{JOB_RETENTION_ENV} must contain valid Unicode"),
+        )),
+    }
+}
+
+fn parse_job_retention(value: &str) -> io::Result<Option<Duration>> {
+    let seconds = value.parse::<u64>().map_err(|error| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!(
+                "{JOB_RETENTION_ENV} must be a whole number of seconds, or 0 to keep jobs: {error}"
+            ),
+        )
+    })?;
+    Ok((seconds > 0).then(|| Duration::from_secs(seconds)))
 }
 
 fn heartbeat_timeout_from_env() -> io::Result<Duration> {
@@ -327,6 +379,19 @@ mod tests {
 
         assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
         assert!(validate_blob_limits(BlobLimits::default()).is_ok());
+    }
+
+    #[test]
+    fn job_retention_zero_keeps_jobs_and_anything_else_must_be_a_number() {
+        assert_eq!(parse_job_retention("0").unwrap(), None);
+        assert_eq!(
+            parse_job_retention("3600").unwrap(),
+            Some(Duration::from_secs(3600))
+        );
+        for value in ["-1", "abc", "", "1.5"] {
+            let error = parse_job_retention(value).expect_err("invalid retention is refused");
+            assert_eq!(error.kind(), io::ErrorKind::InvalidInput, "{value:?}");
+        }
     }
 
     #[test]

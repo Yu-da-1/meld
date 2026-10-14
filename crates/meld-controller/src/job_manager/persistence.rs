@@ -70,6 +70,7 @@ impl JobManager {
             &mut manager.outputs_recorded_at,
         )?;
         load_instants(store, Kind::JobSubmittedAt, &mut manager.job_submitted_at)?;
+        load_instants(store, Kind::JobFinishedAt, &mut manager.job_finished_at)?;
         load_by_id(store, Kind::AutoRetries, &mut manager.auto_retries)?;
         load_instants(store, Kind::RetryNotBefore, &mut manager.retry_not_before)?;
         load_flags(
@@ -139,6 +140,7 @@ impl JobManager {
             || self.cancellation_requests.dirty().next().is_some()
             || self.job_timeout_requests.dirty().next().is_some()
             || self.job_submitted_at.dirty().next().is_some()
+            || self.job_finished_at.dirty().next().is_some()
             || self.placements.dirty().next().is_some()
             || self.auto_retries.dirty().next().is_some()
             || self.retry_not_before.dirty().next().is_some()
@@ -194,6 +196,12 @@ impl JobManager {
         );
         collect(
             &mut changes,
+            Kind::JobFinishedAt,
+            &self.job_finished_at,
+            |instant| encode(&instant_to_unix_ms(*instant)),
+        );
+        collect(
+            &mut changes,
             Kind::CancellationRequest,
             &self.cancellation_requests,
             |()| FLAG_BODY.to_owned(),
@@ -232,6 +240,7 @@ impl JobManager {
         self.retry_not_before.clear_dirty();
         self.outputs_recorded_at.clear_dirty();
         self.job_submitted_at.clear_dirty();
+        self.job_finished_at.clear_dirty();
         self.cancellation_requests.clear_dirty();
         self.job_timeout_requests.clear_dirty();
         self.queue_dirty = false;
@@ -832,5 +841,231 @@ mod tests {
             .expect("still waiting");
         assert!(wait > Duration::from_secs(3), "{wait:?}");
         assert_eq!(after.pending_position(job), Some(0));
+    }
+
+    const RETENTION: Duration = Duration::from_secs(3600);
+
+    /// A job that ran, wrote output, and succeeded.
+    fn succeeded_job(manager: &mut JobManager, registry: &NodeRegistry) -> (JobId, ExecutionId) {
+        let job = manager.submit(spec()).expect("submit");
+        let execution = manager
+            .schedule(job, &Scheduler::new(), registry)
+            .expect("schedule");
+        manager.accept_execution(execution).expect("accept");
+        manager.start_execution(execution).expect("start");
+        manager
+            .finish_execution_with_output(
+                execution,
+                ExecutionResult { exit_code: Some(0) },
+                ExecutionOutput::default(),
+            )
+            .expect("finish");
+        manager.record_output_files(
+            execution,
+            vec![OutputFile {
+                path: "out.txt".to_owned(),
+                sha256: Sha256Digest::from_bytes([9; 32]),
+                size_bytes: 1,
+            }],
+        );
+        (job, execution)
+    }
+
+    fn rows(store: &StateStore, kind: Kind) -> usize {
+        store.load(kind).expect("load").len()
+    }
+
+    #[test]
+    fn a_finished_job_is_forgotten_everywhere_once_its_retention_has_passed() {
+        let store = StateStore::open_in_memory().expect("store");
+        let registry = registry(4);
+        let mut manager = JobManager::new();
+        let (job, execution) = succeeded_job(&mut manager, &registry);
+        let start = Instant::now();
+
+        // Noticed as finished, but young.
+        assert!(manager.prune_finished(start, RETENTION).is_empty());
+        assert!(
+            manager
+                .prune_finished(start + RETENTION - Duration::from_secs(1), RETENTION)
+                .is_empty()
+        );
+        assert!(manager.job(job).is_some());
+
+        let forgotten = manager.prune_finished(start + RETENTION, RETENTION);
+
+        assert_eq!(forgotten, vec![job]);
+        assert!(manager.job(job).is_none());
+        assert!(manager.execution(execution).is_none());
+        assert!(manager.execution_output(execution).is_none());
+        assert!(manager.output_files(execution).is_empty());
+        assert!(manager.latest_execution_for_job(job).is_none());
+        assert!(
+            manager.pinned_digests(start, RETENTION).is_empty(),
+            "its output is no longer held for a record that is gone"
+        );
+
+        manager.flush(&store).expect("flush");
+        for kind in [
+            Kind::Job,
+            Kind::Execution,
+            Kind::Output,
+            Kind::OutputFiles,
+            Kind::OutputsRecordedAt,
+            Kind::Placement,
+            Kind::JobSubmittedAt,
+            Kind::JobFinishedAt,
+        ] {
+            assert_eq!(rows(&store, kind), 0, "{kind:?} rows must be deleted too");
+        }
+        let after = JobManager::restore(&store).expect("what is left restores");
+        assert!(after.job(job).is_none());
+    }
+
+    #[test]
+    fn jobs_that_are_not_settled_are_never_forgotten() {
+        let registry = registry(4);
+        let scheduler = Scheduler::new();
+        let mut manager = JobManager::new();
+        let start = Instant::now();
+        let far = start + RETENTION * 100;
+
+        let queued = manager.submit(spec()).expect("submit");
+        let running = manager.submit(spec()).expect("submit");
+        let running_execution = manager
+            .schedule(running, &scheduler, &registry)
+            .expect("schedule");
+        manager.accept_execution(running_execution).expect("accept");
+        manager.start_execution(running_execution).expect("start");
+        let lost = manager.submit(spec()).expect("submit");
+        let lost_execution = manager
+            .schedule(lost, &scheduler, &registry)
+            .expect("schedule");
+        manager.accept_execution(lost_execution).expect("accept");
+        manager.start_execution(lost_execution).expect("start");
+        manager.mark_execution_lost(lost_execution).expect("lost");
+
+        assert!(manager.prune_finished(start, RETENTION).is_empty());
+        assert!(manager.prune_finished(far, RETENTION).is_empty());
+
+        for job in [queued, running, lost] {
+            assert!(manager.job(job).is_some(), "{job} must be kept");
+        }
+        assert!(manager.execution(lost_execution).is_some());
+    }
+
+    #[test]
+    fn a_lost_job_that_later_ends_is_forgotten_from_then_on() {
+        let registry = registry(4);
+        let mut manager = JobManager::new();
+        let job = manager.submit(spec()).expect("submit");
+        let execution = manager
+            .schedule(job, &Scheduler::new(), &registry)
+            .expect("schedule");
+        manager.accept_execution(execution).expect("accept");
+        manager.start_execution(execution).expect("start");
+        manager.mark_execution_lost(execution).expect("lost");
+        let start = Instant::now();
+        assert!(manager.prune_finished(start, RETENTION).is_empty());
+
+        manager
+            .finish_execution(execution, ExecutionResult { exit_code: Some(0) })
+            .expect("the node reports how it ended");
+        let ended = start + RETENTION * 10;
+        assert!(manager.prune_finished(ended, RETENTION).is_empty());
+
+        assert_eq!(
+            manager.prune_finished(ended + RETENTION, RETENTION),
+            vec![job]
+        );
+    }
+
+    #[test]
+    fn a_job_that_is_run_again_starts_its_period_afresh() {
+        let registry = registry(4);
+        let scheduler = Scheduler::new();
+        let mut manager = JobManager::new();
+        let job = manager.submit(spec()).expect("submit");
+        let execution = manager
+            .schedule(job, &scheduler, &registry)
+            .expect("schedule");
+        manager.accept_execution(execution).expect("accept");
+        manager.start_execution(execution).expect("start");
+        manager
+            .finish_execution(execution, ExecutionResult { exit_code: Some(1) })
+            .expect("failed");
+        let start = Instant::now();
+        assert!(manager.prune_finished(start, RETENTION).is_empty());
+
+        manager.retry_job(job, false).expect("retry");
+        let again = manager
+            .schedule(job, &scheduler, &registry)
+            .expect("schedule");
+        manager.accept_execution(again).expect("accept");
+        manager.start_execution(again).expect("start");
+        // Running again: not settled, so the old clock is dropped.
+        let later = start + RETENTION * 2;
+        assert!(manager.prune_finished(later, RETENTION).is_empty());
+        manager
+            .finish_execution(again, ExecutionResult { exit_code: Some(0) })
+            .expect("succeeded");
+
+        assert!(manager.prune_finished(later, RETENTION).is_empty());
+        assert!(
+            manager
+                .prune_finished(later + RETENTION - Duration::from_secs(1), RETENTION)
+                .is_empty()
+        );
+        assert_eq!(
+            manager.prune_finished(later + RETENTION, RETENTION),
+            vec![job]
+        );
+    }
+
+    #[test]
+    fn when_a_job_finished_survives_a_restart() {
+        let store = StateStore::open_in_memory().expect("store");
+        let registry = registry(4);
+        let mut manager = JobManager::new();
+        let (job, _) = succeeded_job(&mut manager, &registry);
+        let start = Instant::now();
+        manager.prune_finished(start, RETENTION);
+
+        let mut after = restored(&mut manager, &store);
+
+        // The period was not restarted by the restart.
+        let almost = start + RETENTION - Duration::from_secs(1);
+        assert!(after.prune_finished(almost, RETENTION).is_empty());
+        assert_eq!(
+            after.prune_finished(start + RETENTION + Duration::from_secs(1), RETENTION),
+            vec![job]
+        );
+    }
+
+    #[test]
+    fn forgetting_one_job_leaves_the_others_and_the_queue_alone() {
+        let store = StateStore::open_in_memory().expect("store");
+        let registry = registry(4);
+        let mut manager = JobManager::new();
+        let (old, _) = succeeded_job(&mut manager, &registry);
+        let start = Instant::now();
+        manager.prune_finished(start, RETENTION);
+        let (young, young_execution) = succeeded_job(&mut manager, &registry);
+        let queued = manager.submit(spec()).expect("submit");
+        let mid = start + RETENTION / 2;
+        manager.prune_finished(mid, RETENTION);
+
+        let forgotten = manager.prune_finished(start + RETENTION, RETENTION);
+
+        assert_eq!(forgotten, vec![old]);
+        assert!(manager.job(young).is_some());
+        assert!(manager.execution(young_execution).is_some());
+        let after = restored(&mut manager, &store);
+        assert!(after.job(old).is_none());
+        assert_eq!(
+            after.job(young).map(|j| j.state()),
+            Some(JobState::Succeeded)
+        );
+        assert_eq!(after.pending_position(queued), Some(0));
     }
 }

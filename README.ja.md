@@ -144,6 +144,7 @@ meld fetch <job-id> --out-dir ./results
 | `MELD_CACHE_MAX_BYTES` | node | 8 GiB | 入力cacheの上限(バイト) |
 | `MELD_MAX_BLOB_BYTES`、`MELD_BLOB_QUOTA_BYTES` | controller | 1 GiB、16 GiB | 1ファイルの上限、保管する合計(バイト) |
 | `MELD_OUTPUT_RETENTION_SECS` | controller | 86400 | 出力を確実に残す期間 |
+| `MELD_JOB_RETENTION_SECS` | controller | 86400 | 終了したジョブの記録を残す期間。`0`で消さない |
 
 2つのトークンの片方だけの設定と、同じ値の設定は、エラーです。ローカルのマシン以外で待ち受けるcontrollerは、トークンなしでは起動しません。
 

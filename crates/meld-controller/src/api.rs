@@ -57,6 +57,7 @@ pub const BLOB_PATH: &str = "/v1/blobs/{sha256}";
 pub const POLL_NODE_COMMAND_PATH: &str = "/v1/nodes/commands/poll";
 pub const REPORT_EXECUTION_EVENT_PATH: &str = "/v1/nodes/executions/events";
 pub const DEFAULT_OUTPUT_RETENTION: Duration = Duration::from_secs(24 * 60 * 60);
+pub const DEFAULT_JOB_RETENTION: Duration = Duration::from_secs(24 * 60 * 60);
 const COMMAND_LONG_POLL_TIMEOUT: Duration = Duration::from_secs(25);
 
 /// Shared controller state exposed to HTTP handlers.
@@ -72,6 +73,8 @@ pub struct ControllerState {
     retry_backoff: RetryBackoff,
     /// How long outputs are protected from eviction after a job finishes.
     output_retention: Duration,
+    /// How long a settled job's record is kept; `None` keeps it for good.
+    job_retention: Option<Duration>,
     /// What a node seen for the first time is. `Pending` makes an operator
     /// approve every new node.
     first_admission: Admission,
@@ -94,6 +97,7 @@ impl Default for ControllerState {
             store: None,
             retry_backoff: RetryBackoff::default(),
             output_retention: DEFAULT_OUTPUT_RETENTION,
+            job_retention: Some(DEFAULT_JOB_RETENTION),
             first_admission: Admission::Approved,
             node_identity_required: false,
             command_updates,
@@ -111,6 +115,14 @@ impl ControllerState {
     #[must_use]
     pub fn with_output_retention(mut self, output_retention: Duration) -> Self {
         self.output_retention = output_retention;
+        self
+    }
+
+    /// Sets how long the record of a finished job is kept before
+    /// [`Self::prune_finished_jobs`] forgets it. `None` keeps records for good.
+    #[must_use]
+    pub fn with_job_retention(mut self, job_retention: Option<Duration>) -> Self {
+        self.job_retention = job_retention;
         self
     }
 
@@ -239,6 +251,16 @@ impl ControllerState {
             self.notify_command_update();
         }
         Ok(due)
+    }
+
+    /// Forgets the jobs whose retention has passed, in the job manager and in
+    /// the store. Does nothing when records are kept for good.
+    pub fn prune_finished_jobs(&self, now: Instant) -> Result<Vec<JobId>, ControllerStateError> {
+        let Some(retention) = self.job_retention else {
+            return Ok(Vec::new());
+        };
+        let mut jobs = self.jobs_mut()?;
+        Ok(jobs.prune_finished(now, retention))
     }
 
     pub fn expire_jobs(&self, now: Instant) -> Result<Vec<JobId>, ControllerStateError> {
@@ -3609,6 +3631,73 @@ mod tests {
             serde_json::from_slice::<SubmitJobResponse>(&body)
                 .expect("response should contain submitted job JSON")
                 .job_id
+        }
+
+        async fn status_code_of(state: &ControllerState, job_id: JobId) -> StatusCode {
+            router(state.clone())
+                .oneshot(
+                    axum::http::Request::builder()
+                        .uri(format!("/v1/jobs/{job_id}"))
+                        .body(axum::body::Body::empty())
+                        .expect("request"),
+                )
+                .await
+                .expect("status request should be handled")
+                .status()
+        }
+
+        #[tokio::test]
+        async fn a_finished_job_is_forgotten_after_its_retention_and_stays_forgotten() {
+            let directory = tempfile::tempdir().expect("temp dir");
+            let retention = Duration::from_secs(3600);
+            let before = state_over(&directory).with_job_retention(Some(retention));
+            let finished = submit(&before).await;
+            let queued = submit(&before).await;
+            before
+                .jobs_mut()
+                .expect("job lock")
+                .request_job_cancellation(finished)
+                .expect("a queued job is cancelled at once");
+            let now = Instant::now();
+
+            assert!(before.prune_finished_jobs(now).unwrap().is_empty());
+            assert_eq!(status_code_of(&before, finished).await, StatusCode::OK);
+            assert_eq!(
+                before.prune_finished_jobs(now + retention).unwrap(),
+                vec![finished]
+            );
+
+            assert_eq!(
+                status_code_of(&before, finished).await,
+                StatusCode::NOT_FOUND
+            );
+            assert_eq!(status_code_of(&before, queued).await, StatusCode::OK);
+            drop(before);
+            let after = state_over(&directory);
+            assert_eq!(
+                status_code_of(&after, finished).await,
+                StatusCode::NOT_FOUND,
+                "the deletion was saved before the sweep returned"
+            );
+            assert_eq!(status_code_of(&after, queued).await, StatusCode::OK);
+        }
+
+        #[tokio::test]
+        async fn without_a_retention_finished_jobs_are_kept_for_good() {
+            let directory = tempfile::tempdir().expect("temp dir");
+            let state = state_over(&directory).with_job_retention(None);
+            let finished = submit(&state).await;
+            state
+                .jobs_mut()
+                .expect("job lock")
+                .request_job_cancellation(finished)
+                .expect("cancelled");
+            let far = Instant::now() + Duration::from_secs(365 * 24 * 3600);
+
+            assert!(state.prune_finished_jobs(far).unwrap().is_empty());
+            assert!(state.prune_finished_jobs(far).unwrap().is_empty());
+
+            assert_eq!(status_code_of(&state, finished).await, StatusCode::OK);
         }
 
         #[tokio::test]
