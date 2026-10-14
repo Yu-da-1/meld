@@ -28,13 +28,35 @@ const READ_BUFFER_BYTES: usize = 8 * 1024;
 #[derive(Debug, Clone)]
 pub struct NativeExecutor {
     executions_directory: PathBuf,
+    /// Whether a job that uses more memory than it reserved is stopped.
+    enforce_memory_limit: bool,
 }
 
 impl NativeExecutor {
     pub fn new(state_directory: &Path) -> Self {
         Self {
             executions_directory: state_directory.join("executions"),
+            enforce_memory_limit: true,
         }
+    }
+
+    /// Turns the memory limit on or off for this node.
+    ///
+    /// It is on by default. An operator turns it off where the measurement is
+    /// not trustworthy, such as for processes that use a GPU through a
+    /// compatibility layer, which can look many times larger than they are.
+    #[must_use]
+    pub fn with_memory_limit(mut self, enforced: bool) -> Self {
+        self.enforce_memory_limit = enforced;
+        self
+    }
+
+    /// What to watch for an execution that reserved `reserved_bytes`, or
+    /// `None` when this node does not enforce the limit.
+    pub fn memory_watch(&self, reserved_bytes: u64) -> Option<MemoryWatch> {
+        self.enforce_memory_limit.then(|| {
+            MemoryWatch::for_reservation(reserved_bytes, crate::limits::MEMORY_CHECK_INTERVAL)
+        })
     }
 
     /// Removes the workspaces an earlier run of this node left behind, and
@@ -633,6 +655,16 @@ mod tests {
             matches!(outcome, ControlledExecutionOutcome::LimitExceeded { .. }),
             "{outcome:?}"
         );
+    }
+
+    #[test]
+    fn a_node_that_does_not_enforce_the_limit_watches_nothing() {
+        let state_directory = tempdir().expect("temporary state directory should be created");
+        let enforcing = NativeExecutor::new(state_directory.path());
+        let relaxed = NativeExecutor::new(state_directory.path()).with_memory_limit(false);
+
+        assert!(enforcing.memory_watch(1_000).is_some());
+        assert!(relaxed.memory_watch(1_000).is_none());
     }
 
     #[cfg(unix)]

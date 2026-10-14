@@ -31,7 +31,6 @@ use crate::{
     controller_client::{ControllerClient, ControllerClientError},
     executor::{CompletedExecution, ControlledExecutionOutcome, NativeExecutor, Workspace},
     identity::{load_or_create_node_id, load_or_create_node_secret, state_directory},
-    limits::{MEMORY_CHECK_INTERVAL, MemoryWatch},
     resource_reporter::ResourceReporter,
     staging::{DEFAULT_CACHE_MAX_BYTES, InputCache, stage_inputs},
 };
@@ -40,6 +39,7 @@ const HEARTBEAT_INTERVAL_ENV: &str = "MELD_HEARTBEAT_INTERVAL_SECS";
 const DEFAULT_HEARTBEAT_INTERVAL_SECS: u64 = 5;
 const MAX_CONCURRENT_EXECUTIONS_ENV: &str = "MELD_MAX_CONCURRENT_EXECUTIONS";
 const CAPABILITIES_ENV: &str = "MELD_CAPABILITIES";
+const MEMORY_LIMIT_ENV: &str = "MELD_MEMORY_LIMIT";
 const CACHE_MAX_BYTES_ENV: &str = "MELD_CACHE_MAX_BYTES";
 const COMMAND_POLL_RETRY_DELAY: Duration = Duration::from_secs(1);
 const INITIAL_RECONNECT_DELAY: Duration = Duration::from_secs(1);
@@ -77,7 +77,13 @@ async fn main() -> Result<(), Box<dyn Error>> {
         fingerprint.as_ref(),
     )?;
     let state_directory = state_directory()?;
-    let executor = NativeExecutor::new(&state_directory);
+    let enforce_memory_limit = memory_limit_from_env()?;
+    if !enforce_memory_limit {
+        tracing::warn!(
+            "{MEMORY_LIMIT_ENV}=off: jobs that use more memory than they reserved are not stopped"
+        );
+    }
+    let executor = NativeExecutor::new(&state_directory).with_memory_limit(enforce_memory_limit);
     match executor.remove_stale_workspaces() {
         Ok(0) => {}
         Ok(removed) => {
@@ -459,13 +465,11 @@ async fn run_assignment(
         tracing::error!(%node_id, %execution_id, %error, "failed to report running execution");
     }
 
-    // A job may use what it reserved, and a little more.
-    let memory = MemoryWatch::for_reservation(
-        assignment.spec.requirements.memory_bytes,
-        MEMORY_CHECK_INTERVAL,
-    );
+    // A job may use what it reserved, and a little more, unless this node
+    // has been told not to enforce that.
+    let memory = executor.memory_watch(assignment.spec.requirements.memory_bytes);
     let (outcome, workspace) = match execution
-        .wait_controlled(cancellation, timeout, Some(memory))
+        .wait_controlled(cancellation, timeout, memory)
         .await
     {
         Ok((outcome, workspace)) => (outcome, Some(workspace)),
@@ -659,6 +663,29 @@ fn local_node_descriptor(
     })
 }
 
+/// `MELD_MEMORY_LIMIT`: `on` (the default) or `off`.
+fn memory_limit_from_env() -> io::Result<bool> {
+    match env::var(MEMORY_LIMIT_ENV) {
+        Ok(value) => parse_memory_limit(&value),
+        Err(env::VarError::NotPresent) => Ok(true),
+        Err(env::VarError::NotUnicode(_)) => Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("{MEMORY_LIMIT_ENV} must contain valid Unicode"),
+        )),
+    }
+}
+
+fn parse_memory_limit(value: &str) -> io::Result<bool> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "" | "on" => Ok(true),
+        "off" => Ok(false),
+        other => Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("{MEMORY_LIMIT_ENV} must be `on` or `off`, not `{other}`"),
+        )),
+    }
+}
+
 fn capabilities_from_env() -> io::Result<Vec<String>> {
     match env::var(CAPABILITIES_ENV) {
         Ok(value) => Ok(parse_capabilities(&value)),
@@ -765,6 +792,15 @@ fn parse_heartbeat_interval(value: &str) -> io::Result<Duration> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_memory_limit_setting_accepts_on_and_off_only() {
+        assert!(parse_memory_limit("on").unwrap());
+        assert!(parse_memory_limit(" ").unwrap());
+        assert!(!parse_memory_limit("OFF").unwrap());
+        assert!(parse_memory_limit("no").is_err());
+        assert!(parse_memory_limit("0").is_err());
+    }
 
     #[test]
     fn heartbeat_interval_must_be_positive() {
