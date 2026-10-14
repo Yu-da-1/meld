@@ -140,6 +140,7 @@ meld fetch <job-id> --out-dir ./results
 | `MELD_LOST_GRACE_SECS` | controller | 30 | そのjobを諦めるまでの、さらなる猶予 |
 | `MELD_MAX_CONCURRENT_EXECUTIONS` | node | CPU数 | nodeが同時に実行するjob数 |
 | `MELD_CAPABILITIES` | node | なし | jobが要求できるラベル(カンマ区切り) |
+| `MELD_MEMORY_LIMIT` | node | `on` | `off`にすると、そのnodeでメモリ制限を強制しない(下を参照) |
 | `MELD_CACHE_MAX_BYTES` | node | 8 GiB | 入力cacheの上限(バイト) |
 | `MELD_MAX_BLOB_BYTES`、`MELD_BLOB_QUOTA_BYTES` | controller | 1 GiB、16 GiB | 1ファイルの上限、保管する合計(バイト) |
 | `MELD_OUTPUT_RETENTION_SECS` | controller | 86400 | 出力を確実に残す期間 |

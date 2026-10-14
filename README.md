@@ -167,6 +167,7 @@ Everything is set with environment variables.
 | `MELD_LOST_GRACE_SECS` | controller | 30 | Further wait before its jobs are given up on |
 | `MELD_MAX_CONCURRENT_EXECUTIONS` | node | CPU count | Jobs a node runs at once |
 | `MELD_CAPABILITIES` | node | none | Labels jobs can require (comma separated) |
+| `MELD_MEMORY_LIMIT` | node | `on` | `off` stops enforcing the memory limit on this node (see below) |
 | `MELD_CACHE_MAX_BYTES` | node | 8 GiB | Input cache size, in bytes |
 | `MELD_MAX_BLOB_BYTES`, `MELD_BLOB_QUOTA_BYTES` | controller | 1 GiB, 16 GiB | Largest file; total stored, in bytes |
 | `MELD_OUTPUT_RETENTION_SECS` | controller | 86400 | Time outputs are kept for sure |
