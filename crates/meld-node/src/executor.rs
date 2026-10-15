@@ -119,6 +119,7 @@ impl NativeExecutor {
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .kill_on_drop(true);
+        withhold_meld_environment(&mut command);
         #[cfg(unix)]
         {
             use std::os::unix::process::CommandExt;
@@ -310,6 +311,20 @@ pub enum ControlledExecutionOutcome {
         output: ExecutionOutput,
         breach: LimitBreach,
     },
+}
+
+/// Keeps the node's own configuration, tokens included, out of a job's
+/// environment.
+///
+/// A child inherits the node's environment, so without this a job could read
+/// `MELD_NODE_TOKEN` with `env`. Everything else is left as it is: a job still
+/// needs `PATH`, `HOME` and the like.
+fn withhold_meld_environment(command: &mut Command) {
+    for (name, _) in std::env::vars_os() {
+        if name.to_string_lossy().starts_with("MELD_") {
+            command.env_remove(name);
+        }
+    }
 }
 
 async fn capture_stream(mut stream: impl AsyncRead + Unpin) -> io::Result<CapturedStream> {
@@ -579,6 +594,25 @@ mod tests {
         assert_eq!(fs::read(&marker).expect("kept until dropped"), b"staged");
         drop(held);
         assert!(!marker.exists());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_job_does_not_see_the_nodes_meld_environment() {
+        // SAFETY: the name is unique to this test, and nothing else reads it.
+        unsafe { std::env::set_var("MELD_TEST_ONLY_SECRET", "hunter2-hunter2") };
+        let state_directory = tempdir().expect("temporary state directory should be created");
+        let executor = NativeExecutor::new(state_directory.path());
+        let assignment = assignment("env", Vec::new());
+
+        let execution = start_in_new_workspace(&executor, &assignment).expect("env should start");
+        let result = execution.wait().await.expect("process wait should succeed");
+
+        let environment = result.output.stdout.content;
+        assert_eq!(result.result.exit_code, Some(0));
+        assert!(!environment.contains("MELD_"), "{environment}");
+        assert!(!environment.contains("hunter2"), "{environment}");
+        assert!(environment.contains("PATH="), "{environment}");
     }
 
     #[test]
