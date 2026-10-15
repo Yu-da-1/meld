@@ -4,6 +4,7 @@ mod executor;
 mod identity;
 mod limits;
 mod resource_reporter;
+mod sleep_guard;
 mod staging;
 
 use std::{
@@ -32,6 +33,7 @@ use crate::{
     executor::{CompletedExecution, ControlledExecutionOutcome, NativeExecutor, Workspace},
     identity::{load_or_create_node_id, load_or_create_node_secret, state_directory},
     resource_reporter::ResourceReporter,
+    sleep_guard::SleepInhibitor,
     staging::{DEFAULT_CACHE_MAX_BYTES, InputCache, stage_inputs},
 };
 
@@ -40,6 +42,7 @@ const DEFAULT_HEARTBEAT_INTERVAL_SECS: u64 = 5;
 const MAX_CONCURRENT_EXECUTIONS_ENV: &str = "MELD_MAX_CONCURRENT_EXECUTIONS";
 const CAPABILITIES_ENV: &str = "MELD_CAPABILITIES";
 const MEMORY_LIMIT_ENV: &str = "MELD_MEMORY_LIMIT";
+const PREVENT_SLEEP_ENV: &str = "MELD_PREVENT_SLEEP";
 const CACHE_MAX_BYTES_ENV: &str = "MELD_CACHE_MAX_BYTES";
 const COMMAND_POLL_RETRY_DELAY: Duration = Duration::from_secs(1);
 const INITIAL_RECONNECT_DELAY: Duration = Duration::from_secs(1);
@@ -95,11 +98,20 @@ async fn main() -> Result<(), Box<dyn Error>> {
         }
     }
     let cache = InputCache::new(&state_directory, cache_max_bytes_from_env()?)?;
+    let sleep_inhibitor = if prevent_sleep_from_env()? {
+        SleepInhibitor::system()
+    } else {
+        tracing::warn!(
+            "{PREVENT_SLEEP_ENV}=off: this machine may go to sleep while a job runs on it"
+        );
+        SleepInhibitor::disabled()
+    };
 
     if let Err(error) = run_node(
         &client,
         &executor,
         &cache,
+        &sleep_inhibitor,
         descriptor,
         heartbeat_interval,
         &mut resource_reporter,
@@ -196,6 +208,7 @@ async fn run_node(
     client: &ControllerClient,
     executor: &NativeExecutor,
     cache: &InputCache,
+    sleep_inhibitor: &SleepInhibitor,
     descriptor: NodeDescriptor,
     heartbeat_interval: Duration,
     resource_reporter: &mut ResourceReporter,
@@ -306,6 +319,7 @@ async fn run_node(
                             let client = client.clone();
                             let executor = executor.clone();
                             let cache = cache.clone();
+                            let sleep_inhibitor = sleep_inhibitor.clone();
                             let execution_id = assignment.execution_id;
                             let (cancellation, cancellation_receiver) = oneshot::channel();
                             let spawned = active_executions.spawn(
@@ -316,6 +330,7 @@ async fn run_node(
                                         &client,
                                         &executor,
                                         &cache,
+                                        &sleep_inhibitor,
                                         assignment,
                                         cancellation_receiver,
                                     )
@@ -368,9 +383,12 @@ async fn run_assignment(
     client: &ControllerClient,
     executor: &NativeExecutor,
     cache: &InputCache,
+    sleep_inhibitor: &SleepInhibitor,
     assignment: ExecutionAssignment,
     mut cancellation: oneshot::Receiver<()>,
 ) {
+    // Held until the execution has been reported, however it ends.
+    let _awake = sleep_inhibitor.guard();
     let node_id = assignment.node_id;
     let execution_id = assignment.execution_id;
     let timeout = assignment
@@ -676,12 +694,27 @@ fn memory_limit_from_env() -> io::Result<bool> {
 }
 
 fn parse_memory_limit(value: &str) -> io::Result<bool> {
+    parse_on_off(MEMORY_LIMIT_ENV, value)
+}
+
+fn prevent_sleep_from_env() -> io::Result<bool> {
+    match env::var(PREVENT_SLEEP_ENV) {
+        Ok(value) => parse_on_off(PREVENT_SLEEP_ENV, &value),
+        Err(env::VarError::NotPresent) => Ok(true),
+        Err(env::VarError::NotUnicode(_)) => Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("{PREVENT_SLEEP_ENV} must contain valid Unicode"),
+        )),
+    }
+}
+
+fn parse_on_off(name: &str, value: &str) -> io::Result<bool> {
     match value.trim().to_ascii_lowercase().as_str() {
         "" | "on" => Ok(true),
         "off" => Ok(false),
         other => Err(io::Error::new(
             io::ErrorKind::InvalidInput,
-            format!("{MEMORY_LIMIT_ENV} must be `on` or `off`, not `{other}`"),
+            format!("{name} must be `on` or `off`, not `{other}`"),
         )),
     }
 }

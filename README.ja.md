@@ -141,12 +141,15 @@ meld fetch <job-id> --out-dir ./results
 | `MELD_MAX_CONCURRENT_EXECUTIONS` | node | CPU数 | nodeが同時に実行するjob数 |
 | `MELD_CAPABILITIES` | node | なし | jobが要求できるラベル(カンマ区切り) |
 | `MELD_MEMORY_LIMIT` | node | `on` | `off`にすると、そのnodeでメモリ制限を強制しない(下を参照) |
+| `MELD_PREVENT_SLEEP` | node | `on` | `off`にすると、jobの実行中でもマシンがスリープしてよい(下を参照) |
 | `MELD_CACHE_MAX_BYTES` | node | 8 GiB | 入力cacheの上限(バイト) |
 | `MELD_MAX_BLOB_BYTES`、`MELD_BLOB_QUOTA_BYTES` | controller | 1 GiB、16 GiB | 1ファイルの上限、保管する合計(バイト) |
 | `MELD_OUTPUT_RETENTION_SECS` | controller | 86400 | 出力を確実に残す期間 |
 | `MELD_JOB_RETENTION_SECS` | controller | 86400 | 終了したジョブの記録を残す期間。`0`で消さない |
 
 2つのトークンの片方だけの設定と、同じ値の設定は、エラーです。ローカルのマシン以外で待ち受けるcontrollerは、トークンなしでは起動しません。
+
+**スリープ。** nodeはjobを実行している間、OSに自動でスリープしないよう求めます(Windows: `SetThreadExecutionState`、macOS: `caffeinate`、Linux: `systemd-inhibit`)。ノートPCの蓋を閉じることや、人がスリープを選ぶことは止められません。すでに寝ているマシンを起こすこともしないので、到達不能に見えます。WSLの中で動かすnodeはWindowsのスリープを止められないため、そのためにはWindows上で直接nodeを動かしてください。
 
 ## 仕組み
 
