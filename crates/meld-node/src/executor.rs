@@ -13,6 +13,7 @@ use meld_core::{
     CapturedStream, ExecutionAssignment, ExecutionOutput, ExecutionResult, LimitBreach,
     create_private_directory,
 };
+use sysinfo::{Pid, ProcessRefreshKind, ProcessesToUpdate, System};
 use tokio::{
     io::{AsyncRead, AsyncReadExt},
     process::{Child, ChildStderr, ChildStdout, Command},
@@ -28,6 +29,9 @@ const READ_BUFFER_BYTES: usize = 8 * 1024;
 #[derive(Debug, Clone)]
 pub struct NativeExecutor {
     executions_directory: PathBuf,
+    /// One small file per running process group, so that a later run of the
+    /// node can find the groups this run leaves behind if it is killed.
+    processes_directory: PathBuf,
     /// Whether a job that uses more memory than it reserved is stopped.
     enforce_memory_limit: bool,
 }
@@ -36,6 +40,7 @@ impl NativeExecutor {
     pub fn new(state_directory: &Path) -> Self {
         Self {
             executions_directory: state_directory.join("executions"),
+            processes_directory: state_directory.join("processes"),
             enforce_memory_limit: true,
         }
     }
@@ -66,8 +71,8 @@ impl NativeExecutor {
     /// is killed or loses power while it runs. Nothing in this process can
     /// own one yet, and the controller already regards those executions as
     /// lost, so they are of no use to anyone and may hold large or private
-    /// files. A process of such an execution that is still running is not
-    /// found or stopped by this.
+    /// files. Call [`Self::stop_stale_processes`] first, so that no process
+    /// is left running in a directory that is removed from under it.
     pub fn remove_stale_workspaces(&self) -> io::Result<usize> {
         let entries = match fs::read_dir(&self.executions_directory) {
             Ok(entries) => entries,
@@ -91,6 +96,44 @@ impl NativeExecutor {
             }
         }
         Ok(removed)
+    }
+
+    /// Stops the processes an earlier run of this node left running, and
+    /// returns how many process groups that was.
+    ///
+    /// A node that is killed cannot stop the processes of its executions, and
+    /// they keep running without anyone counting them. Each execution records
+    /// its process group and when that started. A recorded group is stopped
+    /// only if a process with that ID is still there and started at that
+    /// time, so a process that merely reused the ID is left alone.
+    ///
+    /// A group whose first process has already ended is not found, even if
+    /// something it started is still running.
+    pub fn stop_stale_processes(&self) -> io::Result<usize> {
+        let entries = match fs::read_dir(&self.processes_directory) {
+            Ok(entries) => entries,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(0),
+            Err(error) => return Err(error),
+        };
+        let mut stopped = 0;
+        for entry in entries {
+            let path = entry?.path();
+            let record = fs::read_to_string(&path)
+                .ok()
+                .and_then(|text| ProcessRecord::parse(&text));
+            if let Some(record) = record
+                && record.is_running()
+            {
+                match record.stop() {
+                    Ok(()) => stopped += 1,
+                    Err(error) => {
+                        tracing::warn!(%error, process_group = record.process_id, "failed to stop a process left by an earlier run");
+                    }
+                }
+            }
+            let _ = fs::remove_file(&path);
+        }
+        Ok(stopped)
     }
 
     /// Creates the empty directory the process will run in.
@@ -127,6 +170,9 @@ impl NativeExecutor {
         }
 
         let mut child = command.spawn()?;
+        let process_record = child.id().and_then(|process_id| {
+            self.record_process(assignment.execution_id.to_string().as_str(), process_id)
+        });
         let stdout = child
             .stdout
             .take()
@@ -140,8 +186,90 @@ impl NativeExecutor {
             stdout: Some(stdout),
             stderr: Some(stderr),
             workspace: Some(workspace),
+            process_record,
         })
     }
+
+    /// Writes down the process group of a new execution, and returns where.
+    /// `None` when that is not possible: the execution still runs, it just
+    /// cannot be found again by a later run of the node.
+    fn record_process(&self, execution: &str, process_id: u32) -> Option<PathBuf> {
+        let record = ProcessRecord::of(process_id)?;
+        let write = create_private_directory(&self.processes_directory).and_then(|()| {
+            let path = self.processes_directory.join(execution);
+            fs::write(&path, record.to_string()).map(|()| path)
+        });
+        match write {
+            Ok(path) => Some(path),
+            Err(error) => {
+                tracing::warn!(%error, "could not record an execution's process");
+                None
+            }
+        }
+    }
+}
+
+/// A process group an execution started, and when its first process did.
+///
+/// The ID alone is not enough: the system hands out IDs again, and a stale
+/// record must never stop something that has nothing to do with it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ProcessRecord {
+    process_id: u32,
+    started_at_secs: u64,
+}
+
+impl ProcessRecord {
+    /// The record for the live process `process_id`.
+    fn of(process_id: u32) -> Option<Self> {
+        Some(Self {
+            process_id,
+            started_at_secs: start_time_secs(process_id)?,
+        })
+    }
+
+    fn parse(text: &str) -> Option<Self> {
+        let (process_id, started_at_secs) = text.trim().split_once(' ')?;
+        Some(Self {
+            process_id: process_id.parse().ok()?,
+            started_at_secs: started_at_secs.parse().ok()?,
+        })
+    }
+
+    /// Whether the process of this record is still there, and is that one.
+    fn is_running(&self) -> bool {
+        start_time_secs(self.process_id) == Some(self.started_at_secs)
+    }
+
+    #[cfg(unix)]
+    fn stop(&self) -> io::Result<()> {
+        let process_group = i32::try_from(self.process_id)
+            .map_err(|_| io::Error::other("process ID exceeds i32"))?;
+        kill_process_group(process_group)
+    }
+
+    #[cfg(not(unix))]
+    fn stop(&self) -> io::Result<()> {
+        Ok(())
+    }
+}
+
+impl std::fmt::Display for ProcessRecord {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(formatter, "{} {}", self.process_id, self.started_at_secs)
+    }
+}
+
+/// When the process started, in seconds since the epoch, if it is running.
+fn start_time_secs(process_id: u32) -> Option<u64> {
+    let pid = Pid::from_u32(process_id);
+    let mut system = System::new();
+    system.refresh_processes_specifics(
+        ProcessesToUpdate::Some(&[pid]),
+        true,
+        ProcessRefreshKind::nothing(),
+    );
+    system.process(pid).map(sysinfo::Process::start_time)
 }
 
 /// The directory an execution runs in, removed when dropped.
@@ -178,6 +306,8 @@ pub struct NativeExecution {
     stdout: Option<ChildStdout>,
     stderr: Option<ChildStderr>,
     workspace: Option<Workspace>,
+    /// Where this execution's process group is written down, until it ends.
+    process_record: Option<PathBuf>,
 }
 
 impl NativeExecution {
@@ -361,6 +491,9 @@ impl Drop for NativeExecution {
         #[cfg(unix)]
         let _ = signal_process_group(&self.child);
         let _ = self.child.start_kill();
+        if let Some(record) = &self.process_record {
+            let _ = fs::remove_file(record);
+        }
     }
 }
 
@@ -380,8 +513,15 @@ fn signal_process_group(child: &Child) -> io::Result<()> {
         .ok_or_else(|| io::Error::other("child process has no operating system ID"))?;
     let process_group =
         i32::try_from(process_id).map_err(|_| io::Error::other("child process ID exceeds i32"))?;
-    // SAFETY: the negative, non-zero PID addresses only the process group
-    // created for this execution. SIGKILL requires no borrowed memory.
+    kill_process_group(process_group)
+}
+
+/// Kills every process of the group `process_group`. A group that is already
+/// gone is not an error.
+#[cfg(unix)]
+fn kill_process_group(process_group: i32) -> io::Result<()> {
+    // SAFETY: the negative, non-zero PID addresses only a process group
+    // this node created. SIGKILL requires no borrowed memory.
     let result = unsafe { libc::kill(-process_group, libc::SIGKILL) };
     if result == 0 {
         return Ok(());
@@ -818,6 +958,107 @@ mod tests {
             .mode();
         assert_eq!(mode & 0o077, 0);
         assert!(workspace.path().is_dir());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_process_left_by_a_killed_node_is_stopped_by_the_next_run() {
+        let state_directory = tempdir().expect("temporary state directory should be created");
+        let executor = NativeExecutor::new(state_directory.path());
+        let assignment = assignment("sleep", vec!["300"]);
+        let execution = start_in_new_workspace(&executor, &assignment).expect("sleep should start");
+        let process_id = execution.child.id().expect("running process has an ID");
+        assert_eq!(
+            fs::read_dir(state_directory.path().join("processes"))
+                .unwrap()
+                .count(),
+            1
+        );
+        // A killed node never runs `Drop`, so neither does this.
+        std::mem::forget(execution);
+        assert!(start_time_secs(process_id).is_some());
+
+        let stopped = NativeExecutor::new(state_directory.path())
+            .stop_stale_processes()
+            .expect("stale processes are looked for");
+
+        // Do not leave it behind if the assertion below fails.
+        let still_running = {
+            for _ in 0..50 {
+                if !is_alive(process_id) {
+                    break;
+                }
+                sleep(Duration::from_millis(100)).await;
+            }
+            is_alive(process_id)
+        };
+        if still_running {
+            let _ = kill_process_group(process_id as i32);
+        }
+        assert_eq!(stopped, 1);
+        assert!(!still_running, "the process is gone");
+        assert_eq!(
+            fs::read_dir(state_directory.path().join("processes"))
+                .unwrap()
+                .count(),
+            0
+        );
+    }
+
+    /// Whether the process is running and not merely waiting to be reaped.
+    /// The forgotten child is nobody's to wait for, so it stays a zombie.
+    #[cfg(unix)]
+    fn is_alive(process_id: u32) -> bool {
+        let pid = Pid::from_u32(process_id);
+        let mut system = System::new();
+        system.refresh_processes_specifics(
+            ProcessesToUpdate::Some(&[pid]),
+            true,
+            ProcessRefreshKind::nothing(),
+        );
+        system
+            .process(pid)
+            .is_some_and(|process| process.status() != sysinfo::ProcessStatus::Zombie)
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_record_that_no_longer_matches_its_process_stops_nothing() {
+        let state_directory = tempdir().expect("temporary state directory should be created");
+        let executor = NativeExecutor::new(state_directory.path());
+        // An unrelated process that happens to hold the recorded ID.
+        let mut bystander = tokio::process::Command::new("sleep")
+            .arg("30")
+            .kill_on_drop(true)
+            .spawn()
+            .expect("sleep should start");
+        let process_id = bystander.id().expect("running process has an ID");
+        let processes = state_directory.path().join("processes");
+        fs::create_dir_all(&processes).expect("processes directory");
+        // The ID is right, the start time is not: another process had this ID.
+        fs::write(processes.join("old"), format!("{process_id} 1")).expect("record");
+        fs::write(processes.join("garbled"), "not a record").expect("garbled record");
+
+        let stopped = executor.stop_stale_processes().expect("look for processes");
+
+        assert_eq!(stopped, 0);
+        assert!(bystander.try_wait().expect("status").is_none());
+        assert_eq!(fs::read_dir(&processes).unwrap().count(), 0);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_finished_execution_leaves_no_record() {
+        let state_directory = tempdir().expect("temporary state directory should be created");
+        let executor = NativeExecutor::new(state_directory.path());
+        let assignment = assignment("sleep", vec!["0.2"]);
+        let execution = start_in_new_workspace(&executor, &assignment).expect("sleep should start");
+        let processes = state_directory.path().join("processes");
+        assert_eq!(fs::read_dir(&processes).unwrap().count(), 1);
+
+        execution.wait().await.expect("process wait should succeed");
+
+        assert_eq!(fs::read_dir(&processes).unwrap().count(), 0);
     }
 
     fn assignment(program: &str, args: Vec<&str>) -> ExecutionAssignment {

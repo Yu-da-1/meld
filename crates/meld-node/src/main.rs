@@ -87,6 +87,15 @@ async fn main() -> Result<(), Box<dyn Error>> {
         );
     }
     let executor = NativeExecutor::new(&state_directory).with_memory_limit(enforce_memory_limit);
+    match executor.stop_stale_processes() {
+        Ok(0) => {}
+        Ok(stopped) => {
+            tracing::warn!(stopped, "stopped processes left running by an earlier run");
+        }
+        Err(error) => {
+            tracing::warn!(%error, "could not look for processes left by an earlier run");
+        }
+    }
     match executor.remove_stale_workspaces() {
         Ok(0) => {}
         Ok(removed) => {
