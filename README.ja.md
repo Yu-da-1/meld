@@ -162,7 +162,7 @@ meld fetch <job-id> --out-dir ./results
 - **controller** はjobとnodeの記録を持ち、配置を決め、ファイルを保管します。
 - **job** は試行(attempt)を持ちます。再実行は同じjobの新しい試行になるので、履歴は残ります。
 
-設計の記録と、見送ったことの理由を含む roadmap は、[`docs/`](docs/) にあります(現在は日本語です)。
+設計の記録と、見送ったことの理由を含む roadmap は、[`docs/`](docs/) にあります(現在は日本語です)。3〜4台の実機、障害、実workload、data transfer、日常運用、外部接続など、今後[実機で試したいこと](docs/verification/plan.md)もまとめています。
 
 ## 開発
 

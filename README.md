@@ -197,7 +197,9 @@ you ──meld──▶  controller  ◀── nodes poll for work ──  node 
 - A **job** has attempts. A retry is a new attempt of the same job, so history is kept.
 
 Design notes and the roadmap, including what was decided against and why, are in
-[`docs/`](docs/) (currently in Japanese).
+[`docs/`](docs/) (currently in Japanese). There is also a Japanese list of
+[things to try on real machines](docs/verification/plan.md), covering a 3–4 machine
+cluster, failures, real workloads, data transfer, daily operation and remote access.
 
 ## Development
 

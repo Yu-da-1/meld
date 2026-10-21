@@ -741,7 +741,7 @@ fn command_for_node(
                 tracing::warn!(
                     node_id = %request.node_id,
                     %execution_id,
-                    "execution is not running on its node after a controller restart; marked lost"
+                    "execution is not running on its node after a controller restart or the node registering again; marked lost"
                 );
             }
         }
@@ -1476,6 +1476,20 @@ async fn register_node(
         tracing::info!(%node_id, "node registered");
     } else {
         tracing::info!(%node_id, "node registered and waits for approval");
+    }
+
+    // The node may be a new process that knows nothing of the executions an
+    // earlier one had. Its first poll tells which of them it still runs.
+    match state.jobs_mut() {
+        Ok(mut jobs) => jobs.await_confirmation_from(node_id),
+        Err(error) => {
+            tracing::error!(%node_id, %error, "job manager lock is poisoned");
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "controller state is unavailable",
+            )
+                .into_response();
+        }
     }
 
     Json(RegisterNodeResponse {

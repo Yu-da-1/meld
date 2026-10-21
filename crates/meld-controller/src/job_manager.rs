@@ -79,9 +79,10 @@ pub struct JobManager {
     queue_dirty: bool,
     /// The scheduler's verdict on every node at the latest placement of each job.
     placements: Tracked<JobId, Vec<NodeAssessment>>,
-    /// Executions restored from the store that were past acknowledgement, and
-    /// whose node has not yet confirmed that it still runs them. Never saved:
-    /// it describes what this controller process has not yet observed.
+    /// Executions past acknowledgement whose node has not yet confirmed that it
+    /// still runs them: those restored from the store, and those of a node
+    /// that has registered again. Never saved: it describes what this
+    /// controller process has not yet observed.
     unconfirmed: BTreeSet<ExecutionId>,
     /// Creation order of executions. Ids are random, so this is the only
     /// record of which attempt came first; the store keeps rows in write order
@@ -1034,15 +1035,42 @@ impl JobManager {
             .collect()
     }
 
-    /// Settles restored executions of one node against what the node reports running.
+    /// Makes the open executions of `node_id` wait for the node to confirm
+    /// them, as restored ones do.
     ///
-    /// After a restart the controller knows what it last recorded, not what
-    /// happened since. The first time a node polls, its list of running
-    /// executions is the truth: a restored execution on the list is confirmed,
-    /// and one missing from it has no process and no pending result, so it is
-    /// marked lost. Only restored executions are judged. During normal
-    /// operation a poll can carry a list older than an execution it races
-    /// with, so absence there proves nothing.
+    /// A node that registers again may be a new process that knows nothing of
+    /// what an earlier one was running. If it returns before the controller
+    /// gives up on it, nothing else would ever settle those executions: they
+    /// would stay `Running`, keep their reservation and ignore a cancel,
+    /// because the node cannot answer for what it does not have.
+    pub fn await_confirmation_from(&mut self, node_id: NodeId) {
+        let open = self
+            .executions
+            .values()
+            .filter(|execution| {
+                execution.node_id() == node_id
+                    && matches!(
+                        execution.state(),
+                        ExecutionState::Accepted
+                            | ExecutionState::Running
+                            | ExecutionState::Cancelling
+                    )
+            })
+            .map(Execution::id)
+            .collect::<Vec<_>>();
+        self.unconfirmed.extend(open);
+    }
+
+    /// Settles unconfirmed executions of one node against what the node reports running.
+    ///
+    /// After a controller restart, or when a node registers again, the
+    /// controller knows what it last recorded, not what happened since. The
+    /// first time the node polls, its list of running executions is the
+    /// truth: an unconfirmed execution on the list is confirmed, and one
+    /// missing from it has no process and no pending result, so it is marked
+    /// lost. Only unconfirmed executions are judged. During normal operation
+    /// a poll can carry a list older than an execution it races with, so
+    /// absence there proves nothing.
     ///
     /// Returns the executions marked lost.
     pub fn reconcile_node(
@@ -2602,6 +2630,83 @@ mod tests {
             assert_eq!(manager.release_due_retries(later), vec![job_id]);
             assert!(manager.release_due_retries(later).is_empty());
         }
+    }
+
+    #[test]
+    fn an_execution_missing_from_a_node_that_registered_again_is_lost() {
+        let mut manager = JobManager::new();
+        let job = manager.submit(spec()).expect("submit");
+        let (registry, node) = ready_registry();
+        let execution = manager
+            .schedule(job, &Scheduler::new(), &registry)
+            .expect("schedule");
+        manager.accept_execution(execution).expect("accept");
+        manager.start_execution(execution).expect("start");
+
+        // Nothing marks it for judgement yet: absence from a list proves nothing.
+        assert!(
+            manager
+                .reconcile_node(node, &[])
+                .expect("reconcile")
+                .is_empty()
+        );
+        assert_eq!(manager.job(job).map(Job::state), Some(JobState::Running));
+
+        manager.await_confirmation_from(node);
+        let lost = manager.reconcile_node(node, &[]).expect("reconcile");
+
+        assert_eq!(lost, vec![execution]);
+        assert_eq!(manager.job(job).map(Job::state), Some(JobState::Lost));
+    }
+
+    #[test]
+    fn an_execution_a_node_still_runs_survives_it_registering_again() {
+        let mut manager = JobManager::new();
+        let job = manager.submit(spec()).expect("submit");
+        let (registry, node) = ready_registry();
+        let execution = manager
+            .schedule(job, &Scheduler::new(), &registry)
+            .expect("schedule");
+        manager.accept_execution(execution).expect("accept");
+        manager.start_execution(execution).expect("start");
+
+        manager.await_confirmation_from(node);
+        let lost = manager
+            .reconcile_node(node, &[execution])
+            .expect("reconcile");
+
+        assert!(lost.is_empty());
+        assert_eq!(manager.job(job).map(Job::state), Some(JobState::Running));
+    }
+
+    #[test]
+    fn registering_again_leaves_other_nodes_and_unacknowledged_work_alone() {
+        let mut manager = JobManager::new();
+        let job = manager.submit(spec()).expect("submit");
+        let (registry, node) = ready_registry();
+        let execution = manager
+            .schedule(job, &Scheduler::new(), &registry)
+            .expect("schedule");
+        // Assigned, not yet accepted by the node: it may be about to start.
+        manager.await_confirmation_from(node);
+        assert!(
+            manager
+                .reconcile_node(node, &[])
+                .expect("reconcile")
+                .is_empty()
+        );
+        assert_eq!(
+            manager.execution(execution).map(Execution::state),
+            Some(ExecutionState::Assigned)
+        );
+
+        manager.accept_execution(execution).expect("accept");
+        manager.start_execution(execution).expect("start");
+        manager.await_confirmation_from(NodeId::generate());
+        let lost = manager.reconcile_node(node, &[]).expect("reconcile");
+
+        assert!(lost.is_empty());
+        assert_eq!(manager.job(job).map(Job::state), Some(JobState::Running));
     }
 
     fn assigned_job() -> (JobManager, JobId, ExecutionId) {
