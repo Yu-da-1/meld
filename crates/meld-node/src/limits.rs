@@ -62,6 +62,10 @@ impl MemoryMeter {
     /// Memory shared between processes is counted in each, so a job that
     /// forks many workers can look larger than it is. The margin above the
     /// reservation absorbs a little of this, not all of it.
+    ///
+    /// Threads are left out. On Linux they are listed beside processes and
+    /// each reports the whole process's memory, so counting them would
+    /// multiply a process's memory by its thread count.
     pub fn tree_bytes(&mut self, root: u32) -> Option<u64> {
         self.system.refresh_processes_specifics(
             ProcessesToUpdate::All,
@@ -73,6 +77,7 @@ impl MemoryMeter {
             self.system
                 .processes()
                 .iter()
+                .filter(|(_, process)| process.thread_kind().is_none())
                 .map(|(pid, process)| (*pid, process.parent(), process.memory())),
         )
     }
@@ -165,5 +170,42 @@ mod tests {
             .expect("the running test process is measured");
 
         assert!(bytes > 0);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn threads_do_not_multiply_the_memory_of_their_process() {
+        let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let threads: Vec<_> = (0..32)
+            .map(|_| {
+                let stop = stop.clone();
+                std::thread::spawn(move || {
+                    while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+                        std::thread::sleep(Duration::from_millis(10));
+                    }
+                })
+            })
+            .collect();
+        let resident_pages: u64 = std::fs::read_to_string("/proc/self/statm")
+            .unwrap()
+            .split_whitespace()
+            .nth(1)
+            .unwrap()
+            .parse()
+            .unwrap();
+        let resident = resident_pages * 4096;
+
+        let measured = MemoryMeter::new()
+            .tree_bytes(std::process::id())
+            .expect("the running test process is measured");
+
+        stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        for thread in threads {
+            thread.join().unwrap();
+        }
+        assert!(
+            measured < resident * 2,
+            "measured {measured} bytes for a process holding {resident}"
+        );
     }
 }
